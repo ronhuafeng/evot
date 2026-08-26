@@ -80,6 +80,7 @@ async fn send(
     let mut builder = client
         .post(url)
         .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
         .header("authorization", format!("Bearer {api_key}"));
     for (key, value) in model_config.headers() {
         builder = builder.header(key, value);
