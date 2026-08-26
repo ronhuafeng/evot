@@ -3,6 +3,10 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
+      target_sha:
+        description: 'Exact commit to release; defaults to the selected ref'
+        type: string
+        required: false
       prerelease:
         description: 'Create as beta prerelease'
         type: boolean
@@ -11,6 +15,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,13 +35,36 @@ jobs:
       previous: ${{ steps.next.outputs.previous }}
       name: ${{ steps.next.outputs.name }}
       semver: ${{ steps.next.outputs.semver }}
+      skip: ${{ steps.release_state.outputs.skip }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           fetch-tags: true
           submodules: recursive
-          ref: ${{ github.ref_name }}
+          ref: ${{ inputs.target_sha || github.sha }}
+
+      - name: Validate release target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+
+          if [ -n "${TARGET_SHA}" ] && [ "${CHECKED_OUT_SHA}" != "${TARGET_SHA}" ]; then
+            echo "checkout does not match target_sha" >&2
+            exit 1
+          fi
+
+          if [ -n "${TARGET_SHA}" ]; then
+            CURRENT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+            if [ "${CURRENT_SHA}" != "${TARGET_SHA}" ]; then
+              echo "main advanced before release started; refusing to release a stale commit" >&2
+              exit 1
+            fi
+          fi
 
       - name: Configure git
         shell: bash
@@ -42,8 +73,37 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Check release state
+        id: release_state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_SHA="$(git rev-parse HEAD)"
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+
+          while IFS=$'\t' read -r TAG IS_DRAFT; do
+            [ -n "${TAG}" ] || continue
+            TAG_SHA="$(git rev-list -n 1 "${TAG}" 2>/dev/null || true)"
+            [ "${TAG_SHA}" = "${TARGET_SHA}" ] || continue
+
+            if [ "${IS_DRAFT}" = "true" ]; then
+              echo "draft release ${TAG} already exists for target_sha; recover or delete it before retrying" >&2
+              exit 1
+            fi
+
+            echo "target_sha is already published as ${TAG}; no new release is needed"
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            break
+          done < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq '.[] | [.tag_name, .draft] | @tsv'
+          )
+
       - name: Determine next version (CalVer)
         id: next
+        if: steps.release_state.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -115,20 +175,20 @@ jobs:
         run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
 
       - name: Tag (annotated)
-        if: github.ref_name == 'main'
+        if: github.ref_name == 'main' && steps.release_state.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
           git tag -a "${{ steps.next.outputs.tag }}" "${{ steps.meta.outputs.sha }}" -m "${{ steps.next.outputs.tag }}"
 
       - name: Push tag
-        if: github.ref_name == 'main'
+        if: github.ref_name == 'main' && steps.release_state.outputs.skip != 'true'
         shell: bash
         run: git push origin "refs/tags/${{ steps.next.outputs.tag }}"
 
       - name: Generate release notes
         id: notes
-        if: github.ref_name == 'main'
+        if: github.ref_name == 'main' && steps.release_state.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -176,7 +236,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create prerelease (draft)
-        if: github.ref_name == 'main'
+        if: github.ref_name == 'main' && steps.release_state.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -201,7 +261,7 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: create_release
-    if: github.ref_name == 'main'
+    if: github.ref_name == 'main' && needs.create_release.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -358,7 +418,7 @@ jobs:
     name: Publish release (undraft)
     runs-on: ubuntu-latest
     needs: [create_release, build]
-    if: github.ref_name == 'main' && !cancelled() && needs.build.result != 'cancelled'
+    if: github.ref_name == 'main' && needs.create_release.outputs.skip != 'true' && needs.build.result == 'success'
     steps:
       - name: Publish release
         shell: bash
