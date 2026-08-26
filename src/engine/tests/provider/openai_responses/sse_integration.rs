@@ -149,6 +149,13 @@ async fn native_openai_posts_responses_payload_to_responses_endpoint(
         .await
         .ok_or("request recording unavailable")?;
     let request = requests.first().ok_or("missing request")?;
+    assert_eq!(
+        request
+            .headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
     let body: serde_json::Value = serde_json::from_slice(&request.body)?;
     assert_eq!(body["model"], "gpt-5.5");
     assert_eq!(body["reasoning"]["effort"], "medium");
