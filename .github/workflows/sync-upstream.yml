@@ -1,0 +1,68 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main and dispatch CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Capture current main
+        id: before
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Sync fork with upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=main
+
+      - name: Capture updated main
+        id: after
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          echo "sha=${SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Dispatch CI for updated main
+        if: steps.before.outputs.sha != steps.after.outputs.sha
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ steps.after.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run ci.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f "target_sha=${TARGET_SHA}" \
+            -f "auto_release=true"
+
+      - name: Report no change
+        if: steps.before.outputs.sha == steps.after.outputs.sha
+        run: echo "Fork main is already synchronized with upstream."

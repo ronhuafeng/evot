@@ -2,6 +2,16 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      target_sha:
+        description: 'Exact commit to verify'
+        type: string
+        required: false
+      auto_release:
+        description: 'Release target_sha after all checks pass'
+        type: boolean
+        required: false
+        default: false
   push:
     branches: [main]
     paths-ignore:
@@ -29,6 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
       - uses: ./.github/actions/setup-rust
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -39,6 +51,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
       - uses: ./.github/actions/setup-rust
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run --no-fail-fast
@@ -49,6 +63,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
       - uses: ./.github/actions/setup-rust
       - uses: oven-sh/setup-bun@v2
         with:
@@ -61,6 +77,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
@@ -73,8 +91,50 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
       - run: cd cli && bun install
       - run: cd cli && bun test tests/
+
+  dispatch-release:
+    name: Dispatch release
+    runs-on: ubuntu-latest
+    needs: [check, test, build, test-cli, test-cli-macos]
+    if: github.event_name == 'workflow_dispatch' && inputs.auto_release == true
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Verify target is current main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TARGET_SHA}" ]; then
+            echo "target_sha is required when auto_release is true" >&2
+            exit 1
+          fi
+
+          CURRENT_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq '.sha')"
+          if [ "${CURRENT_SHA}" != "${TARGET_SHA}" ]; then
+            echo "main advanced after CI started; refusing to release a stale commit" >&2
+            exit 1
+          fi
+
+      - name: Dispatch release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f "target_sha=${TARGET_SHA}" \
+            -f "prerelease=false"
