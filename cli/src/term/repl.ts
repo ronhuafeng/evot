@@ -129,6 +129,7 @@ import { findPreviousSession, shouldPreloadStartupSessions, selectResumeMessages
 import { handleSelectorControl } from './app/selector-control.js'
 import { decideReplControl, type ReplControlAction } from './app/repl-control.js'
 import { replaceOrPushStatusLine } from './app/status-line.js'
+import { AuthWatcher } from './app/auth-watch.js'
 import { mergeQueuedIntoEditorText } from './app/queue-restore.js'
 import {
   createQueueSelectorState,
@@ -472,12 +473,98 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   historyState = createHistoryState(entries)
 
   let configInfo: ConfigInfo | undefined
+  let cloudLoginRequired = false
+  let revocationCleanup: Promise<void> | null = null
+  let authWatcher: AuthWatcher | null = null
   const refreshConfigInfo = () => {
     // Re-read backend config after a model switch so the footer reflects the
     // new provider's effective thinking level (it can differ per provider).
     try { configInfo = agent.configInfo() } catch {}
   }
   refreshConfigInfo()
+
+  /** Single cloud-session status line; updates replace it in place. */
+  function commitCloudSession(text: string, tone: 'dim' | 'ok' | 'warn'): void {
+    const paint = tone === 'ok' ? chalk.green : tone === 'warn' ? chalk.yellow : chalk.dim
+    commitStatusLine({ id: 'sys-cloud-session', kind: 'system', text: paint(text) })
+  }
+
+  /**
+   * Re-resolve the model after an auth change and report whether one remains.
+   * The backend keeps a still-served selection, so this only announces a model
+   * the reload actually moved.
+   */
+  function reloadAfterAuthChange(): boolean {
+    const previousSpec = currentModelSpec(configInfo, appState.model)
+    const hasModel = agent.reloadSelection()
+    refreshConfigInfo()
+    reloadCloudContent()
+    if (!hasModel) return false
+
+    appState = { ...appState, model: agent.model }
+    const next = configInfo?.availableModels.find(model => model.spec === currentModelSpec(configInfo, agent.model))
+    if (next && next.spec !== previousSpec) {
+      commitStatusLine({
+        id: 'sys-model',
+        kind: 'system',
+        text: `  Model → ${formatModelLabel(agent.model, next.provider, next.group_label)}`,
+      })
+    }
+    return true
+  }
+
+  function handleCloudSessionRevoked(): void {
+    // A dead scoped key is recoverable: the catalog mints a fresh one on read,
+    // so only a refused CLI token needs /login.
+    if (revocationCleanup) return
+    commitCloudSession('  ⟳ Cloud session key expired · restoring', 'dim')
+    revocationCleanup = (async () => {
+      try {
+        const { authRefreshSession } = await import('../native/index.js')
+        const { planAfterRevocation } = await import('../commands/login-flow.js')
+        const plan = planAfterRevocation(await authRefreshSession())
+        if (plan.kind === 'recovered') {
+          cloudLoginRequired = !reloadAfterAuthChange()
+          authWatcher?.sync()
+          commitCloudSession('  ✓ Cloud session restored · send your message again', 'ok')
+        } else if (plan.kind === 'unavailable') {
+          // An outage says nothing about the credential; keep it.
+          cloudLoginRequired = false
+          commitCloudSession(`  ⚠ Cannot reach the evot server${plan.error ? ` (${plan.error})` : ''} · try again shortly`, 'warn')
+        } else {
+          cloudLoginRequired = true
+          try { reloadAfterAuthChange() } catch { /* no provider left; /login is the fix */ }
+          authWatcher?.sync()
+          commitCloudSession('  ⚠ Cloud session signed out · run /login to reconnect', 'warn')
+        }
+      } catch (err) {
+        cloudLoginRequired = true
+        commitCloudSession(`  ⚠ Could not restore the cloud session: ${errorText(err)}`, 'warn')
+      } finally {
+        revocationCleanup = null
+        renderer.requestRender()
+      }
+    })()
+  }
+
+  function queryBlockedByCloudLogin(): boolean {
+    if (revocationCleanup) {
+      commitCloudSession('  ⟳ Cloud session key expired · restoring', 'dim')
+      return true
+    }
+    if (!cloudLoginRequired) return false
+    commitCloudSession('  ⚠ Cloud session signed out · run /login to reconnect', 'warn')
+    return true
+  }
+
+  function activeProviderIsCloud(): boolean {
+    const provider = configInfo?.provider
+    if (!provider) return false
+    const active = configInfo?.availableModels.find(
+      option => option.provider === provider && option.model === appState.model,
+    )
+    return active !== undefined && isCloudModel(active)
+  }
 
   let preloadedSessions: SessionMeta[] = []
   if (shouldPreloadStartupSessions(opts)) {
@@ -1265,6 +1352,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   async function runQuery(text: string, contentJson?: string, prebuiltStream?: QueryStream) {
+    if (queryBlockedByCloudLogin()) return
     const generation = beginRun()
     liveContentMaxHeight = 0
     isLoading = true
@@ -1312,11 +1400,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
           continue
         }
 
-        const update = reduceRunEvent(streamMachine!, event, { termRows: renderer.termRows })
+        const update = reduceRunEvent(streamMachine!, event, {
+          termRows: renderer.termRows,
+          cloudProvider: activeProviderIsCloud(),
+        })
 
         streamMachine = update.state
         appState = update.state.appState
         spinnerState = update.state.spinnerState
+        if (update.sessionRevoked) handleCloudSessionRevoked()
 
         // Git commands run inside tool subprocesses. Refresh synchronously when
         // any tool settles instead of waiting for the debounced HEAD watcher;
@@ -2291,40 +2383,39 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       await handleVersionCommand(replCommands)
     } else if (name === '/login') {
       // Device-code flow in place so free models appear without restarting.
-      // If no provider was configured, the cloud provider becomes active.
+      // Wait for an admin-sign-out cleanup before checking local identity;
+      // otherwise a fast /login can race the auth-file removal.
       if (loginInFlight) {
         commitSystem('sys-login', '  login already in progress')
       } else {
+        // Wait for an in-flight recovery first: it decides whether this login is
+        // even needed, and a fast /login could otherwise race the auth cleanup.
+        if (revocationCleanup) await revocationCleanup
         const { authWhoami } = await import('../native/index.js')
-        const existing = await authWhoami()
-        if (existing) {
-          commitSystem('sys-login', `  already logged in as ${existing.name} <${existing.email}>`)
+        const { decideLoginGate } = await import('../commands/login-flow.js')
+        // `cloudLoginRequired` is set only after the server refused the stored
+        // CLI token, so a leftover auth.json can never block a fresh flow.
+        const existing = cloudLoginRequired ? null : await authWhoami()
+        const gate = decideLoginGate(existing, cloudLoginRequired)
+        if (gate.kind === 'already-logged-in') {
+          commitSystem('sys-login', `  already logged in as ${gate.user.name} <${gate.user.email}>`)
         } else {
           loginInFlight = true
           try {
-            const hadKey = Boolean(configInfo?.hasApiKey)
             const loggedIn = await handleLoginCommand(replCommands)
             if (loggedIn) {
-              refreshConfigInfo()
-              reloadCloudContent()
-              if (!hadKey) {
-                const cloud = (configInfo?.availableModels ?? []).find(isCloudModel)
-                if (cloud) {
-                  try {
-                    agent.setProvider(cloud.spec)
-                    refreshConfigInfo()
-                    appState = { ...appState, model: agent.model }
-                    commitStatusLine({
-                      id: 'sys-model',
-                      kind: 'system',
-                      text: `  Model → ${formatModelLabel(agent.model, cloud.provider, cloud.group_label)}`,
-                    })
-                  } catch (err) {
-                    commitSystem('sys-login-model-err', chalk.red(`  Failed to switch to cloud model: ${errorText(err)}`))
-                  }
+              try {
+                cloudLoginRequired = !reloadAfterAuthChange()
+                authWatcher?.sync()
+                if (cloudLoginRequired) {
+                  commitSystem('sys-login-model-err', chalk.red('  Login succeeded, but no cloud model was loaded. Try /login again.'))
+                } else {
+                  void syncCloudNow(true)
                 }
+              } catch (err) {
+                cloudLoginRequired = true
+                commitSystem('sys-login-model-err', chalk.red(`  Failed to load the signed-in cloud model: ${errorText(err)}`))
               }
-              void syncCloudNow(true)
             }
           } finally {
             loginInFlight = false
@@ -2335,29 +2426,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       if (loginInFlight) {
         commitSystem('sys-logout', '  login in progress — wait or restart to log out')
       } else {
-        const previousSpec = currentModelSpec(configInfo, agent.model)
+        if (revocationCleanup) await revocationCleanup
         const loggedOut = await handleLogoutCommand(replCommands)
         if (loggedOut) {
-          refreshConfigInfo()
-          reloadCloudContent()
-          const remaining = configInfo?.availableModels ?? []
-          const stillThere = remaining.some(m => m.spec === previousSpec)
-          if (!stillThere) {
-            const next = remaining[0]
-            if (next) {
-              try {
-                agent.setProvider(next.spec)
-                refreshConfigInfo()
-                appState = { ...appState, model: agent.model }
-                commitStatusLine({
-                  id: 'sys-model',
-                  kind: 'system',
-                  text: `  Model → ${formatModelLabel(agent.model, next.provider, next.group_label)}`,
-                })
-              } catch (err) {
-                commitSystem('sys-logout-model-err', chalk.red(`  Failed to leave cloud model: ${errorText(err)}`))
-              }
-            }
+          try {
+            cloudLoginRequired = !reloadAfterAuthChange()
+            authWatcher?.sync()
+          } catch (err) {
+            cloudLoginRequired = true
+            commitSystem('sys-logout-model-err', chalk.red(`  Failed to reload providers after logout: ${errorText(err)}`))
           }
         }
       }
@@ -2422,8 +2499,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
    * ranked list with reasons, then opens the resume selector on the ranked
    * sessions. Falls back to the literal-filter selector on failure.
    */
-  function cloudCampaigns() {
-    return authNotices().map(n => ({
+  function cloudCampaigns(notices = authNotices()) {
+    return notices.map(n => ({
       id: n.id,
       kind: n.kind,
       priority: n.priority,
@@ -2438,10 +2515,9 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   /** Re-read the synced catalog: refresh model config and the ad/notice slot.
    *  Called after login, by the live-sync poller, and on demand. */
-  function reloadCloudContent(): void {
+  function reloadCloudContent(fresh = cloudCampaigns()): void {
     const previous = [...adSlot.notices, ...adSlot.ads]
     const previousById = new Map(previous.map(campaign => [campaign.id, campaign]))
-    const fresh = cloudCampaigns()
     // Refresh campaigns in place — runtime slot state (whether the slot has
     // been triggered, and where rotation is) must survive a content refresh.
     const keep = {
@@ -2481,45 +2557,77 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }, CLOUD_SYNC_MS)
   ;(syncTimer as unknown as { unref?: () => void }).unref?.()
 
+  /** Adopt a cloud auth change made by another evot process. */
+  function adoptExternalAuthChange(): void {
+    // A recovery in flight owns the auth state and syncs the stamp itself.
+    if (revocationCleanup) return
+    try {
+      const reloaded = reloadAfterAuthChange()
+      cloudLoginRequired = !reloaded && !configInfo?.hasApiKey
+      if (cloudLoginRequired) {
+        commitCloudSession('  ⚠ Cloud session signed out · run /login to reconnect', 'warn')
+      } else {
+        renderer.requestRender()
+      }
+    } catch {
+      // Half-written file from a concurrent login; the next event retries.
+    }
+  }
+
+  authWatcher = new AuthWatcher(() => adoptExternalAuthChange())
+
   async function syncCloudNow(force = false): Promise<void> {
     if (inflightSync) return inflightSync
     if (!force && Date.now() - lastSyncedAt < CLOUD_SYNC_MS) return
     inflightSync = (async () => {
+      const { authSyncModels, authSyncNotices, authWhoami } = await import('../native/index.js')
+      if (!await authWhoami()) return
+      // Any server-pushed group counts, not just the free tier, so granted
+      // models and split protocol groups are announced too.
+      const cloudModels = () => configInfo?.availableModels.filter(isCloudModel) ?? []
+      const knownModelIds = new Set(cloudModels().map(m => m.model))
+      const knownCampaignIds = new Set([...adSlot.notices, ...adSlot.ads].map(c => c.id))
+      const knownFingerprints = new Set([...adSlot.notices, ...adSlot.ads].map(campaignFingerprint))
+
+      // Campaigns are public and refresh independently from the authenticated
+      // model catalog. An expired cloud token must not freeze the ad slot.
+      let noticesSynced = false
+      let modelsSynced = false
       try {
-        const { authSyncModels, authWhoami } = await import('../native/index.js')
-        if (!await authWhoami()) return
-        // Any server-pushed group counts, not just the free tier, so granted
-        // models and split protocol groups are announced too.
-        const cloudModels = () => configInfo?.availableModels.filter(isCloudModel) ?? []
-        const knownModelIds = new Set(cloudModels().map(m => m.model))
-        const knownCampaignIds = new Set([...adSlot.notices, ...adSlot.ads].map(c => c.id))
-        const knownFingerprints = new Set([...adSlot.notices, ...adSlot.ads].map(campaignFingerprint))
+        const notices = await authSyncNotices()
+        noticesSynced = true
+        reloadCloudContent(cloudCampaigns(notices))
+      } catch {}
+      try {
         await authSyncModels()
-        lastSyncedAt = Date.now()
+        modelsSynced = true
+        // Absorb our own write so the watcher does not replay it.
+        authWatcher?.sync()
         reloadCloudContent()
-        const addedModels = cloudModels().filter(m => !knownModelIds.has(m.model))
-        const campaigns = [...adSlot.notices, ...adSlot.ads]
-        const addedCampaigns = campaigns.filter(c => !knownCampaignIds.has(c.id))
-        const copyChanged = campaigns.some(c => !knownFingerprints.has(campaignFingerprint(c)))
-        if (addedModels.length > 0) {
-          const names = addedModels.slice(0, 3)
-            .map(m => formatModelOptionLabel(m))
-            .join(', ')
-          const more = addedModels.length > 3 ? ` and ${addedModels.length - 3} more` : ''
-          commitSystem('sys-cloud-models', chalk.dim(`  ✓ New models available: ${names}${more} — /model to switch`))
+      } catch {}
+      lastSyncedAt = Date.now()
+      if (!noticesSynced && !modelsSynced) return
+
+      const addedModels = cloudModels().filter(m => !knownModelIds.has(m.model))
+      const campaigns = [...adSlot.notices, ...adSlot.ads]
+      const addedCampaigns = campaigns.filter(c => !knownCampaignIds.has(c.id))
+      const copyChanged = campaigns.some(c => !knownFingerprints.has(campaignFingerprint(c)))
+      if (addedModels.length > 0) {
+        const names = addedModels.slice(0, 3)
+          .map(m => formatModelOptionLabel(m))
+          .join(', ')
+        const more = addedModels.length > 3 ? ` and ${addedModels.length - 3} more` : ''
+        commitSystem('sys-cloud-models', chalk.dim(`  ✓ New models available: ${names}${more} — /model to switch`))
+      }
+      if (addedCampaigns.length > 0) {
+        // The slot itself announces it: erase what's showing, type the new one.
+        if (!queueAdSlotTransition(adSlot, addedCampaigns[0]!.id)) {
+          triggerAdSlot(adSlot, Date.now())
         }
-        if (addedCampaigns.length > 0) {
-          // The slot itself announces it: erase what's showing, type the new one.
-          if (!queueAdSlotTransition(adSlot, addedCampaigns[0]!.id)) {
-            triggerAdSlot(adSlot, Date.now())
-          }
-        }
-        const refreshedOpenPicker = refreshOpenModelSelector()
-        if (addedModels.length > 0 || addedCampaigns.length > 0 || copyChanged || refreshedOpenPicker) {
-          renderer.requestRender()
-        }
-      } catch {
-        // offline / not logged in / server unreachable — stay silent
+      }
+      const refreshedOpenPicker = modelsSynced && refreshOpenModelSelector()
+      if (addedModels.length > 0 || addedCampaigns.length > 0 || copyChanged || refreshedOpenPicker) {
+        renderer.requestRender()
       }
     })()
     try {
@@ -2727,6 +2835,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   async function runLogQuery(forked: import('../native/index.js').ForkedAgent, prompt: string) {
+    if (queryBlockedByCloudLogin()) return
     const generation = beginRun()
     liveContentMaxHeight = 0
     isLoading = true
@@ -2753,10 +2862,14 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         if (destroyed || !ownsRun(generation)) break
         if (!streamMachine) break
 
-        const update = reduceRunEvent(streamMachine, event, { termRows: renderer.termRows })
+        const update = reduceRunEvent(streamMachine, event, {
+          termRows: renderer.termRows,
+          cloudProvider: activeProviderIsCloud(),
+        })
         streamMachine = update.state
         appState = update.state.appState
         spinnerState = update.state.spinnerState
+        if (update.sessionRevoked) handleCloudSessionRevoked()
 
         if (event.kind === 'assistant_delta') renderer.requestRender()
         if (update.commitLines.length > 0) commitLines(update.commitLines)
@@ -2979,6 +3092,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     stopSpinner()
     clearInterval(adSlotTimer)
     clearInterval(syncTimer)
+    authWatcher?.dispose()
+    authWatcher = null
     caretBlink.dispose()
     gitInfo.dispose()
     updateMgr.cleanup()

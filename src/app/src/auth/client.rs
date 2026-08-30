@@ -5,6 +5,7 @@ use serde::de::DeserializeOwned;
 use crate::auth::types::AuthState;
 use crate::auth::types::LoginCodeResponse;
 use crate::auth::types::ModelsResponse;
+use crate::auth::types::Notice;
 use crate::error::EvotError;
 use crate::error::Result;
 
@@ -16,6 +17,51 @@ pub enum PollOutcome {
     Success { user: AuthState },
     Expired,
     Denied,
+}
+
+/// Result of one authenticated catalog read.
+#[derive(Debug)]
+pub enum CatalogOutcome {
+    Ready(ModelsResponse),
+    /// `401`/`403`: this CLI token is dead. Only a new login can fix it.
+    Refused,
+    /// Network or server fault. Says nothing about the credential.
+    Unavailable(String),
+}
+
+/// Read the model catalog with the stored CLI token.
+///
+/// Every call mints a fresh scoped LLM key, so this is what repairs a session the
+/// gateway reported as `session_revoked`.
+pub async fn fetch_catalog(state: &AuthState) -> CatalogOutcome {
+    if state.cli_token.trim().is_empty() {
+        return CatalogOutcome::Refused;
+    }
+    let url = format!(
+        "{}/v1/config/models",
+        state.server_base_url.trim_end_matches('/')
+    );
+    let sent = reqwest::Client::new()
+        .get(&url)
+        .bearer_auth(&state.cli_token)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await;
+    let response = match sent {
+        Ok(response) => response,
+        Err(error) => return CatalogOutcome::Unavailable(format!("sync models: {error}")),
+    };
+    let status = response.status();
+    if matches!(status.as_u16(), 401 | 403) {
+        return CatalogOutcome::Refused;
+    }
+    if !status.is_success() {
+        return CatalogOutcome::Unavailable(format!("sync models: server returned {status}"));
+    }
+    match response.json::<ModelsResponse>().await {
+        Ok(catalog) => CatalogOutcome::Ready(catalog),
+        Err(error) => CatalogOutcome::Unavailable(format!("decode: {error}")),
+    }
 }
 
 pub async fn begin_login(base_url: &str, fingerprint_id: &str) -> Result<LoginCodeResponse> {
@@ -53,6 +99,26 @@ pub async fn poll_status(base_url: &str, code: &str, expires_at: i64) -> Result<
         "denied" => Ok(PollOutcome::Denied),
         _ => Ok(PollOutcome::Pending),
     }
+}
+
+pub async fn sync_notices(base_url: &str) -> Result<Vec<Notice>> {
+    let url = [base_url.trim_end_matches('/'), "/v1/notices"].concat();
+    let response = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| EvotError::Conf(format!("sync notices: {error}")))?;
+    if !response.status().is_success() {
+        return Err(EvotError::Conf(format!(
+            "sync notices: server returned {}",
+            response.status()
+        )));
+    }
+    response
+        .json::<Vec<Notice>>()
+        .await
+        .map_err(|error| EvotError::Conf(format!("sync notices: decode: {error}")))
 }
 
 pub async fn sync_models(state: &AuthState) -> Result<ModelsResponse> {

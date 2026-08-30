@@ -367,6 +367,16 @@ export class Agent {
   }
 
   /**
+   * Re-resolve the live model selection after login, logout, or key recovery.
+   * A selection the fresh config still serves is kept, so recovering a scoped
+   * key does not move this session onto a different model. Returns false only
+   * when nothing is configured any more.
+   */
+  reloadSelection(): boolean {
+    return this.raw.reloadSelection()
+  }
+
+  /**
    * Reload provider/model from disk, including its configured thinking level.
    * Returns false when the saved selection is unavailable and the current live
    * selection was refreshed instead.
@@ -496,7 +506,9 @@ import {
   authPoll as rawAuthPoll,
   authLogout as rawAuthLogout,
   authSyncModels as rawAuthSyncModels,
+  authSyncNotices as rawAuthSyncNotices,
   authWhoami as rawAuthWhoami,
+  authRefreshSession as rawAuthRefreshSession,
   authNotices as rawAuthNotices,
 } from './binding.js'
 
@@ -534,6 +546,10 @@ export async function authSyncModels(): Promise<void> {
   await rawAuthSyncModels()
 }
 
+export async function authSyncNotices(): Promise<CloudNotice[]> {
+  return parseJsonOrThrow(await rawAuthSyncNotices(), 'notice sync failed') as CloudNotice[]
+}
+
 export async function authLogout(): Promise<void> {
   await rawAuthLogout()
 }
@@ -546,6 +562,35 @@ export async function authWhoami(): Promise<{ id: string; name: string; email: s
   } catch {
     return null
   }
+}
+
+export interface CloudUser {
+  id: string
+  name: string
+  email: string
+}
+
+/**
+ * Outcome of repairing a cloud session the gateway rejected.
+ * - `recovered`: a fresh scoped key was cached; retry the request.
+ * - `login_required`: the CLI token was refused and has been cleared.
+ * - `unavailable`: server unreachable; nothing was cleared.
+ */
+export type AuthRefreshStatus = 'recovered' | 'login_required' | 'unavailable'
+
+export interface AuthRefreshResult {
+  status: AuthRefreshStatus
+  /** Null only when a new login is required. */
+  user: CloudUser | null
+  /** Why the server could not be reached, when status is `unavailable`. */
+  error?: string | null
+  /** Set when clearing a refused credential failed. */
+  cleanup_error?: string | null
+}
+
+/** Re-mint the scoped LLM key after the gateway reported `session_revoked`. */
+export async function authRefreshSession(): Promise<AuthRefreshResult> {
+  return parseJsonOrThrow(await rawAuthRefreshSession(), 'session refresh failed') as AuthRefreshResult
 }
 
 export interface CloudNotice {

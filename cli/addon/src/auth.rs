@@ -42,6 +42,21 @@ pub async fn auth_sync_models() -> NapiResult<String> {
     to_json(&cache.response)
 }
 
+#[napi]
+pub async fn auth_sync_notices() -> NapiResult<String> {
+    let state = auth::load_auth()
+        .map_err(to_napi)?
+        .ok_or_else(|| napi::Error::from_reason("not logged in"))?;
+    let notices = auth::sync_notices(&state.server_base_url)
+        .await
+        .map_err(to_napi)?;
+    if let Some(mut cache) = auth::load_models_cache().map_err(to_napi)? {
+        cache.response.notices.clone_from(&notices);
+        auth::save_models_cache(&cache).map_err(to_napi)?;
+    }
+    to_json(&notices)
+}
+
 async fn sync_models_inner() -> evot::error::Result<evot::auth::ModelsCache> {
     let state =
         auth::load_auth()?.ok_or_else(|| evot::error::EvotError::Conf("not logged in".into()))?;
@@ -60,6 +75,40 @@ pub fn auth_logout() -> NapiResult<()> {
 pub fn auth_whoami() -> Option<String> {
     let state = auth::load_auth().ok()??;
     serde_json::to_string(&state.user).ok()
+}
+
+/// Repair a cloud session the LLM gateway rejected by re-minting the scoped key.
+///
+/// - `recovered`: a fresh scoped key was cached; the caller can retry.
+/// - `login_required`: the CLI token itself was refused; the dead credential is
+///   cleared here.
+/// - `unavailable`: server unreachable, so nothing is cleared.
+#[napi]
+pub async fn auth_refresh_session() -> NapiResult<String> {
+    let Some(state) = auth::load_auth().map_err(to_napi)? else {
+        return to_json(&serde_json::json!({ "status": "login_required", "user": null }));
+    };
+    match auth::fetch_catalog(&state).await {
+        auth::CatalogOutcome::Ready(response) => {
+            let cache = evot::auth::ModelsCache::new(now_ms(), response);
+            auth::save_models_cache(&cache).map_err(to_napi)?;
+            to_json(&serde_json::json!({ "status": "recovered", "user": state.user }))
+        }
+        auth::CatalogOutcome::Refused => {
+            // A failed cleanup must still report `login_required`.
+            let cleanup_error = auth::logout().err().map(|error| error.to_string());
+            to_json(&serde_json::json!({
+                "status": "login_required",
+                "user": null,
+                "cleanup_error": cleanup_error,
+            }))
+        }
+        auth::CatalogOutcome::Unavailable(error) => to_json(&serde_json::json!({
+            "status": "unavailable",
+            "user": state.user,
+            "error": error,
+        })),
+    }
 }
 
 fn now_ms() -> i64 {

@@ -7,6 +7,7 @@ use evot::agent::session::Session;
 use evot::agent::Agent;
 use evot::agent::QueryRequest;
 use evot::agent::RunEventPayload;
+use evot::agent::SelectionReload;
 use evot::agent::SubmitOutcome;
 use evot::conf::Config;
 use evot::conf::Protocol;
@@ -324,6 +325,104 @@ fn resume_reload_reapplies_current_configured_thinking_level() -> TestResult {
     assert_eq!(agent.llm().provider, before.provider);
     assert_eq!(agent.llm().model, before.model);
     assert_eq!(agent.llm().thinking_level, before.thinking_level);
+    Ok(())
+}
+
+/// The shared reload rule: a still-served selection is kept (so re-minting a
+/// scoped key cannot move a running session), a dropped one yields to the
+/// config's active selection, and an empty config leaves no model at all.
+#[test]
+fn reload_selection_keeps_served_switches_dropped_and_clears_empty() -> TestResult {
+    let dir = TempDir::new()?;
+    let initial = anthropic_config(&dir);
+    let agent = Agent::new(&initial, "/work")?;
+
+    // Same provider, re-read with a rotated key: the live model must survive
+    // even though another model now heads the provider's list.
+    let mut rotated = anthropic_config(&dir);
+    if let Some(profile) = rotated.providers.get_mut("anthropic") {
+        profile.api_key = "rotated-key".into();
+        profile.models = vec!["claude-haiku-4-6".into(), "claude-opus-4-6".into()];
+    }
+    assert_eq!(agent.reload_selection(&rotated), SelectionReload::Kept);
+    assert_eq!(agent.llm().model, "claude-opus-4-6");
+    assert_eq!(agent.llm().api_key, "rotated-key");
+
+    let mut replacement = Config::new(dir.path().to_path_buf());
+    replacement
+        .providers
+        .insert("deepseek".into(), ProviderProfile {
+            protocol: Protocol::OpenAi,
+            api_key: "replacement-key".into(),
+            base_url: "https://api.deepseek.com".into(),
+            models: vec!["deepseek-chat".into()],
+            compat_caps: Default::default(),
+            route_capabilities: Default::default(),
+            thinking_level: None,
+            context_window: None,
+            max_tokens: None,
+            supports_image: None,
+        });
+    replacement.llm.provider = "deepseek".into();
+
+    assert_eq!(
+        agent.reload_selection(&replacement),
+        SelectionReload::Switched
+    );
+    assert_eq!(agent.llm().provider, "deepseek");
+    assert_eq!(agent.llm().model, "deepseek-chat");
+
+    // Logged out with no BYOK left: a model that can only 401 is worse than
+    // none, so the agent reports it has nothing.
+    let empty = Config::new(dir.path().to_path_buf());
+    let landing = agent.reload_selection(&empty);
+    assert_eq!(landing, SelectionReload::Unconfigured);
+    assert!(!landing.has_model());
+    assert_eq!(agent.llm().provider, "");
+    assert_eq!(agent.llm().model, "");
+    Ok(())
+}
+
+/// A cloud selection is only kept while the catalog still lists it: the server
+/// owns that list, so a retired model must not linger on a key refresh.
+#[test]
+fn reload_selection_drops_cloud_models_the_catalog_retired() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut config = Config::new(dir.path().to_path_buf());
+    config
+        .providers
+        .insert("evot-free".into(), ProviderProfile {
+            protocol: Protocol::Anthropic,
+            api_key: "evot.scoped.token".into(),
+            base_url: "https://auto.evot.ai/v1/llm".into(),
+            models: vec!["landing-model".into(), "grok-4-6".into()],
+            compat_caps: Default::default(),
+            route_capabilities: Default::default(),
+            thinking_level: None,
+            context_window: None,
+            max_tokens: None,
+            supports_image: None,
+        });
+    config.cloud_providers.insert("evot-free".into());
+    config.cloud_model_sorts.insert("landing-model".into(), 100);
+    config.llm.provider = "evot-free".into();
+
+    let agent = Agent::new(&config, "/work")?;
+    // A fresh session lands on the top-ranked model, then the user switches.
+    assert_eq!(agent.llm().model, "landing-model");
+    agent.set_model_by_spec(&config, "grok-4-6")?;
+
+    // Key recovery re-reads the same catalog: the chosen model stays put.
+    assert_eq!(agent.reload_selection(&config), SelectionReload::Kept);
+    assert_eq!(agent.llm().model, "grok-4-6");
+
+    // The catalog drops that model: now the landing spot legitimately wins.
+    let mut retired = config.clone();
+    if let Some(profile) = retired.providers.get_mut("evot-free") {
+        profile.models = vec!["landing-model".into()];
+    }
+    assert_eq!(agent.reload_selection(&retired), SelectionReload::Switched);
+    assert_eq!(agent.llm().model, "landing-model");
     Ok(())
 }
 
