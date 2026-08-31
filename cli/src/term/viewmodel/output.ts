@@ -1,14 +1,42 @@
 import type { OutputLine } from '../../render/output.js'
 import stringWidth from 'string-width'
-import { line, block, plain, dim, bold, colored, type ViewBlock, type StyledLine } from './types.js'
+import { line, block, plain, dim, bold, colored, type ViewBlock, type StyledLine, type StyledSpan } from './types.js'
 import { wrapTextByWidth } from './width.js'
 import { wrapTextWithAnsi } from '../../render/wrap.js'
 import { BOX_DRAWING_RE } from '../../markdown/primitives.js'
+import { getTheme } from '../../render/theme.js'
 import stripAnsi from 'strip-ansi'
 
 export interface OutputContext {
   prevKind?: string
   columns?: number
+}
+
+// A committed user message is marked by a left rail rather than a prompt glyph:
+// it spans every rendered row, so a wrapped or multi-line message reads as one
+// block instead of a first line plus loose continuations.
+//
+// U+258D (left five-eighths block) matches freebuff's rail. It paints most of
+// the cell, so the rail still reads as continuous down the message, while a
+// fully background-filled cell was wide enough to look like a selection
+// highlight rather than a margin marker.
+const USER_BAR = '\u258d'
+
+/**
+ * Wall-clock header shown above a user message, e.g. `[06:11 PM]`.
+ *
+ * Formatted from the timestamp captured when the message was built, so a
+ * re-render (or the incremental history cache) reproduces the original time
+ * instead of drifting to "now".
+ */
+export function formatClock(timestamp: number): string {
+  const at = new Date(timestamp)
+  const hours = at.getHours()
+  const suffix = hours < 12 ? 'AM' : 'PM'
+  const hour12 = hours % 12 === 0 ? 12 : hours % 12
+  const hh = String(hour12).padStart(2, '0')
+  const mm = String(at.getMinutes()).padStart(2, '0')
+  return `[${hh}:${mm} ${suffix}]`
 }
 
 // OSC 133 semantic zone markers (the shell-integration protocol). Wrapping each
@@ -49,19 +77,34 @@ export function buildOutputBlocks(lines: OutputLine[], context: OutputContext | 
     switch (ol.kind) {
       case 'user': {
         const cols = initialContext.columns
+        // The bar occupies one cell plus a separating space, matching the
+        // 2-column prefix every other kind uses so wrapped text stays aligned.
         const availWidth = cols ? Math.max(1, cols - 2) : 0
-        if (availWidth > 0 && ol.text.length > 0) {
-          const chunks = wrapTextByWidth(ol.text, availWidth)
-          const userLines = chunks.map((c, k) => {
-            const prefix = k === 0 ? bold('❯ ', 'yellow') : plain('  ')
-            return line(prefix, bold(ol.text.slice(c.start, c.end)))
-          })
-          blocks.push(block(userLines, 1))
-        } else {
-          blocks.push(block([
-            line(bold('❯ ', 'yellow'), bold(ol.text)),
-          ], 1))
+        const barHex = getTheme().brandHex
+        const bar = (): StyledSpan => ({ text: USER_BAR, hex: barHex })
+        const userLines: StyledLine[] = []
+        if (ol.timestamp !== undefined) {
+          userLines.push(line(bar(), plain(' '), dim(formatClock(ol.timestamp))))
         }
+        // Shift+Enter and pasted input carry hard newlines. Each logical line is
+        // wrapped on its own so every rendered row keeps the bar: letting a raw
+        // newline reach the renderer splits the row *after* the prefix, which is
+        // what dropped the bar on continuation lines.
+        for (const segment of ol.text.split('\n')) {
+          if (!segment) {
+            userLines.push(line(bar()))
+            continue
+          }
+          if (availWidth > 0) {
+            for (const c of wrapTextByWidth(segment, availWidth)) {
+              userLines.push(line(bar(), plain(' '), bold(segment.slice(c.start, c.end))))
+            }
+          } else {
+            userLines.push(line(bar(), plain(' '), bold(segment)))
+          }
+        }
+        if (userLines.length === 0) userLines.push(line(bar()))
+        blocks.push(block(userLines, 1))
         break
       }
 

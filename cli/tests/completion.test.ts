@@ -35,6 +35,13 @@ describe('slash command completion', () => {
     expect(result).toBeNull()
   })
 
+  test('completes /rest to /restart', () => {
+    const result = complete('/rest', 5)
+    expect(result).not.toBeNull()
+    expect(result!.replacement).toBe('/restart ')
+    expect(result!.candidates).toEqual(['/restart'])
+  })
+
   test('completes /q to /quit alias', () => {
     const result = complete('/qu', 3)
     expect(result).not.toBeNull()
@@ -129,5 +136,21 @@ describe('ghost hints', () => {
     expect(hint).toContain('install')
     expect(hint).toContain('list')
     expect(hint).toContain('remove')
+  })
+
+  test('hints the /sessions alias like the canonical command', () => {
+    // Typing an alias must feel like typing the real name: same description on
+    // the name, same argument hints after the space.
+    expect(getGhostHint('/sessions', 9)).toContain('<id>')
+    expect(getGhostHint('/sessions ', 10)).toContain('<query>')
+  })
+})
+
+describe('alias completion', () => {
+  test('tab-completes /sessions', () => {
+    const result = complete('/sess', 5)
+    expect(result).not.toBeNull()
+    expect(result!.replacement).toBe('/sessions ')
+    expect(result!.candidates).toEqual(['/sessions'])
   })
 })
