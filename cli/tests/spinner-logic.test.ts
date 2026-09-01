@@ -287,6 +287,24 @@ describe('formatSpinnerLine', () => {
     expect(line).toContain('esc to interrupt')
   })
 
+  test('names stopping the wait instead while work is being waited on', () => {
+    // Esc releases the wait rather than killing in this state, so promising an
+    // interrupt would describe the wrong outcome. Worded as "stop waiting"
+    // because a blocked task is already backgrounded.
+    const state = createSpinnerState()
+    const line = stripAnsi(formatSpinnerLine(state, Date.now(), undefined, { backgroundable: true }))
+    expect(line).toContain('esc to stop waiting')
+    expect(line).not.toContain('esc to interrupt')
+  })
+
+  test('a suppressed hint stays suppressed even when backgroundable', () => {
+    const state = createSpinnerState()
+    const line = stripAnsi(
+      formatSpinnerLine(state, Date.now(), undefined, { interruptible: false, backgroundable: true }),
+    )
+    expect(line).not.toContain('esc to')
+  })
+
   test('shows token count after 30s', () => {
     const now = Date.now()
     const state = {

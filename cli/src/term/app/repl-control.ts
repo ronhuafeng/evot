@@ -13,10 +13,17 @@ export type ReplControlInput = {
   logMode: boolean
   hasQueuedPrompt: boolean
   isCompacting?: boolean
+  /**
+   * Something is waiting on a background task that esc can release without
+   * killing it: a shell watched in the foreground, or a blocking `task_output`
+   * call holding the turn.
+   */
+  canReclaimTurn?: boolean
 }
 
 export type ReplControlAction =
   | { kind: 'restore-queued' }
+  | { kind: 'reclaim-turn' }
   | { kind: 'interrupt' }
   | { kind: 'exit' }
   | { kind: 'show-exit-hint' }
@@ -36,7 +43,7 @@ export type ReplControlAction =
   | { kind: 'normal-key' }
 
 export function decideReplControl(input: ReplControlInput): ReplControlAction[] {
-  const { event, overlay, isLoading, hasStream, editor, exitHint, logMode, hasQueuedPrompt, isCompacting } = input
+  const { event, overlay, isLoading, hasStream, editor, exitHint, logMode, hasQueuedPrompt, isCompacting, canReclaimTurn } = input
   const actions: ReplControlAction[] = []
 
   if (isCompacting && (event.type === 'escape' || (event.type === 'ctrl' && event.key === 'c'))) {
@@ -59,6 +66,14 @@ export function decideReplControl(input: ReplControlInput): ReplControlAction[] 
     }
     if (editor.completion) return actions.concat({ kind: 'close-completion' })
     if (isLoading && hasStream && hasQueuedPrompt) return actions.concat({ kind: 'restore-queued' })
+    // Waiting on a background task is released before esc is allowed to mean
+    // "interrupt". Killing was previously the only way to reclaim the turn,
+    // which threw away however far a build or test run had already got.
+    // Escalation is by repeat: once nothing is waiting, the next esc interrupts
+    // as it always did.
+    if (isLoading && hasStream && canReclaimTurn) {
+      return actions.concat({ kind: 'reclaim-turn' })
+    }
     if (isLoading && hasStream) return actions.concat({ kind: 'interrupt' })
     if (!isEditorEmpty(editor)) return actions.concat({ kind: 'clear-editor' })
     if (logMode) return actions.concat({ kind: 'exit-log-mode' })

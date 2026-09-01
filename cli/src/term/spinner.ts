@@ -187,6 +187,15 @@ export interface SpinnerFormatOptions {
   interruptible?: boolean
   /** Requested model, used to identify long quota waits. */
   model?: string
+  /**
+   * Work is being waited on that esc can release without killing it: a shell
+   * watched in the foreground, or a blocking `task_output` call holding the
+   * turn. The hint has to say so — offering only "esc to interrupt" while the
+   * softer gesture is the one bound would describe the wrong outcome. Worded as
+   * "stop waiting" because a blocked task is already in the background; what
+   * ends is the waiting, not the work.
+   */
+  backgroundable?: boolean
 }
 
 export function formatSpinnerLine(
@@ -234,7 +243,11 @@ export function formatSpinnerLine(
 
   const status = humanDuration(elapsed)
   const tokenSuffix = isLongWaitPhase(state.phase) ? '' : formatSpinnerTokenSuffix(state, now, stats)
-  const interruptHint = options.interruptible === false ? '' : ' · esc to interrupt'
+  const interruptHint = options.interruptible === false
+    ? ''
+    : options.backgroundable
+      ? ' · esc to stop waiting'
+      : ' · esc to interrupt'
 
   if (slow) {
     return `\x1b[31m${char}\x1b[0m \x1b[31m${label}\x1b[0m\x1b[2m (${status}${tokenSuffix})${interruptHint}\x1b[0m`

@@ -50,6 +50,14 @@ describe('resolveCommand', () => {
     expect(isSlashCommand('/restart')).toBe(true)
   })
 
+  test('background work has no slash commands', () => {
+    // Managed only through the TUI panel (ctrl+t, or ↓ on an empty composer).
+    // Keeping a command surface too would mean two presentations to keep in sync.
+    expect(resolveCommand('/tasks')).toEqual({ kind: 'unknown' })
+    expect(resolveCommand('/ps')).toEqual({ kind: 'unknown' })
+    expect(resolveCommand('/stop')).toEqual({ kind: 'unknown' })
+  })
+
   test('resolves aliases', () => {
     const result = resolveCommand('/q')
     expect(result).toEqual({ kind: 'resolved', name: '/exit', args: '' })
@@ -76,9 +84,11 @@ describe('resolveCommand', () => {
   })
 
   test('returns ambiguous for multiple prefix matches', () => {
-    // /plan and /act both exist, but /p could match /plan only
-    const result = resolveCommand('/p')
-    expect(result.kind).toBe('resolved')
+    // `/s` still spans several commands. `/p` no longer does: it used to collide
+    // with the background `/ps`, and now resolves straight to `/plan`.
+    const result = resolveCommand('/s')
+    expect(result.kind).toBe('ambiguous')
+    expect(resolveCommand('/p')).toEqual({ kind: 'resolved', name: '/plan', args: '' })
   })
 
   test('routes removed /history command to the unknown-command handler', () => {

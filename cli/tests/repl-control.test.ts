@@ -90,6 +90,63 @@ describe('repl control', () => {
     expect(kinds({ ...base, event: { type: 'escape' }, isLoading: true, hasStream: true })).toEqual(['interrupt'])
   })
 
+  test('escape stops waiting on a task before it means interrupt', () => {
+    // Killing used to be the only way to reclaim the turn, discarding however
+    // far a build or test run had got. Releasing the wait keeps the work.
+    expect(kinds({
+      ...base,
+      event: { type: 'escape' },
+      isLoading: true,
+      hasStream: true,
+      canReclaimTurn: true,
+    })).toEqual(['reclaim-turn'])
+  })
+
+  test('escape interrupts once nothing is being waited on', () => {
+    // Escalation is by repeat: the first esc releases, the second interrupts.
+    expect(kinds({
+      ...base,
+      event: { type: 'escape' },
+      isLoading: true,
+      hasStream: true,
+      canReclaimTurn: false,
+    })).toEqual(['interrupt'])
+  })
+
+  test('a queued prompt still outranks reclaiming the turn', () => {
+    // Pulling back text the user typed is the more recent intent, and it is
+    // reversible: the wait can still be released with the next esc.
+    expect(kinds({
+      ...base,
+      event: { type: 'escape' },
+      isLoading: true,
+      hasStream: true,
+      hasQueuedPrompt: true,
+      canReclaimTurn: true,
+    })).toEqual(['restore-queued'])
+  })
+
+  test('ctrl-c still interrupts immediately while work is being waited on', () => {
+    // Ctrl+C is the unambiguous stop gesture; only esc gained the softer step.
+    expect(kinds({
+      ...base,
+      event: { type: 'ctrl', key: 'c' },
+      isLoading: true,
+      hasStream: true,
+      canReclaimTurn: true,
+    })).toEqual(['interrupt'])
+  })
+
+  test('compaction escape interrupts regardless of waited-on work', () => {
+    expect(kinds({
+      ...base,
+      event: { type: 'escape' },
+      isLoading: true,
+      isCompacting: true,
+      canReclaimTurn: true,
+    })).toEqual(['interrupt'])
+  })
+
   test('escape clears editor before exiting log mode', () => {
     expect(kinds({ ...base, event: { type: 'escape' }, editor: textEditor, logMode: true })).toEqual(['clear-editor'])
   })
@@ -104,6 +161,13 @@ describe('repl control', () => {
 
   test('selector overlay delegates key', () => {
     expect(kinds({ ...base, event: { type: 'down' }, overlay: selector })).toEqual(['selector-key'])
+  })
+
+  test('down reaches the editor while loading, so ↓ can open the task panel', () => {
+    // Shells usually run mid-turn. If loading swallowed ↓ the way it swallows
+    // typed characters, the gesture the prompt advertises would never fire.
+    expect(kinds({ ...base, event: { type: 'down' }, isLoading: true, hasStream: true }))
+      .toEqual(['normal-key'])
   })
 
   test('ask overlay delegates key', () => {
