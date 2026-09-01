@@ -5,6 +5,7 @@ use std::time::Duration;
 use evotengine::tools::BackgroundReason;
 use evotengine::tools::BashTool;
 use evotengine::tools::ProcessManager;
+use evotengine::tools::ProcessStatus;
 use evotengine::tools::TaskOutputTool;
 use evotengine::tools::TaskStopTool;
 use evotengine::types::AgentTool;
@@ -567,8 +568,10 @@ async fn completion_notification_is_claimed_once() -> Result<(), Box<dyn Error>>
 
 #[test]
 fn yield_schema_advertises_the_generous_foreground_wait() {
-    // A build or test suite routinely runs for a minute. Advertising a 10s
-    // default taught the model that yielding was the normal outcome.
+    // 120s, not the 2s I briefly set here. Claude Code's 2s mark only arms its
+    // ctrl+b hint; the command stays in the foreground until its timeout. Yielding
+    // at 2s would charge the model an extra round trip, on every command slower
+    // than a couple of seconds, to collect a result it was already waiting for.
     let bash = BashTool::new().with_process_manager(Arc::new(ProcessManager::new()));
     let schema = bash.parameters_schema();
     let description = schema["properties"]["yield_time_ms"]["description"]
@@ -581,27 +584,85 @@ fn yield_schema_advertises_the_generous_foreground_wait() {
         description.contains("never interrupts"),
         "got: {description}"
     );
+    // Both directions are legitimate, so neither is discouraged.
+    assert!(description.contains("Lower it"), "got: {description}");
 }
 
 #[test]
-fn timeout_schema_says_it_kills_rather_than_waits() {
-    // The parameter name matches other agents where `timeout` means "watch this
-    // long, then background it". Here it is a SIGKILL deadline, so a model
-    // carrying that prior would sentence its own build to death — which is
-    // exactly what happened to a `pytest` run at `timeout: 180`.
+fn timeout_schema_says_it_bounds_the_wait_rather_than_killing() {
+    // The parameter name carries a strong prior from other tools, where a
+    // timeout kills. It no longer does, so the description has to say so
+    // outright: a model that believes this is a SIGKILL deadline will avoid
+    // setting one at all, or set a huge one, for a parameter that is now safe.
     let bash = BashTool::new().with_process_manager(Arc::new(ProcessManager::new()));
     let schema = bash.parameters_schema();
     let description = schema["properties"]["timeout"]["description"]
         .as_str()
         .unwrap_or_default();
-    assert!(description.contains("SIGKILL"), "got: {description}");
-    // Says the kill still lands after the command has been backgrounded.
     assert!(
-        description.contains("already moved to the background"),
+        description.contains("handed back still running"),
         "got: {description}"
     );
-    // Points at the parameter that actually controls watching.
+    assert!(description.contains("never killed"), "got: {description}");
+    // The one case where it does nothing at all. Without this a model would set
+    // a timeout on a run_in_background call and believe it bounded something.
+    assert!(
+        description.contains("No effect with run_in_background"),
+        "got: {description}"
+    );
+    // Points at the parameter that shortens the wait, and the one that stops it.
     assert!(description.contains("yield_time_ms"), "got: {description}");
+    assert!(description.contains("task_stop"), "got: {description}");
+    // Must not carry the old kill language.
+    assert!(!description.contains("SIGKILL"), "got: {description}");
+    assert!(
+        !description.contains("death sentence"),
+        "got: {description}"
+    );
+}
+
+#[test]
+fn without_background_support_the_timeout_schema_still_promises_a_kill() {
+    // The behaviour differs by runtime, so the description has to as well. A
+    // headless run gets a deadline that really does kill; telling it "never
+    // killed" would be the same trap this work removed, just relocated -- a
+    // model would set a tight timeout believing it only bounded a wait.
+    let bash = BashTool::new();
+    let schema = bash.parameters_schema();
+    let description = schema["properties"]["timeout"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(description.contains("killed"), "got: {description}");
+    assert!(!description.contains("never killed"), "got: {description}");
+    assert!(
+        !description.contains("moved to the background"),
+        "got: {description}"
+    );
+    // No point naming tools this runtime does not have.
+    assert!(!description.contains("task_stop"), "got: {description}");
+    assert!(!description.contains("yield_time_ms"), "got: {description}");
+}
+
+#[test]
+fn the_two_timeout_descriptions_do_not_agree() {
+    // Guards the split itself: if these ever collapse back to one string, one of
+    // the two runtimes is being told the wrong thing about whether its work
+    // survives the deadline.
+    let with_background = BashTool::new().with_process_manager(Arc::new(ProcessManager::new()));
+    let without_background = BashTool::new();
+    let describe = |bash: &BashTool| {
+        bash.parameters_schema()["properties"]["timeout"]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let backgrounding = describe(&with_background);
+    let killing = describe(&without_background);
+    // Non-empty first: two missing keys would also compare unequal-to-nothing and
+    // let a broken lookup pass as a passing assertion.
+    assert!(!backgrounding.is_empty());
+    assert!(!killing.is_empty());
+    assert_ne!(backgrounding, killing);
 }
 
 #[test]
@@ -646,8 +707,10 @@ fn task_output_description_prefers_reading_the_file() {
 #[tokio::test]
 async fn a_command_finishing_inside_the_default_wait_stays_in_the_foreground(
 ) -> Result<(), Box<dyn Error>> {
-    // The regression this guards: `cargo test` (tens of seconds) used to be
-    // yielded, breaking a `test -> commit` chain that had always been serial.
+    // Quick commands still answer inline, which is most of them: a `git status`
+    // or a short script must not cost the model a second round trip to collect
+    // its own output. Anything slower than the 2s window is expected to yield,
+    // so this is the boundary case, not the common one.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new().with_process_manager(manager.clone());
@@ -729,8 +792,9 @@ async fn an_explicit_background_request_is_not_framed_as_a_timeout() -> Result<(
 #[tokio::test]
 async fn a_model_requested_wait_can_exceed_the_old_thirty_second_ceiling(
 ) -> Result<(), Box<dyn Error>> {
-    // MAX_YIELD_TIME used to be 30s, below the new default, so any explicit
-    // request was clamped to less than what omitting the field would give.
+    // MAX_YIELD_TIME used to be 30s, which clamped any explicit request below
+    // what the model asked for. Raising the ceiling is what lets a model keep a
+    // specific command inline despite the short default.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new().with_process_manager(manager.clone());
@@ -779,9 +843,11 @@ async fn a_nonzero_exit_is_reported_as_failed_with_its_code() -> Result<(), Box<
 }
 
 #[tokio::test]
-async fn a_task_killed_past_its_timeout_is_timed_out_not_failed() -> Result<(), Box<dyn Error>> {
-    // `timed_out` and `failed` are different outcomes: the first says nothing
-    // about the command's correctness, so they must not be conflated.
+async fn a_task_past_its_timeout_keeps_running_in_the_background() -> Result<(), Box<dyn Error>> {
+    // The deadline bounds the waiting, not the command. Killing here made
+    // `timeout` a trap: a model setting one to cap its own wait was sentencing
+    // its build to death, and a `timed_out` status invited re-running work that
+    // had in fact been destroyed rather than finished.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new()
@@ -794,22 +860,102 @@ async fn a_task_killed_past_its_timeout_is_timed_out_not_failed() -> Result<(), 
             context("bash", dir.path()),
         )
         .await?;
-    let id = task_id(&started)?;
-    let snapshot = manager
-        .wait(id, Duration::from_secs(5))
-        .await
-        .ok_or("task disappeared")?;
+    let id = task_id(&started)?.to_string();
 
-    assert_eq!(snapshot.status.as_str(), "timed_out");
-    // A timed-out task still reports where its partial output went, so the
-    // model can inspect how far it got.
+    // Well past the deadline, the process is still alive.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let snapshot = manager.snapshot(&id).ok_or("task disappeared")?;
+    assert!(
+        !snapshot.status.is_terminal(),
+        "the deadline must not kill the command, got {:?}",
+        snapshot.status
+    );
+    // Still reports where its output is going, so progress stays inspectable.
     assert!(snapshot.output_path.starts_with(dir.path()));
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
 }
 
 #[tokio::test]
-async fn a_model_requested_timeout_shorter_than_the_default_is_honored(
+async fn a_foreground_command_hitting_its_timeout_is_handed_back_alive(
 ) -> Result<(), Box<dyn Error>> {
+    // The caller stops waiting at the deadline and gets a background result, so
+    // the turn is freed without the work being lost.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = Arc::new(
+        BashTool::new()
+            .with_timeout(Duration::from_millis(300))
+            .with_process_manager(manager.clone()),
+    );
+
+    // A yield far away, so only the timeout can end the foreground wait.
+    let result = bash
+        .execute(
+            serde_json::json!({"command": "sleep 30", "yield_time_ms": 600_000}),
+            context("bash", dir.path()),
+        )
+        .await?;
+
+    assert_eq!(result.details["backgrounded"], true);
+    assert_eq!(result.details["background_reason"], "timeout_elapsed");
+    let body = text(&result);
+    assert!(body.contains("hit its timeout"), "got: {body}");
+    assert!(body.contains("still running"), "got: {body}");
+    // Must not read as the command being over.
+    assert!(!body.contains("was interrupted"), "got: {body}");
+
+    let id = task_id(&result)?.to_string();
+    let snapshot = manager.snapshot(&id).ok_or("task disappeared")?;
+    assert!(!snapshot.status.is_terminal());
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_timed_out_command_still_notifies_on_completion() -> Result<(), Box<dyn Error>> {
+    // The caller has stopped waiting, so a notification is the only way the
+    // result gets back. Without it the deadline would silently swallow it.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = Arc::new(
+        BashTool::new()
+            .with_timeout(Duration::from_millis(250))
+            .with_process_manager(manager.clone()),
+    );
+
+    let result = bash
+        .execute(
+            serde_json::json!({"command": "sleep 0.7; echo survived", "yield_time_ms": 600_000}),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let id = task_id(&result)?.to_string();
+
+    let snapshot = manager
+        .wait(&id, Duration::from_secs(5))
+        .await
+        .ok_or("task disappeared")?;
+    assert_eq!(snapshot.exit_code, Some(0));
+    assert_eq!(snapshot.status.as_str(), "completed");
+
+    let notifications = manager.take_notifications();
+    assert_eq!(notifications.len(), 1, "got: {notifications:?}");
+    assert!(notifications[0].contains(&id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_timeout_does_nothing_to_an_explicitly_backgrounded_task() -> Result<(), Box<dyn Error>> {
+    // `timeout` bounds the foreground wait. `run_in_background: true` has no
+    // wait, so there is nothing for the deadline to end -- it cannot background
+    // a task that is already there, and killing is what this stopped doing.
+    //
+    // Asserted on the exact status rather than `!is_terminal()`: that weaker
+    // check passes whether the deadline was inapplicable or silently mishandled,
+    // which is the difference this test exists to pin.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new()
@@ -826,13 +972,18 @@ async fn a_model_requested_timeout_shorter_than_the_default_is_honored(
             context("bash", dir.path()),
         )
         .await?;
-    let id = task_id(&started)?;
+    let id = task_id(&started)?.to_string();
 
-    let snapshot = manager
-        .wait(id, Duration::from_secs(5))
-        .await
-        .ok_or("task disappeared")?;
-    assert_eq!(snapshot.status.as_str(), "timed_out");
+    // Well past the deadline.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let snapshot = manager.snapshot(&id).ok_or("task disappeared")?;
+    assert_eq!(
+        snapshot.status,
+        ProcessStatus::RunningBackground(BackgroundReason::Explicit),
+        "the deadline must neither kill it nor re-attribute why it is backgrounded",
+    );
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
 }
 
@@ -1993,11 +2144,10 @@ async fn detaching_leaves_explicitly_background_tasks_alone() -> Result<(), Box<
 }
 
 #[tokio::test]
-async fn the_kill_deadline_still_lands_after_a_user_detach() -> Result<(), Box<dyn Error>> {
-    // The `timeout` schema description promises exactly this: the SIGKILL is not
-    // cancelled by moving the task aside. If detaching quietly reprieved a task,
-    // that description would be a lie and a model relying on the deadline would
-    // be misled.
+async fn a_user_detach_is_not_undone_by_the_timeout_deadline() -> Result<(), Box<dyn Error>> {
+    // Once the user has moved a command aside, the deadline passing must not
+    // change anything: it neither kills the command nor re-attributes why it is
+    // in the background. The user's reason is the one the model should see.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = Arc::new(
@@ -2028,17 +2178,20 @@ async fn the_kill_deadline_still_lands_after_a_user_detach() -> Result<(), Box<d
             .len(),
         1
     );
-    let id = task_id(&handle.await??)?.to_string();
+    let result = handle.await??;
+    let id = task_id(&result)?.to_string();
+    assert_eq!(result.details["background_reason"], "user_requested");
 
-    let snapshot = manager
-        .wait(&id, Duration::from_secs(5))
-        .await
-        .ok_or("task disappeared")?;
-    assert_eq!(
-        snapshot.status.as_str(),
-        "timed_out",
-        "the deadline must survive the detach"
+    // Let the deadline pass.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let snapshot = manager.snapshot(&id).ok_or("task disappeared")?;
+    assert!(
+        !snapshot.status.is_terminal(),
+        "the deadline must not kill a detached command, got {:?}",
+        snapshot.status
     );
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
 }
 
@@ -2281,5 +2434,223 @@ async fn a_non_blocking_poll_is_never_counted_as_waiting() -> Result<(), Box<dyn
     assert_eq!(manager.blocking_waiters(), 0);
 
     manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Wire compatibility for the retired `timed_out` state. A timeout now
+// backgrounds instead of killing, so nothing produces this value any more --
+// but sessions and addon JSON written before that change still carry it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn legacy_timed_out_data_still_deserializes() {
+    // Dropping the variant would make old stored sessions unreadable. The writer
+    // stopped emitting it; readers must not stop accepting it.
+    let decoded: ProcessStatus =
+        serde_json::from_str(r#"{"state":"timed_out"}"#).unwrap_or(ProcessStatus::Killed);
+    assert_eq!(decoded, ProcessStatus::TimedOut);
+    assert_eq!(decoded.as_str(), "timed_out");
+    // Still terminal, so a resumed session does not show it as live work.
+    assert!(decoded.is_terminal());
+}
+
+#[test]
+fn every_background_reason_survives_a_round_trip() {
+    // These are persisted inside `running` states, so a renamed or dropped
+    // variant would break resume. TimeoutElapsed is the newest and the one a
+    // strict older reader has never seen.
+    for reason in [
+        BackgroundReason::Explicit,
+        BackgroundReason::YieldElapsed,
+        BackgroundReason::TimeoutElapsed,
+        BackgroundReason::UserRequested,
+        BackgroundReason::MessageDelivery,
+    ] {
+        let status = ProcessStatus::RunningBackground(reason);
+        let encoded = match serde_json::to_string(&status) {
+            Ok(encoded) => encoded,
+            Err(error) => panic!("{reason:?} failed to serialize: {error}"),
+        };
+        let decoded: ProcessStatus = match serde_json::from_str(&encoded) {
+            Ok(decoded) => decoded,
+            Err(error) => panic!("{reason:?} failed to round-trip from {encoded}: {error}"),
+        };
+        assert_eq!(decoded, status, "from {encoded}");
+        // Every background state reports as plain `running` to the UI, whatever
+        // moved it there.
+        assert_eq!(decoded.as_str(), "running");
+        assert!(!decoded.is_terminal());
+    }
+}
+
+#[test]
+fn the_timeout_reason_serializes_under_its_documented_name() {
+    // The addon and TUI match on this string, so the wire name is a contract.
+    let encoded = serde_json::to_string(&ProcessStatus::RunningBackground(
+        BackgroundReason::TimeoutElapsed,
+    ))
+    .unwrap_or_default();
+    assert!(encoded.contains("timeout_elapsed"), "got: {encoded}");
+}
+
+#[tokio::test]
+async fn without_background_support_the_deadline_still_kills() -> Result<(), Box<dyn Error>> {
+    // Headless and readonly runtimes get a bash tool with no process manager, so
+    // there is no yield, no task_output and no notification path. Backgrounding
+    // there would orphan the command with nothing to collect it, so the deadline
+    // remains the only bound and must still kill.
+    //
+    // `make check` caught this: changing the timeout to background unbounded
+    // every non-TUI runtime, which is a worse failure than the trap it fixed.
+    let tool = BashTool::new().with_timeout(Duration::from_millis(100));
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "sleep 10"}),
+            context("bash", &std::env::temp_dir()),
+        )
+        .await;
+
+    let error = match result {
+        Err(error) => error.to_string(),
+        Ok(ok) => panic!("expected a timeout error, got: {}", text(&ok)),
+    };
+    assert!(error.contains("timed out"), "got: {error}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_background_support_the_same_deadline_spares_the_command() -> Result<(), Box<dyn Error>>
+{
+    // The contrast that makes the branch above meaningful: identical timeout,
+    // opposite outcome, decided only by whether the runtime can background.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let tool = BashTool::new()
+        .with_timeout(Duration::from_millis(100))
+        .with_process_manager(manager.clone());
+
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "sleep 10", "yield_time_ms": 600_000}),
+            context("bash", dir.path()),
+        )
+        .await?;
+
+    assert_eq!(result.details["background_reason"], "timeout_elapsed");
+    let id = task_id(&result)?.to_string();
+    let snapshot = manager.snapshot(&id).ok_or("task disappeared")?;
+    assert!(!snapshot.status.is_terminal(), "got {:?}", snapshot.status);
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_yield_lede_reports_the_wait_that_actually_elapsed() -> Result<(), Box<dyn Error>> {
+    // The lede used to interpolate DEFAULT_YIELD_TIME regardless of what was
+    // asked for, so a model requesting a 1s yield was told its command "did not
+    // finish within its 120s foreground wait". False, and it overstates how long
+    // the command has been running -- which is exactly the input a model uses to
+    // decide whether to keep waiting or move on.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new()
+        .with_timeout(Duration::from_secs(30))
+        .with_process_manager(manager.clone());
+
+    let result = bash
+        .execute(
+            serde_json::json!({"command": "sleep 30", "yield_time_ms": 1_000}),
+            context("bash", dir.path()),
+        )
+        .await?;
+
+    assert_eq!(result.details["background_reason"], "yield_elapsed");
+    let body = text(&result);
+    assert!(body.contains("its 1s foreground wait"), "got: {body}");
+    // The default must not appear when it is not the wait that happened.
+    assert!(!body.contains("120s"), "got: {body}");
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_default_yield_lede_still_names_the_default() -> Result<(), Box<dyn Error>> {
+    // The other direction: with no yield_time_ms the number quoted must be the
+    // default that actually governed the wait.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new()
+        .with_timeout(Duration::from_secs(30))
+        .with_process_manager(manager.clone());
+
+    // Detach externally, which reports the configured yield rather than a
+    // deadline -- waiting out the real 120s default would stall the suite.
+    let tool = Arc::new(bash);
+    let watcher = tool.clone();
+    let dir_path = dir.path().to_path_buf();
+    let handle = tokio::spawn(async move {
+        watcher
+            .execute(
+                serde_json::json!({"command": "sleep 30"}),
+                context("bash", &dir_path),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        manager
+            .background_all_foreground(BackgroundReason::YieldElapsed)
+            .len(),
+        1
+    );
+
+    let body = text(&handle.await??);
+    assert!(body.contains("its 120s foreground wait"), "got: {body}");
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_running_limit_tells_the_model_how_to_free_a_slot() -> Result<(), Box<dyn Error>> {
+    // Reachable in a way it was not before: a timeout used to reclaim slots by
+    // killing the process, and now it backgrounds instead, so nothing frees one
+    // except an explicit stop. A bare "limit reached" would leave the model with
+    // no move to make -- and re-running is the move it would guess.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new()
+        .with_timeout(Duration::from_secs(30))
+        .with_process_manager(manager.clone());
+
+    let mut refused = None;
+    // Climb until the per-session cap answers; the exact number is the
+    // manager's business, not this test's.
+    for _ in 0..64 {
+        match bash
+            .execute(
+                serde_json::json!({"command": "sleep 30", "run_in_background": true}),
+                context("bash", dir.path()),
+            )
+            .await
+        {
+            Ok(_) => continue,
+            Err(error) => {
+                refused = Some(error.to_string());
+                break;
+            }
+        }
+    }
+
+    let message = refused.ok_or("the running limit never engaged")?;
+    assert!(message.contains("Too many running"), "got: {message}");
+    assert!(message.contains("task_stop"), "got: {message}");
+
+    manager
+        .terminate_all_and_wait(Duration::from_secs(10))
+        .await;
     Ok(())
 }

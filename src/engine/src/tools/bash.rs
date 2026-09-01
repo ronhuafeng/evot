@@ -28,10 +28,15 @@ const MAX_DISPLAY_BYTES: usize = 50 * 1024;
 const MAX_LINE_BYTES: usize = 4096;
 /// Default foreground wait before a still-running command is yielded.
 ///
-/// Deliberately generous: a build or test suite routinely runs for a minute,
-/// and a command that gets yielded mid-dependency-chain (`cargo test` before
-/// `git commit`) is the expensive failure — the model has to notice the task ID
-/// and wait, where staying in the foreground would just have worked.
+/// Generous on purpose. Claude Code's equivalent is its command timeout
+/// (10 minutes), not the 2s mark: at 2s it only arms ctrl+b and shows the
+/// background hint, leaving the command in the foreground. Yielding early
+/// instead would make the model pay a second round trip to collect a result it
+/// was already waiting for, on every command slower than a couple of seconds.
+///
+/// The equivalent hint here lives in the TUI, which shows `ctrl+b to
+/// background` for as long as a command is being watched. That is a rendering
+/// concern, so no threshold belongs on this side.
 const DEFAULT_YIELD_TIME: Duration = Duration::from_secs(120);
 /// Longest model-requested foreground wait.
 const MAX_YIELD_TIME: Duration = Duration::from_secs(600);
@@ -145,7 +150,11 @@ impl AgentTool for BashTool {
 
     fn description(&self) -> &str {
         if self.background_enabled {
-            "Execute a bash command. Short commands return normally. Set run_in_background to return immediately, or use yield_time_ms to control how long to wait before returning a background task ID. The timeout parameter remains the command's hard runtime limit."
+            // `{{task_stop}}` resolves here because descriptions pass through
+            // `resolve_tool_refs`. The schema below and BACKGROUND_GUIDANCE do
+            // not, so those must keep literal names or the model would be shown
+            // a raw `{{...}}`.
+            "Execute a bash command. Short commands return normally. Set run_in_background to return immediately, or use yield_time_ms to control how long to wait before returning a background task ID. Neither yielding nor the timeout stops the command: both hand it back still running. Use {{task_stop}} to actually stop one."
         } else {
             "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). The timeout parameter is the command's hard runtime limit."
         }
@@ -161,8 +170,15 @@ impl AgentTool for BashTool {
 
     fn prompt_guidelines(&self) -> Vec<&str> {
         if self.background_enabled {
+            // `{{task_output}}` rather than the literal name: Claude models see
+            // this tool as `TaskOutput`, so a hardcoded `task_output` names a
+            // tool that does not exist for them.
+            //
+            // Ordering matches the per-result guidance and the tool's own
+            // schema — read the output path first, block only when a later step
+            // cannot proceed. Offering them as equals here contradicted both.
             vec![
-                "For long-running commands that can continue independently, use `run_in_background: true` and inspect the returned output path or use `task_output`.",
+                "For long-running commands that can continue independently, use `run_in_background: true` and inspect the returned output path; call {{task_output}} only when a later step cannot proceed without the result.",
             ]
         } else {
             Vec::new()
@@ -177,7 +193,16 @@ impl AgentTool for BashTool {
             },
             "timeout": {
                 "type": "number",
-                "description": "Hard kill deadline in seconds (default 600, max 1800). The command is SIGKILLed when it elapses, even if it has already moved to the background — this is a death sentence, not a wait. Leave it unset unless you want the command dead by a specific time; to control how long to watch a command, use yield_time_ms instead."
+                // Branch-specific because the behaviour is. With background
+                // support the deadline hands the command back alive; without it
+                // there is nowhere to hand it, so it still kills. One shared
+                // sentence would be a lie in whichever half it did not describe,
+                // and "it is never killed" is the more dangerous lie to tell.
+                "description": if self.background_enabled {
+                    "Deadline in seconds for bounding your wait (default 600, max 1800). When it elapses the command is handed back still running — it is never killed. No effect with run_in_background, which has no wait to bound. Use yield_time_ms to be handed a command back sooner; use task_stop to actually stop one."
+                } else {
+                    "Hard runtime limit in seconds (default 600, max 1800). The command is killed when it elapses, so set it above the time the command legitimately needs."
+                }
             }
         });
         if self.background_enabled {
@@ -186,7 +211,7 @@ impl AgentTool for BashTool {
                     "yield_time_ms".into(),
                     serde_json::json!({
                         "type": "number",
-                        "description": "How long to watch a command in the foreground before handing it back as a background task, in ms (default 120000, max 600000). Yielding never interrupts the command; it keeps running and its output keeps accumulating. Raise this to watch longer, not to keep a command alive."
+                        "description": "How long to watch a command in the foreground before handing it back as a background task, in ms (default 120000, max 600000). Yielding never interrupts the command; it keeps running and its output keeps accumulating. Lower it when you do not need the result inline; raise it to keep waiting."
                     }),
                 );
                 properties.insert(
@@ -271,11 +296,22 @@ impl AgentTool for BashTool {
                 output_dir,
                 tail_bytes: self.max_output_bytes,
                 background_reason: run_in_background.then_some(BackgroundReason::Explicit),
+                // Only meaningful where background support exists. Without it
+                // there is no yield, no task_output and no notification, so a
+                // backgrounded command would be orphaned with nothing to collect
+                // it — the deadline has to stay a kill.
+                background_on_timeout: self.background_enabled,
             })
             .await?;
 
         if run_in_background {
-            return background_result(&self.process_manager, &task_id, BackgroundReason::Explicit);
+            // No wait elapsed: backgrounding was the request, not an outcome.
+            return background_result(
+                &self.process_manager,
+                &task_id,
+                BackgroundReason::Explicit,
+                None,
+            );
         }
 
         let started = Instant::now();
@@ -304,7 +340,7 @@ impl AgentTool for BashTool {
             // Hand it back as a background result: the command keeps running, so
             // the only thing that ends here is the waiting.
             if let ProcessStatus::RunningBackground(reason) = snapshot.status {
-                return background_result(&self.process_manager, &task_id, reason);
+                return background_result(&self.process_manager, &task_id, reason, yield_time);
             }
 
             let elapsed = started.elapsed();
@@ -317,6 +353,7 @@ impl AgentTool for BashTool {
                         &self.process_manager,
                         &task_id,
                         BackgroundReason::YieldElapsed,
+                        yield_time,
                     );
                 }
                 return completed_result(
@@ -388,13 +425,14 @@ fn background_result(
     manager: &ProcessManager,
     task_id: &str,
     reason: BackgroundReason,
+    waited: Option<Duration>,
 ) -> Result<ToolResult, ToolError> {
     let snapshot = manager
         .snapshot(task_id)
         .ok_or_else(|| ToolError::Failed(format!("Process task disappeared: {task_id}")))?;
     let text = format!(
         "{}\nTask ID: {}\nOutput: {}\n{}",
-        background_lede(reason),
+        background_lede(reason, waited),
         snapshot.task_id,
         snapshot.output_path.display(),
         BACKGROUND_GUIDANCE,
@@ -417,12 +455,29 @@ fn background_result(
 /// An explicit `run_in_background` needs no explanation, but a command the
 /// harness moved on its own does: without the reason the model cannot tell an
 /// intentional detach from one it should wait out.
-fn background_lede(reason: BackgroundReason) -> String {
+///
+/// `waited` is the wait that actually elapsed. It has to be passed in rather
+/// than read from [`DEFAULT_YIELD_TIME`]: a model that asked for
+/// `yield_time_ms: 5000` was being told its command "did not finish within its
+/// 120s foreground wait", which is false and, worse, overstates how long the
+/// command has already been running.
+fn background_lede(reason: BackgroundReason, waited: Option<Duration>) -> String {
     match reason {
-        BackgroundReason::YieldElapsed => format!(
-            "Command did not finish within its {}s foreground wait and was moved to the background; it was not interrupted.",
-            DEFAULT_YIELD_TIME.as_secs()
-        ),
+        BackgroundReason::YieldElapsed => match waited {
+            Some(waited) => format!(
+                "Command did not finish within its {}s foreground wait and was moved to the background; it was not interrupted.",
+                waited.as_secs()
+            ),
+            None => "Command did not finish within its foreground wait and was moved to the background; it was not interrupted.".to_string(),
+        },
+        // A timeout no longer kills, so the lede must not imply the work is over.
+        // A model that reads "timed out" as "dead" would re-run a build that is
+        // still going, which is the failure the old kill behaviour caused.
+        BackgroundReason::TimeoutElapsed => concat!(
+            "Command hit its timeout and was moved to the background; it was not interrupted and is still running. ",
+            "The timeout bounded the wait, not the command.",
+        )
+        .to_string(),
         // The user moved this aside, which is not the same as abandoning it:
         // saying only "running in the background" would let the model treat the
         // result as unwanted and skip a step that still depends on it.
@@ -453,6 +508,13 @@ fn background_lede(reason: BackgroundReason) -> String {
 /// blocking `task_output` occupies the whole turn, which throws away the point
 /// of backgrounding. Blocking is named last and only for the case that
 /// genuinely needs it.
+///
+/// Tool names stay literal here. This is a tool-result body, which never passes
+/// through `resolve_tool_refs`, so a `{{task_output}}` placeholder would reach
+/// the model raw. The names being canonical rather than per-model is harmless:
+/// `matches_call_name` is case-insensitive and accepts every alias, so a Claude
+/// model that reads `task_output` here and calls it still dispatches, even
+/// though its own schema spells the tool `TaskOutput`.
 const BACKGROUND_GUIDANCE: &str = concat!(
     "You will be notified when it completes, so you do not need to poll for it. ",
     "To see progress now, use Read on the output path — it costs nothing and leaves you free to keep working. ",

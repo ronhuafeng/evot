@@ -55,7 +55,8 @@ struct ProcessManagerInner {
     /// A blocking wait occupies the whole turn while the task it watches is
     /// already backgrounded, so no foreground shell exists for the user to
     /// detach. Without this count the UI cannot tell that state apart from an
-    /// ordinary model call, and esc has nothing softer to offer than a kill.
+    /// ordinary model call, and ctrl+b would look inert exactly when it is the
+    /// key that helps.
     blocking_waiters: AtomicUsize,
     /// Bumped to tell in-flight blocking waits to give up the turn.
     ///
@@ -257,7 +258,8 @@ impl ProcessManager {
             .count();
         if running >= MAX_RUNNING_TASKS {
             return Err(ToolError::Failed(format!(
-                "Too many running background processes (limit: {MAX_RUNNING_TASKS})"
+                "Too many running background processes (limit: {MAX_RUNNING_TASKS}). \
+                 Use task_stop on tasks you no longer need before starting more."
             )));
         }
         if tasks.len() >= MAX_TRACKED_TASKS {
@@ -267,12 +269,17 @@ impl ProcessManager {
         }
         drop(tasks);
 
+        // Both running limits name a remedy now. A timeout used to reclaim slots
+        // on its own by killing the process; it backgrounds instead, so nothing
+        // frees a slot except an explicit stop or session teardown. A bare
+        // "limit reached" would leave the model with no move to make.
         let global_permit = GLOBAL_PROCESS_PERMITS
             .clone()
             .try_acquire_owned()
             .map_err(|_| {
                 ToolError::Failed(format!(
-                    "Too many running processes across sessions (limit: {MAX_GLOBAL_RUNNING_TASKS})"
+                    "Too many running processes across sessions (limit: {MAX_GLOBAL_RUNNING_TASKS}). \
+                     Other sessions hold some of these; use task_stop on tasks this session no longer needs."
                 ))
             })?;
         let task_id = Uuid::new_v4().to_string();
@@ -353,17 +360,40 @@ impl ProcessManager {
         tokio::spawn(async move {
             let timeout = tokio::time::sleep(request.timeout);
             tokio::pin!(timeout);
-            let (wait_result, forced_status) = tokio::select! {
-                result = child.wait() => (result, None),
-                _ = task.cancel.cancelled() => {
-                    let requested = task.state.lock().requested_status.clone()
-                        .unwrap_or(ProcessStatus::Killed);
-                    let _ = child.kill().await;
-                    (child.wait().await, Some(requested))
-                }
-                _ = &mut timeout => {
-                    let _ = child.kill().await;
-                    (child.wait().await, Some(ProcessStatus::TimedOut))
+            let mut timed_out = false;
+            let (wait_result, forced_status) = loop {
+                tokio::select! {
+                    result = child.wait() => break (result, None),
+                    _ = task.cancel.cancelled() => {
+                        let requested = task.state.lock().requested_status.clone()
+                            .unwrap_or(ProcessStatus::Killed);
+                        let _ = child.kill().await;
+                        break (child.wait().await, Some(requested));
+                    }
+                    // The deadline hands the command to the background instead of
+                    // killing it. A `timeout` that destroyed work made the
+                    // parameter a trap: a model setting one to bound its own wait
+                    // was sentencing its build to death. Killing stays an explicit
+                    // act — task_stop, or the user.
+                    //
+                    // Unless this runtime cannot background at all, in which case
+                    // the deadline is the only bound there is and still kills.
+                    _ = &mut timeout, if !timed_out => {
+                        timed_out = true;
+                        if !request.background_on_timeout {
+                            let _ = child.kill().await;
+                            break (child.wait().await, Some(ProcessStatus::TimedOut));
+                        }
+                        let mut state = task.state.lock();
+                        if matches!(state.status, ProcessStatus::RunningForeground) {
+                            state.status = ProcessStatus::RunningBackground(
+                                BackgroundReason::TimeoutElapsed,
+                            );
+                            // The caller stops waiting, so completion has to
+                            // arrive as a notification or the result is lost.
+                            state.notify_on_completion = true;
+                        }
+                    }
                 }
             };
 
@@ -979,6 +1009,10 @@ fn notification_summary(snapshot: &ProcessSnapshot) -> String {
     match snapshot.status {
         ProcessStatus::Completed => format!("Command \"{}\" completed", command),
         ProcessStatus::Failed => format!("Command \"{}\" failed", command),
+        // Retired: a timeout backgrounds rather than kills, and the one runtime
+        // where it still kills never notifies (`notify_on_completion` is only
+        // armed for a background reason). Kept so a legacy snapshot read back
+        // from a stored session still describes itself.
         ProcessStatus::TimedOut => format!("Command \"{}\" timed out", command),
         // Cancelled, not merely stopped: the work is void. Mirrors Claude
         // Code's phrasing for a user-stopped agent — "won't be resumed" plus a
