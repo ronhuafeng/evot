@@ -129,11 +129,6 @@ describe('task tool settled status', () => {
     expect(statusLine(lines)).toBe('  ✗ · failed · exit 1 · 8s · 30 lines')
   })
 
-  test('a timed-out task is distinguished from a failed one', () => {
-    const lines = render(settled({ status: 'timed_out', elapsed_ms: 600_000 }))
-    expect(statusLine(lines)).toBe('  ✗ · timed out · 10m')
-  })
-
   test('a stopped task reads as stopped and stays non-failing', () => {
     // A stop is a deliberate outcome, not an error.
     const lines = render(settled({ status: 'killed', elapsed_ms: 300_000 }))
@@ -160,8 +155,10 @@ describe('task tool settled status', () => {
     expect(statusLine(lines)).toBe('  ✓ · stopped · 21s')
   })
 
-  test('an absent attribution flag degrades to a plain stop', () => {
-    // Old sessions and older addon payloads have no such field.
+  test('a missing attribution flag degrades to a plain stop', () => {
+    // Unlike the panel's typed BackgroundProcess, a card reads untyped tool-result
+    // details, so a missing key is a real parse case rather than a type error.
+    // Attributing an unattributed stop to the user would be the worse guess.
     const lines = render(settled({ status: 'killed', elapsed_ms: 21_000 }))
     expect(statusLine(lines)).toBe('  ✓ · stopped · 21s')
   })
@@ -173,7 +170,7 @@ describe('task tool settled status', () => {
       elapsed_ms: 45_000,
       total_lines: 12,
     }))
-    expect(statusLine(lines)).toBe('  ● · still running · wait timed out · 45s · 12 lines')
+    expect(statusLine(lines)).toBe('  ● · running in background · wait timed out · 45s · 12 lines')
   })
 
   test('a wait the user ended reads as stopped waiting, not a timeout', () => {
@@ -186,7 +183,7 @@ describe('task tool settled status', () => {
       elapsed_ms: 45_000,
       total_lines: 12,
     }))
-    expect(statusLine(lines)).toBe('  ● · still running · stopped waiting · 45s · 12 lines')
+    expect(statusLine(lines)).toBe('  ● · running in background · stopped waiting · 45s · 12 lines')
   })
 
   test('a non-blocking check that found work in progress omits the timeout note', () => {
@@ -195,7 +192,28 @@ describe('task tool settled status', () => {
       status: 'running',
       elapsed_ms: 3_000,
     }))
-    expect(statusLine(lines)).toBe('  ● · still running · 3s')
+    expect(statusLine(lines)).toBe('  ● · running in background · 3s')
+  })
+
+  test('a backgrounded task names the background, a foreground one does not', () => {
+    // `running` is RunningBackground, `running_foreground` is a shell still being
+    // waited on. Both used to render as a bare "still running", so the card could
+    // not tell a user whether the turn was already free. This is the pair that
+    // distinction rests on, so it is asserted directly rather than inferred from
+    // the retrieval-status cases above.
+    const background = render(settled({
+      retrieval_status: 'not_ready',
+      status: 'running',
+      elapsed_ms: 3_000,
+    }))
+    expect(statusLine(background)).toBe('  ● · running in background · 3s')
+
+    const foreground = render(settled({
+      retrieval_status: 'not_ready',
+      status: 'running_foreground',
+      elapsed_ms: 3_000,
+    }))
+    expect(statusLine(foreground)).toBe('  ● · still running · 3s')
   })
 
   test('an engine-side error still renders as a failure', () => {

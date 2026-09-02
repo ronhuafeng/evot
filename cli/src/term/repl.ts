@@ -43,7 +43,7 @@ import {
   type ViewBlock,
 } from './viewmodel/index.js'
 import { joinLeftRight, spansWidth } from './viewmodel/width.js'
-import { createAdSlotState, tickAdSlot, triggerAdSlot, queueAdSlotTransition, buildAdSlotBlocks, type AdSlotState } from './viewmodel/ad-slot.js'
+import { createAdSlotState, tickAdSlot, triggerAdSlot, queueAdSlotTransition, buildAdSlotBlocks, campaignFingerprint, type AdSlotState } from './viewmodel/ad-slot.js'
 import { HistoryRenderCache } from './viewmodel/history-cache.js'
 import { Committer } from './committer.js'
 import {
@@ -99,7 +99,7 @@ import {
   type AskUserParams,
 } from './host-tools.js'
 import { extractPlanItems, type PlanModeItem } from './plan-mode.js'
-import { currentModelSpec, formatModelLabel, formatModelOptionLabel, isCloudModel, modelOptions, modelSelectorItems, providerDisplayName, selectModelOption } from './app/provider.js'
+import { currentModelSpec, formatModelLabel, formatModelOptionLabel, hasPremiumModel, isCloudModel, modelOptions, modelSelectorItems, providerDisplayName, selectModelOption } from './app/provider.js'
 import chalk from 'chalk'
 import {
   shouldCollapse,
@@ -200,6 +200,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     ...createInitialState(agent.model, agent.cwd),
   }
   let spinnerState = createSpinnerState()
+  /**
+   * Spinner state for the idle wait on a detached task.
+   *
+   * Separate from `spinnerState` so the two never overwrite each other: a run
+   * starting mid-wait resets its own animation, and the wait keeps its own
+   * elapsed clock rather than inheriting the last run's.
+   */
+  let backgroundWaitSpinner = setSpinnerPhase(createSpinnerState(), 'awaiting_background')
+  let backgroundWaitSince: number | null = null
   let manualCompactionPhase: string | null = null
   let editor: EditorState = createEditorState()
   // Undo stack lives outside EditorState so snapshots stay plain data. Cleared
@@ -247,20 +256,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   let exitHint = false
   let exitHintTimer: ReturnType<typeof setTimeout> | null = null
   let overlay: OverlayState = { kind: 'none' }
-  const adSlot: AdSlotState = createAdSlotState(
-    authNotices().map(n => ({
-      id: n.id,
-      kind: n.kind,
-      priority: n.priority,
-      title: n.title,
-      body: n.body_md ?? '',
-    })),
-  )
-  // Logged-in users see the slot from the start — no need to wait for a
-  // task to finish. The live sync below refreshes content first.
-  if (adSlot.notices.length > 0 || adSlot.ads.length > 0) {
-    triggerAdSlot(adSlot, Date.now())
-  }
+  // Assigned after configInfo below, which decides the premium intake filter.
+  let adSlot: AdSlotState
   // Promise-based bridge for the ask-user overlay. Both the `ask_user` host
   // tool and the plan-review flow present questions through the same overlay
   // and await the user's answers here. Resolves with the collected answers, or
@@ -504,6 +501,23 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     try { configInfo = agent.configInfo() } catch {}
   }
   refreshConfigInfo()
+
+  const premiumAccount = hasPremiumModel(configInfo)
+  adSlot = createAdSlotState(
+    authNotices().map(n => ({
+      id: n.id,
+      kind: n.kind,
+      priority: n.priority,
+      title: n.title,
+      body: n.body_md ?? '',
+    })),
+    { premium: premiumAccount },
+  )
+  // Logged-in users see the slot from the start — no need to wait for a
+  // task to finish. The live sync below refreshes content first.
+  if (adSlot.notices.length > 0 || adSlot.ads.length > 0) {
+    triggerAdSlot(adSlot, Date.now())
+  }
 
   /** Single cloud-session status line; updates replace it in place. */
   function commitCloudSession(text: string, tone: 'dim' | 'ok' | 'warn'): void {
@@ -839,6 +853,25 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       spinnerBlock = {
         lines: wrapTextWithAnsi(spinnerText, renderer.termCols).map(text => ({ spans: [{ text }] })),
         // Separating blank above the status row; queue rows bring their own.
+        marginTop: 1,
+      }
+    } else if (backgroundWaitSince !== null && overlay.kind !== 'ask-user') {
+      // Idle, but a detached task is still running and will wake the agent when
+      // it finishes. Without a status row here the transcript looks finished, so
+      // a user watching a long build would conclude the work had stopped.
+      //
+      // Elapsed is measured from when the wait began, not from the last run, so
+      // the clock reads as the age of the wait itself.
+      const waitText = formatSpinnerLine(
+        { ...backgroundWaitSpinner, phaseStartedAt: backgroundWaitSince },
+        Date.now(),
+        // No per-call usage belongs to a wait: nothing is being spent while the
+        // agent is parked.
+        undefined,
+        { model: appState.model },
+      )
+      spinnerBlock = {
+        lines: wrapTextWithAnsi(waitText, renderer.termCols).map(text => ({ spans: [{ text }] })),
         marginTop: 1,
       }
     }
@@ -1330,11 +1363,46 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     panelOpen: () => overlay.kind === 'selector' && isBackgroundPanelTitle(overlay.state.title),
     panelState: () =>
       overlay.kind === 'selector' && isBackgroundPanelTitle(overlay.state.title) ? overlay.state : null,
+    // A run drains the notification queue itself between turns, so waking is
+    // only for the idle case.
+    runInFlight: () => isLoading,
+    queuedMessages: () => queuedUserMessages.length + queuedCompactionSubmissions.length,
+    // An ask overlay is the agent waiting on the user: seizing the turn would
+    // answer a question they have not answered yet.
+    overlayBlocking: () => overlay.kind === 'ask-user',
+    wakeForNotifications: () => {
+      // No text: build_turn puts the queued completion notices into this turn's
+      // input, so a synthetic prompt would duplicate what the model just read.
+      // Fire-and-forget because the poll cannot await; runQuery owns its own
+      // lifecycle and errors from here.
+      void runQuery('')
+    },
   })
 
   function refreshBackgroundProcesses(): void {
     backgroundTerminals.refresh()
+    // Track the idle wait alongside the poll that discovers it. A live
+    // background task will wake the agent when it finishes, so while one is
+    // running the agent is genuinely parked rather than done.
+    const waiting = backgroundTerminals.runningCount() > 0
+    if (waiting && backgroundWaitSince === null) {
+      backgroundWaitSince = Date.now()
+      renderer.requestRender()
+    } else if (!waiting && backgroundWaitSince !== null) {
+      backgroundWaitSince = null
+      renderer.requestRender()
+    }
   }
+
+  // Animates the idle wait row. The spinner timer only runs during a turn, and
+  // the ad-slot ticker stops whenever an overlay owns the screen, so neither can
+  // be relied on to keep this glyph moving.
+  const backgroundWaitTimer = setInterval(() => {
+    if (isLoading || backgroundWaitSince === null) return
+    backgroundWaitSpinner = advanceSpinner(backgroundWaitSpinner)
+    renderer.requestRender()
+  }, SPINNER_INTERVAL_MS)
+  ;(backgroundWaitTimer as unknown as { unref?: () => void }).unref?.()
 
   /** Insert pasted text, collapsing large pastes into refs. */
   function insertPaste(raw: string) {
@@ -2639,10 +2707,6 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }))
   }
 
-  function campaignFingerprint(campaign: { id: string; title: string; body: string; kind: string; priority?: number }): string {
-    return `${campaign.id}\0${campaign.kind}\0${campaign.priority ?? 0}\0${campaign.title}\0${campaign.body}`
-  }
-
   /** Re-read the synced catalog: refresh model config and the ad/notice slot.
    *  Called after login, by the live-sync poller, and on demand. */
   function reloadCloudContent(fresh = cloudCampaigns()): void {
@@ -2657,8 +2721,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       shownAt: adSlot.shownAt,
       rotationDueAt: adSlot.rotationDueAt,
       queuedId: adSlot.queuedId,
+      shownFingerprints: adSlot.shownFingerprints,
     }
-    Object.assign(adSlot, createAdSlotState(fresh), keep)
+    // Re-read, not cached: a mid-session login can grant a premium model.
+    const premium = hasPremiumModel(configInfo)
+    Object.assign(
+      adSlot,
+      createAdSlotState(fresh, { premium, shownFingerprints: adSlot.shownFingerprints }),
+      keep,
+    )
     const showing = [...adSlot.notices, ...adSlot.ads].find(campaign => campaign.id === adSlot.currentId)
     if (adSlot.currentId && !showing) {
       adSlot.currentId = null
@@ -3225,6 +3296,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     clearInterval(adSlotTimer)
     clearInterval(syncTimer)
     clearInterval(backgroundProcessTimer)
+    clearInterval(backgroundWaitTimer)
     authWatcher?.dispose()
     authWatcher = null
     caretBlink.dispose()

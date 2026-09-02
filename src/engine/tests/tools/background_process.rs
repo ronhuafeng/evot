@@ -667,41 +667,48 @@ fn the_two_timeout_descriptions_do_not_agree() {
 
 #[test]
 fn block_schema_names_the_cost_of_waiting() {
-    // `block` defaults to true, so the heaviest behaviour is what a model gets
-    // by saying nothing. The description has to price it: a blocking call holds
-    // the whole turn, which undoes the backgrounding it was called about.
+    // `block` defaults to true, so the heaviest behaviour is what a model gets by
+    // saying nothing. The description has to price it — but pricing is all it
+    // should do. Calling a blocking wait "throwing away the point" of
+    // backgrounding told a model its legitimate use was a mistake.
     let output = TaskOutputTool::new(Arc::new(ProcessManager::new()));
     let schema = output.parameters_schema();
     let description = schema["properties"]["block"]["description"]
         .as_str()
         .unwrap_or_default();
     assert!(description.contains("default true"), "got: {description}");
-    assert!(
-        description.contains("occupies your whole turn"),
-        "got: {description}"
-    );
+    // The cost, stated plainly.
+    assert!(description.contains("holds the turn"), "got: {description}");
     // Says why that matters, rather than leaving it as an abstract cost.
     assert!(
         description.contains("cannot be answered"),
         "got: {description}"
     );
-    // Offers the cheap alternative and confines blocking to the case that needs it.
+    // The other mode is offered, with the situation it suits.
     assert!(description.contains("false"), "got: {description}");
-    assert!(
-        description.contains("cannot proceed without"),
-        "got: {description}"
-    );
+    // No language that frames waiting as a misuse of the tool.
+    assert!(!description.contains("throws away"), "got: {description}");
 }
 
 #[test]
-fn task_output_description_prefers_reading_the_file() {
-    // The tool summary is what a model reads before it ever looks at `block`.
-    // Leading with "can optionally wait" presented the expensive path as the
-    // headline feature.
+fn task_output_description_states_both_modes() {
+    // The tool summary is what a model reads before it ever looks at `block`. It
+    // should say what the tool does; ranking the two paths here ("reading is
+    // usually better") editorialised against the tool's own purpose.
     let output = TaskOutputTool::new(Arc::new(ProcessManager::new()));
     let description = output.description();
+    // Both modes named, so `block` is not a surprise discovered later.
+    assert!(
+        description.contains("Waits for the task"),
+        "got: {description}"
+    );
+    assert!(description.contains("block: false"), "got: {description}");
+    // The file is mentioned as available, not as the better choice.
     assert!(description.contains("output file"), "got: {description}");
-    assert!(description.contains("costs nothing"), "got: {description}");
+    assert!(
+        !description.contains("usually better"),
+        "got: {description}"
+    );
 }
 
 #[tokio::test]
@@ -755,15 +762,14 @@ async fn a_yielded_command_tells_the_model_to_wait_before_dependent_steps(
         body.contains("never treat a started task as a passed one"),
         "got: {body}"
     );
-    // Blocking is the last resort, not the default: reading the file is free,
-    // while `task_output` occupies the turn and undoes the backgrounding.
-    let read_at = body.find("Read on the output path");
-    let block_at = body.find("task_output");
-    assert!(
-        read_at.is_some() && block_at.is_some() && read_at < block_at,
-        "reading should be offered before blocking; got: {body}"
-    );
-    assert!(body.contains("blocks your whole turn"), "got: {body}");
+    // Both ways of collecting the result are present, each with what it is for.
+    // Order is not asserted: ranking them is what carried Claude Code's stance
+    // that a blocking wait wastes the backgrounding, and waiting on a result the
+    // next step needs is exactly what task_output is for.
+    assert!(body.contains("Read on the output path"), "got: {body}");
+    // The cost of waiting is still stated, just not as a reprimand.
+    assert!(body.contains("holds the turn"), "got: {body}");
+    assert!(!body.contains("do not use it merely"), "got: {body}");
     Ok(())
 }
 
@@ -915,9 +921,12 @@ async fn a_foreground_command_hitting_its_timeout_is_handed_back_alive(
 }
 
 #[tokio::test]
-async fn a_timed_out_command_still_notifies_on_completion() -> Result<(), Box<dyn Error>> {
+async fn a_command_past_its_deadline_notifies_when_it_finishes() -> Result<(), Box<dyn Error>> {
     // The caller has stopped waiting, so a notification is the only way the
     // result gets back. Without it the deadline would silently swallow it.
+    //
+    // Named for the deadline, not a `timed_out` status: the command here reaches
+    // `completed`, because the deadline ends the wait rather than the work.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = Arc::new(
@@ -988,7 +997,7 @@ async fn a_timeout_does_nothing_to_an_explicitly_backgrounded_task() -> Result<(
 }
 
 #[tokio::test]
-async fn an_explicitly_stopped_task_is_killed_not_timed_out() -> Result<(), Box<dyn Error>> {
+async fn an_explicitly_stopped_task_reports_killed() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new().with_process_manager(manager.clone());
@@ -1223,13 +1232,22 @@ async fn notifications_arrive_in_completion_order() -> Result<(), Box<dyn Error>
 
     // Started together, staggered so completion order is deterministic and the
     // reverse of nothing in particular — it must follow finishing, not spawning.
+    //
+    // Backgrounded by a short yield rather than `run_in_background`: only one
+    // deliberate background task is allowed at a time, while a command handed
+    // back because its wait elapsed is uncapped. Either way these are live
+    // background tasks, which is all this test needs.
+    //
+    // Every delay clears the foreground loop's 100ms poll, so each command is
+    // still running when the yield hands it back. A command that finishes first
+    // returns a terminal result and no task id at all.
     let mut ids = Vec::new();
-    for (label, delay) in [("third", "0.5"), ("first", "0.05"), ("second", "0.25")] {
+    for (label, delay) in [("third", "0.9"), ("first", "0.3"), ("second", "0.6")] {
         let started = bash
             .execute(
                 serde_json::json!({
                     "command": format!("sleep {delay}; echo {label}"),
-                    "run_in_background": true,
+                    "yield_time_ms": 20,
                 }),
                 context("bash", dir.path()),
             )
@@ -1272,7 +1290,7 @@ async fn summaries_are_ordered_by_runtime_so_the_newest_task_is_last() -> Result
     for _ in 0..3 {
         let started = bash
             .execute(
-                serde_json::json!({"command": "sleep 5", "run_in_background": true}),
+                serde_json::json!({"command": "sleep 5", "yield_time_ms": 20}),
                 context("bash", dir.path()),
             )
             .await?;
@@ -1407,7 +1425,7 @@ async fn stop_all_attributes_every_task_to_the_user() -> Result<(), Box<dyn Erro
 
     for _ in 0..3 {
         bash.execute(
-            serde_json::json!({"command": "sleep 30", "run_in_background": true}),
+            serde_json::json!({"command": "sleep 30", "yield_time_ms": 20}),
             context("bash", dir.path()),
         )
         .await?;
@@ -2438,60 +2456,34 @@ async fn a_non_blocking_poll_is_never_counted_as_waiting() -> Result<(), Box<dyn
 }
 
 // ---------------------------------------------------------------------------
-// Wire compatibility for the retired `timed_out` state. A timeout now
-// backgrounds instead of killing, so nothing produces this value any more --
-// but sessions and addon JSON written before that change still carry it.
+// Wire names the TUI matches on. Nothing here is persisted -- the manager is
+// in-memory and dies with the process -- so these are one-way: the engine
+// writes them into tool-result details and `output.ts` switches on the strings.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn legacy_timed_out_data_still_deserializes() {
-    // Dropping the variant would make old stored sessions unreadable. The writer
-    // stopped emitting it; readers must not stop accepting it.
-    let decoded: ProcessStatus =
-        serde_json::from_str(r#"{"state":"timed_out"}"#).unwrap_or(ProcessStatus::Killed);
-    assert_eq!(decoded, ProcessStatus::TimedOut);
-    assert_eq!(decoded.as_str(), "timed_out");
-    // Still terminal, so a resumed session does not show it as live work.
-    assert!(decoded.is_terminal());
-}
-
-#[test]
-fn every_background_reason_survives_a_round_trip() {
-    // These are persisted inside `running` states, so a renamed or dropped
-    // variant would break resume. TimeoutElapsed is the newest and the one a
-    // strict older reader has never seen.
-    for reason in [
-        BackgroundReason::Explicit,
-        BackgroundReason::YieldElapsed,
-        BackgroundReason::TimeoutElapsed,
-        BackgroundReason::UserRequested,
-        BackgroundReason::MessageDelivery,
+fn every_background_reason_serializes_under_the_name_the_tui_matches() {
+    // `output.ts` switches on these exact strings to say *why* a command went to
+    // the background, falling back to neutral wording on an unknown one. A rename
+    // here silently degrades every one of those cards.
+    for (reason, expected) in [
+        (BackgroundReason::Explicit, "explicit"),
+        (BackgroundReason::YieldElapsed, "yield_elapsed"),
+        (BackgroundReason::TimeoutElapsed, "timeout_elapsed"),
+        (BackgroundReason::UserRequested, "user_requested"),
+        (BackgroundReason::MessageDelivery, "message_delivery"),
     ] {
-        let status = ProcessStatus::RunningBackground(reason);
-        let encoded = match serde_json::to_string(&status) {
+        let encoded = match serde_json::to_string(&reason) {
             Ok(encoded) => encoded,
             Err(error) => panic!("{reason:?} failed to serialize: {error}"),
         };
-        let decoded: ProcessStatus = match serde_json::from_str(&encoded) {
-            Ok(decoded) => decoded,
-            Err(error) => panic!("{reason:?} failed to round-trip from {encoded}: {error}"),
-        };
-        assert_eq!(decoded, status, "from {encoded}");
-        // Every background state reports as plain `running` to the UI, whatever
-        // moved it there.
-        assert_eq!(decoded.as_str(), "running");
-        assert!(!decoded.is_terminal());
-    }
-}
+        assert_eq!(encoded, format!("\"{expected}\""), "for {reason:?}");
 
-#[test]
-fn the_timeout_reason_serializes_under_its_documented_name() {
-    // The addon and TUI match on this string, so the wire name is a contract.
-    let encoded = serde_json::to_string(&ProcessStatus::RunningBackground(
-        BackgroundReason::TimeoutElapsed,
-    ))
-    .unwrap_or_default();
-    assert!(encoded.contains("timeout_elapsed"), "got: {encoded}");
+        // Whatever moved it there, the status the UI reads is plain `running`.
+        let status = ProcessStatus::RunningBackground(reason);
+        assert_eq!(status.as_str(), "running");
+        assert!(!status.is_terminal());
+    }
 }
 
 #[tokio::test]
@@ -2629,10 +2621,14 @@ async fn the_running_limit_tells_the_model_how_to_free_a_slot() -> Result<(), Bo
     let mut refused = None;
     // Climb until the per-session cap answers; the exact number is the
     // manager's business, not this test's.
+    //
+    // Backgrounded by a short yield: `run_in_background` is capped at one live
+    // task, so it could never reach the manager's own ceiling. The yield path is
+    // uncapped and lands in the same task table.
     for _ in 0..64 {
         match bash
             .execute(
-                serde_json::json!({"command": "sleep 30", "run_in_background": true}),
+                serde_json::json!({"command": "sleep 30", "yield_time_ms": 20}),
                 context("bash", dir.path()),
             )
             .await
@@ -2652,5 +2648,118 @@ async fn the_running_limit_tells_the_model_how_to_free_a_slot() -> Result<(), Bo
     manager
         .terminate_all_and_wait(Duration::from_secs(10))
         .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_explicit_background_task_is_refused() -> Result<(), Box<dyn Error>> {
+    // One deliberate background task at a time. The refusal has to name the way
+    // out, or the model is left with a wall: wait, stop, or run it inline.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+
+    let first = bash
+        .execute(
+            serde_json::json!({ "command": "sleep 30", "run_in_background": true }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let first_id = task_id(&first)?.to_string();
+
+    let refused = bash
+        .execute(
+            serde_json::json!({ "command": "sleep 30", "run_in_background": true }),
+            context("bash", dir.path()),
+        )
+        .await;
+    let message = match refused {
+        Err(error) => error.to_string(),
+        Ok(_) => return Err("a second explicit background task must be refused".into()),
+    };
+    assert!(
+        message.contains("task_output") && message.contains("task_stop"),
+        "the refusal must name how to proceed, got: {message}",
+    );
+
+    // The refusal must not disturb the task already running.
+    let snapshot = manager
+        .snapshot(&first_id)
+        .ok_or("first task disappeared")?;
+    assert_eq!(
+        snapshot.status,
+        ProcessStatus::RunningBackground(BackgroundReason::Explicit),
+    );
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_finished_background_task_frees_the_slot() -> Result<(), Box<dyn Error>> {
+    // The cap counts live tasks, not tasks ever started. Otherwise one
+    // background command per session would be the real limit.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+
+    let first = bash
+        .execute(
+            serde_json::json!({ "command": "true", "run_in_background": true }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let first_id = task_id(&first)?.to_string();
+    let settled = manager
+        .wait(&first_id, Duration::from_secs(5))
+        .await
+        .ok_or("first task disappeared")?;
+    assert!(settled.status.is_terminal(), "got: {:?}", settled.status);
+
+    let second = bash
+        .execute(
+            serde_json::json!({ "command": "sleep 30", "run_in_background": true }),
+            context("bash", dir.path()),
+        )
+        .await;
+    assert!(
+        second.is_ok(),
+        "a settled task must not keep holding the only slot",
+    );
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_yielded_command_is_not_blocked_by_the_single_task_cap() -> Result<(), Box<dyn Error>> {
+    // The cap governs deliberate backgrounding only. A command handed back
+    // because its wait elapsed is already running: refusing it would either kill
+    // live work or strand the caller, so it must go through regardless.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+
+    bash.execute(
+        serde_json::json!({ "command": "sleep 30", "run_in_background": true }),
+        context("bash", dir.path()),
+    )
+    .await?;
+
+    let yielded = bash
+        .execute(
+            serde_json::json!({ "command": "sleep 30", "yield_time_ms": 250 }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let yielded_id = task_id(&yielded)?.to_string();
+    let snapshot = manager.snapshot(&yielded_id).ok_or("task disappeared")?;
+    assert_eq!(
+        snapshot.status,
+        ProcessStatus::RunningBackground(BackgroundReason::YieldElapsed),
+        "a yielded command must still be handed back alive",
+    );
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
 }
