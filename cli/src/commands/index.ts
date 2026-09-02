@@ -8,6 +8,8 @@ export interface SlashCommand {
   description: string
   usage?: string
   handler: 'builtin'
+  /** Minimum typed prefix length, including `/`, before prefix matching applies. */
+  minPrefixLength?: number
 }
 
 export const COMMANDS: SlashCommand[] = [
@@ -18,11 +20,11 @@ export const COMMANDS: SlashCommand[] = [
   { name: '/plan', description: 'Enter planning mode', handler: 'builtin' },
   { name: '/login', description: 'Log in to evot cloud', handler: 'builtin' },
   { name: '/logout', description: 'Log out of evot cloud', handler: 'builtin' },
-  { name: '/restart', description: 'Restart evot in place', handler: 'builtin' },
 ]
 
 /** Hidden commands — recognised but not shown in /help or ghost hints */
 export const HIDDEN_COMMANDS: SlashCommand[] = [
+  { name: '/restart', description: 'Restart evot in place', handler: 'builtin', minPrefixLength: 5 },
   { name: '/update', description: 'Update evot to latest version', handler: 'builtin' },
   { name: '/version', description: 'Show current version', handler: 'builtin' },
   { name: '/exit', aliases: ['/quit', '/q'], description: 'Exit the REPL', handler: 'builtin' },
@@ -84,9 +86,11 @@ export function resolveCommand(input: string): ResolvedCommand {
     if (c.aliases?.includes(cmd)) return { kind: 'resolved', name: c.name, args }
   }
 
-  // Prefix match (visible + hidden)
+  // Prefix match. Low-frequency commands may require a longer explicit prefix
+  // so they do not steal common prefixes from high-frequency commands.
   const matches = ALL_COMMANDS.filter(
-    (c) => c.name.startsWith(cmd) || (c.aliases?.some((a) => a.startsWith(cmd)) ?? false)
+    (c) => cmd.length >= (c.minPrefixLength ?? 1)
+      && (c.name.startsWith(cmd) || (c.aliases?.some((a) => a.startsWith(cmd)) ?? false))
   )
 
   if (matches.length === 1) {

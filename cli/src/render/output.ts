@@ -39,6 +39,15 @@ function toolGlyph(name: string): ToolGlyph {
   }
 }
 
+/** User-facing label for internal tool names. Protocol names remain unchanged. */
+function toolDisplayName(name: string): string {
+  switch (name.toLowerCase()) {
+    case 'task_output': case 'taskoutput': return 'background shell'
+    case 'task_stop': case 'taskstop': return 'stop background shell'
+    default: return name
+  }
+}
+
 /** True for the tools that act on an existing background task by id. */
 function isTaskTool(name: string): boolean {
   const n = name.toLowerCase()
@@ -144,8 +153,9 @@ function toolCallText(
   options?: { failed?: boolean },
 ): string {
   const glyph = toolGlyph(name).icon
+  const displayName = toolDisplayName(name)
   const primary = toolPrimaryArg(name, args, previewCommand, expanded, options)
-  return primary ? `${glyph} ${name}  ${primary}` : `${glyph} ${name}`
+  return primary ? `${glyph} ${displayName}  ${primary}` : `${glyph} ${displayName}`
 }
 
 function toolDraftText(args: Record<string, unknown>, keys: string[]): string {
@@ -369,7 +379,7 @@ function insertToolStatus(lines: OutputLine[], status: OutputLine): void {
 
 export interface OutputLine {
   id: string
-  kind: 'user' | 'assistant' | 'thinking' | 'tool' | 'tool_result' | 'verbose' | 'error' | 'system'
+  kind: 'user' | 'assistant' | 'thinking' | 'tool' | 'tool_result' | 'verbose' | 'error' | 'system' | 'cancelled'
   text: string
   rawMarkdown?: string
   /** Thinking text already contains markdown ANSI; apply only the outer pi tint. */
@@ -1060,6 +1070,8 @@ function taskToolStatusParts(details: Record<string, unknown>): string[] {
       break
     case 'running_foreground':
       // No "in background" here: this task really is still in the foreground.
+      // The `timeout` clause is legacy for the same reason as above: replayed
+      // transcripts still carry it, nothing new writes it.
       parts.push(retrieval === 'timeout' ? 'still running · wait timed out' : 'still running')
       break
     default:
@@ -1078,19 +1090,19 @@ function taskToolStatusParts(details: Record<string, unknown>): string[] {
  * card and Claude Code: the useful fact is that the work is detached and the
  * turn is free, not merely that it has not finished.
  *
- * `retrieval_status` then says what this particular poll did. `released` must
- * not read as a timeout — nothing went wrong and no deadline was hit, the user
- * reclaimed the turn.
+ * Only a hit deadline earns an extra clause. `released` and `not_ready` both
+ * mean the same thing to someone reading the card — the task is detached and
+ * this poll returned no result — and "running in background · stopped waiting"
+ * said that twice.
  */
 function runningInBackgroundLabel(retrieval: string | undefined): string {
-  switch (retrieval) {
-    case 'timeout':
-      return 'running in background · wait timed out'
-    case 'released':
-      return 'running in background · stopped waiting'
-    default:
-      return 'running in background'
-  }
+  // `timeout` is a legacy value: waits are no longer cut short by a bound, so
+  // nothing writes it any more. Tool-result details are persisted per
+  // transcript, so sessions recorded before that change still replay through
+  // here and must not render a bare, unexplained "running in background".
+  return retrieval === 'timeout'
+    ? 'running in background · wait timed out'
+    : 'running in background'
 }
 
 function resultLineCount(content: string): number {

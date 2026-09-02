@@ -26,20 +26,20 @@ const MAX_DISPLAY_LINES: usize = 2000;
 const MAX_DISPLAY_BYTES: usize = 50 * 1024;
 /// Max bytes per single output line before truncation.
 const MAX_LINE_BYTES: usize = 4096;
-/// Default foreground wait before a still-running command is yielded.
+/// Foreground wait before a still-running command is yielded, when a host asks
+/// for one.
 ///
-/// Generous on purpose. Claude Code's equivalent is its command timeout
-/// (10 minutes), not the 2s mark: at 2s it only arms ctrl+b and shows the
-/// background hint, leaving the command in the foreground. Yielding early
-/// instead would make the model pay a second round trip to collect a result it
-/// was already waiting for, on every command slower than a couple of seconds.
+/// Unset by default. A wait bound and a user-driven detach solve the same
+/// problem, and the detach is the better half: `ctrl+b` and typing a message
+/// both hand foreground shells to the background and release blocking waits, so
+/// the turn is always one keypress away. Slicing on top of that did not add
+/// safety, it split one wait into a series of them — the model was handed back
+/// mid-wait, learned nothing new, and asked again.
 ///
-/// The equivalent hint here lives in the TUI, which shows `ctrl+b to
-/// background` for as long as a command is being watched. That is a rendering
-/// concern, so no threshold belongs on this side.
-const DEFAULT_YIELD_TIME: Duration = Duration::from_secs(120);
-/// Longest model-requested foreground wait.
-const MAX_YIELD_TIME: Duration = Duration::from_secs(600);
+/// `timeout` remains the bound that survives an absent user: it hands the
+/// command back alive where backgrounding exists, and still kills where it does
+/// not.
+const NO_FOREGROUND_WAIT: Option<Duration> = None;
 
 /// Execute shell commands. Short commands return normally; long commands can
 /// yield into a session-scoped [`ProcessManager`] and be queried later.
@@ -62,6 +62,7 @@ pub struct BashTool {
     pub sandbox_dirs: Option<Vec<PathBuf>>,
     process_manager: Arc<ProcessManager>,
     background_enabled: bool,
+    foreground_wait: Option<Duration>,
 }
 
 impl Default for BashTool {
@@ -83,6 +84,7 @@ impl Default for BashTool {
             sandbox_dirs: None,
             process_manager: Arc::new(ProcessManager::new()),
             background_enabled: false,
+            foreground_wait: NO_FOREGROUND_WAIT,
         }
     }
 }
@@ -132,6 +134,16 @@ impl BashTool {
         self.background_enabled = true;
         self
     }
+
+    /// Set a foreground-wait bound, which is unset by default.
+    ///
+    /// This is host configuration and is deliberately absent from the tool
+    /// schema, so a tool call cannot extend or disable the bound. Tests use it
+    /// to reach the yield path in milliseconds instead of waiting one out.
+    pub fn with_foreground_wait(mut self, wait: Duration) -> Self {
+        self.foreground_wait = Some(wait);
+        self
+    }
 }
 
 #[async_trait]
@@ -154,7 +166,7 @@ impl AgentTool for BashTool {
             // `resolve_tool_refs`. The schema below and BACKGROUND_GUIDANCE do
             // not, so those must keep literal names or the model would be shown
             // a raw `{{...}}`.
-            "Execute a bash command. Short commands return normally. Set run_in_background to return immediately, or use yield_time_ms to control how long to wait before returning a background task ID. Neither yielding nor the timeout stops the command: both hand it back still running. Use {{task_stop}} to actually stop one."
+            "Execute a bash command. Short commands return normally. A long command holds the turn until it finishes, its timeout elapses, or the user moves it to the background; none of these stop it. Set run_in_background to return immediately. Use {{task_stop}} to actually stop one."
         } else {
             "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). The timeout parameter is the command's hard runtime limit."
         }
@@ -179,7 +191,7 @@ impl AgentTool for BashTool {
             // Code's stance that blocking is a misuse; it is not, it is what the
             // tool exists for.
             vec![
-                "For long-running commands that can continue independently, use `run_in_background: true`; read the returned output path to check progress, or call {{task_output}} to wait when a later step needs the result.",
+                "For long-running commands that can continue independently, use `run_in_background: true`; read the returned output path to check progress, or call {{task_output}} once to wait when a later step needs the result. Never poll a task with sleep loops or repeated {{task_output}} calls.",
             ]
         } else {
             Vec::new()
@@ -200,7 +212,7 @@ impl AgentTool for BashTool {
                 // sentence would be a lie in whichever half it did not describe,
                 // and "it is never killed" is the more dangerous lie to tell.
                 "description": if self.background_enabled {
-                    "Deadline in seconds for bounding your wait (default 600, max 1800). When it elapses the command is handed back still running — it is never killed. No effect with run_in_background, which has no wait to bound. Use yield_time_ms to be handed a command back sooner; use task_stop to actually stop one."
+                    "Deadline in seconds for bounding command execution (default 600, max 1800). When it elapses the command is handed back alive as a background task rather than killed, so it remains available to collect. No effect with run_in_background. Use task_stop to actually stop one."
                 } else {
                     "Hard runtime limit in seconds (default 600, max 1800). The command is killed when it elapses, so set it above the time the command legitimately needs."
                 }
@@ -208,13 +220,6 @@ impl AgentTool for BashTool {
         });
         if self.background_enabled {
             if let Some(properties) = properties.as_object_mut() {
-                properties.insert(
-                    "yield_time_ms".into(),
-                    serde_json::json!({
-                        "type": "number",
-                        "description": "How long to watch a command in the foreground before handing it back as a background task, in ms (default 120000, max 600000). Yielding never interrupts the command; it keeps running and its output keeps accumulating. Lower it when you do not need the result inline; raise it to keep waiting."
-                    }),
-                );
                 properties.insert(
                     "run_in_background".into(),
                     serde_json::json!({
@@ -246,9 +251,7 @@ impl AgentTool for BashTool {
         let timeout = requested_timeout(&params, self.timeout, self.max_timeout);
         let run_in_background =
             self.background_enabled && params["run_in_background"].as_bool().unwrap_or(false);
-        let yield_time = self
-            .background_enabled
-            .then(|| requested_yield_time(&params));
+        let yield_time = self.foreground_wait.filter(|_| self.background_enabled);
 
         for pattern in &self.deny_patterns {
             if command_text.contains(pattern.as_str()) {
@@ -431,13 +434,6 @@ fn requested_timeout(
     }
 }
 
-fn requested_yield_time(params: &serde_json::Value) -> Duration {
-    match params["yield_time_ms"].as_u64() {
-        Some(milliseconds) => Duration::from_millis(milliseconds).min(MAX_YIELD_TIME),
-        None => DEFAULT_YIELD_TIME,
-    }
-}
-
 fn process_output_dir(ctx: &ToolContext) -> PathBuf {
     if let Some(spill) = &ctx.spill {
         let candidate = spill.path_for_key("process-output");
@@ -484,10 +480,9 @@ fn background_result(
 /// intentional detach from one it should wait out.
 ///
 /// `waited` is the wait that actually elapsed. It has to be passed in rather
-/// than read from [`DEFAULT_YIELD_TIME`]: a model that asked for
-/// `yield_time_ms: 5000` was being told its command "did not finish within its
-/// 120s foreground wait", which is false and, worse, overstates how long the
-/// command has already been running.
+/// than inferred from the default: a model that asked for
+/// `yield_time_ms: 5000` must be told that its 5s foreground wait elapsed, not
+/// that the full default elapsed.
 fn background_lede(reason: BackgroundReason, waited: Option<Duration>) -> String {
     match reason {
         BackgroundReason::YieldElapsed => match waited {
@@ -543,12 +538,28 @@ fn background_lede(reason: BackgroundReason, waited: Option<Duration>) -> String
 /// `matches_call_name` is case-insensitive and accepts every alias, so a Claude
 /// model that reads `task_output` here and calls it still dispatches, even
 /// though its own schema spells the tool `TaskOutput`.
+/// What to do with a task that is now running outside the foreground.
+///
+/// This is a two-way choice, and both ways have to be spelled out. An earlier
+/// version named only the blocking one and then added "never end your turn to
+/// wait", which closed the only path that does not hold the turn: completion
+/// notices are delivered into the next turn, so ending the turn is how an
+/// independent task reports back. With that path forbidden the model had no
+/// option but to block, get handed back at the wait bound, and block again —
+/// one card and one decision per bound, for a single wait.
+///
+/// The anti-polling sentence is about `sleep` loops as much as repeated calls:
+/// a `while ...; do sleep 30; done` poller is itself a long command that gets
+/// backgrounded, so polling this way nests the very problem it tries to solve.
 const BACKGROUND_GUIDANCE: &str = concat!(
     "You will be notified when it completes. ",
     "To check progress without waiting, use Read on the output path. ",
     "When a later step cannot proceed without this command's result, call task_output to wait for it ",
     "before that step: it holds the turn until the task ends, so the user cannot be answered meanwhile. ",
-    "Never end your turn to wait, and never treat a started task as a passed one. ",
+    "When nothing you can do next depends on it, carry on with other work or end your turn — ",
+    "the result reaches you on its own once the task finishes. ",
+    "Either way, do not poll: no sleep loops, and no repeated task_output calls to watch it progress. ",
+    "Never treat a started task as a passed one. ",
     "Use task_stop to terminate it.",
 );
 

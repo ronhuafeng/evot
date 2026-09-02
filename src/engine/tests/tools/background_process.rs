@@ -2,6 +2,7 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use evotengine::tools::task_label;
 use evotengine::tools::BackgroundReason;
 use evotengine::tools::BashTool;
 use evotengine::tools::ProcessManager;
@@ -236,17 +237,18 @@ async fn background_output_file_is_capped_but_tail_remains_available() -> Result
 }
 
 #[tokio::test]
-async fn yield_time_moves_running_command_to_background() -> Result<(), Box<dyn Error>> {
+async fn runtime_wait_moves_running_command_to_background() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
     let started_at = std::time::Instant::now();
 
     let result = bash
         .execute(
             serde_json::json!({
-                "command": "sleep 0.3; echo yielded",
-                "yield_time_ms": 20
+                "command": "sleep 0.3; echo yielded"
             }),
             context("bash", dir.path()),
         )
@@ -567,25 +569,18 @@ async fn completion_notification_is_claimed_once() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn yield_schema_advertises_the_generous_foreground_wait() {
-    // 120s, not the 2s I briefly set here. Claude Code's 2s mark only arms its
-    // ctrl+b hint; the command stays in the foreground until its timeout. Yielding
-    // at 2s would charge the model an extra round trip, on every command slower
-    // than a couple of seconds, to collect a result it was already waiting for.
+fn foreground_wait_is_runtime_owned() {
     let bash = BashTool::new().with_process_manager(Arc::new(ProcessManager::new()));
     let schema = bash.parameters_schema();
-    let description = schema["properties"]["yield_time_ms"]["description"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(description.contains("120000"), "got: {description}");
-    assert!(description.contains("600000"), "got: {description}");
-    // Yielding must read as handing back a live command, not as stopping one.
-    assert!(
-        description.contains("never interrupts"),
-        "got: {description}"
-    );
-    // Both directions are legitimate, so neither is discouraged.
-    assert!(description.contains("Lower it"), "got: {description}");
+    assert!(schema["properties"]["yield_time_ms"].is_null());
+    // No number to quote: a long command holds the turn until one of three
+    // things happens, and naming a fixed hand-back taught the model to wait for
+    // one that no longer arrives.
+    assert!(bash.description().contains("holds the turn"));
+    assert!(bash
+        .description()
+        .contains("user moves it to the background"));
+    assert!(!bash.description().contains("60 seconds"));
 }
 
 #[test]
@@ -600,20 +595,11 @@ fn timeout_schema_says_it_bounds_the_wait_rather_than_killing() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        description.contains("handed back still running"),
+        description.contains("handed back alive"),
         "got: {description}"
     );
-    assert!(description.contains("never killed"), "got: {description}");
-    // The one case where it does nothing at all. Without this a model would set
-    // a timeout on a run_in_background call and believe it bounded something.
-    assert!(
-        description.contains("No effect with run_in_background"),
-        "got: {description}"
-    );
-    // Points at the parameter that shortens the wait, and the one that stops it.
-    assert!(description.contains("yield_time_ms"), "got: {description}");
+    assert!(!description.contains("60 seconds"), "got: {description}");
     assert!(description.contains("task_stop"), "got: {description}");
-    // Must not carry the old kill language.
     assert!(!description.contains("SIGKILL"), "got: {description}");
     assert!(
         !description.contains("death sentence"),
@@ -677,15 +663,20 @@ fn block_schema_names_the_cost_of_waiting() {
         .as_str()
         .unwrap_or_default();
     assert!(description.contains("default true"), "got: {description}");
-    // The cost, stated plainly.
-    assert!(description.contains("holds the turn"), "got: {description}");
-    // Says why that matters, rather than leaving it as an abstract cost.
+    // The two ways a wait ends, so neither is a surprise. No number: the wait is
+    // unbounded by default, and quoting one taught the model to expect a
+    // hand-back that never comes and to re-ask when it did.
     assert!(
-        description.contains("cannot be answered"),
+        description.contains("the task finishes"),
         "got: {description}"
     );
-    // The other mode is offered, with the situation it suits.
+    assert!(
+        description.contains("user reclaims the turn"),
+        "got: {description}"
+    );
+    assert!(!description.contains("60 seconds"), "got: {description}");
     assert!(description.contains("false"), "got: {description}");
+    assert!(schema["properties"]["timeout"].is_null());
     // No language that frames waiting as a misuse of the tool.
     assert!(!description.contains("throws away"), "got: {description}");
 }
@@ -699,9 +690,10 @@ fn task_output_description_states_both_modes() {
     let description = output.description();
     // Both modes named, so `block` is not a surprise discovered later.
     assert!(
-        description.contains("Waits for the task"),
+        description.contains("user reclaims the turn"),
         "got: {description}"
     );
+    assert!(!description.contains("60 seconds"), "got: {description}");
     assert!(description.contains("block: false"), "got: {description}");
     // The file is mentioned as available, not as the better choice.
     assert!(description.contains("output file"), "got: {description}");
@@ -736,15 +728,78 @@ async fn a_command_finishing_inside_the_default_wait_stays_in_the_foreground(
 }
 
 #[tokio::test]
+async fn nothing_yields_a_foreground_command_on_a_timer() -> Result<(), Box<dyn Error>> {
+    // The default has no foreground wait at all. A command that outlives any
+    // bound the runtime used to impose still answers inline, because the only
+    // things that end a wait now are the command finishing, its timeout, or the
+    // user. A timer on top of those did not make anything safer: it split one
+    // wait into a series of them, handing the model back mid-wait with nothing
+    // new to act on, which is what made it ask again.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new()
+        .with_timeout(Duration::from_secs(30))
+        .with_process_manager(manager.clone());
+
+    let result = bash
+        .execute(
+            serde_json::json!({"command": "sleep 1.2; echo waited"}),
+            context("bash", dir.path()),
+        )
+        .await?;
+
+    assert!(result.details["backgrounded"].is_null());
+    assert!(result.details["background_reason"].is_null());
+    assert!(text(&result).contains("waited"), "got: {}", text(&result));
+    assert_eq!(result.details["exit_code"], 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_blocking_wait_is_not_cut_short_by_a_bound() -> Result<(), Box<dyn Error>> {
+    // Same policy on the collection side. The wait used to return `timeout` with
+    // the task still running, which reads as "ask again" — the model had learned
+    // nothing and the user had not asked for the turn back, so the only sensible
+    // next move was another identical call.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let output = TaskOutputTool::new(manager.clone());
+
+    let started = bash
+        .execute(
+            serde_json::json!({"command": "sleep 1.2; echo late", "run_in_background": true}),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let id = task_id(&started)?.to_string();
+
+    let result = output
+        .execute(
+            serde_json::json!({"task_id": id}),
+            context("task_output", dir.path()),
+        )
+        .await?;
+
+    // Waited to completion rather than being handed back mid-run.
+    assert_eq!(result.details["retrieval_status"], "success");
+    assert_eq!(result.details["status"], "completed");
+    assert!(text(&result).contains("late"), "got: {}", text(&result));
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_yielded_command_tells_the_model_to_wait_before_dependent_steps(
 ) -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
 
     let result = bash
         .execute(
-            serde_json::json!({"command": "sleep 0.3; echo late", "yield_time_ms": 20}),
+            serde_json::json!({"command": "sleep 0.3; echo late"}),
             context("bash", dir.path()),
         )
         .await?;
@@ -759,7 +814,8 @@ async fn a_yielded_command_tells_the_model_to_wait_before_dependent_steps(
     assert!(body.contains("cannot proceed without"), "got: {body}");
     assert!(body.contains("task_output"), "got: {body}");
     assert!(
-        body.contains("never treat a started task as a passed one"),
+        body.contains("never treat a started task as a passed one")
+            || body.contains("Never treat a started task as a passed one"),
         "got: {body}"
     );
     // Both ways of collecting the result are present, each with what it is for.
@@ -770,6 +826,15 @@ async fn a_yielded_command_tells_the_model_to_wait_before_dependent_steps(
     // The cost of waiting is still stated, just not as a reprimand.
     assert!(body.contains("holds the turn"), "got: {body}");
     assert!(!body.contains("do not use it merely"), "got: {body}");
+    // The non-blocking path has to be named too. Completion notices arrive in a
+    // later turn, so ending the turn is how an independent task reports back;
+    // forbidding that left blocking as the only option the model could see.
+    assert!(body.contains("end your turn"), "got: {body}");
+    assert!(!body.contains("Never end your turn"), "got: {body}");
+    // Polling is the failure both paths degrade into, and a sleep loop is itself
+    // a long command that gets backgrounded, so it nests the problem.
+    assert!(body.contains("do not poll"), "got: {body}");
+    assert!(body.contains("sleep loops"), "got: {body}");
     Ok(())
 }
 
@@ -792,30 +857,6 @@ async fn an_explicit_background_request_is_not_framed_as_a_timeout() -> Result<(
     assert!(!body.contains("did not finish within"), "got: {body}");
     // Still told how to collect the result.
     assert!(body.contains("You will be notified"), "got: {body}");
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_model_requested_wait_can_exceed_the_old_thirty_second_ceiling(
-) -> Result<(), Box<dyn Error>> {
-    // MAX_YIELD_TIME used to be 30s, which clamped any explicit request below
-    // what the model asked for. Raising the ceiling is what lets a model keep a
-    // specific command inline despite the short default.
-    let dir = tempfile::tempdir()?;
-    let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
-
-    let result = bash
-        .execute(
-            serde_json::json!({"command": "echo quick", "yield_time_ms": 90_000}),
-            context("bash", dir.path()),
-        )
-        .await?;
-
-    // A 90s wait is honored rather than clamped, so the command completes in
-    // the foreground instead of being yielded.
-    assert!(result.details["backgrounded"].is_null());
-    assert!(text(&result).contains("quick"));
     Ok(())
 }
 
@@ -1155,6 +1196,40 @@ fn a_missing_task_id_has_no_preview() {
     assert!(output.preview_command(&serde_json::json!({})).is_none());
 }
 
+#[test]
+fn a_short_command_is_its_own_label() {
+    assert_eq!(task_label("make check"), "make check");
+}
+
+#[test]
+fn a_long_command_is_cut_to_a_headline_width() {
+    // The bash card that started the task already printed the command in full;
+    // repeating a long pipeline on every poll only wraps the card.
+    let label = task_label("cd /Users/bohu/github/evotai/evot && make check 2>&1 | tail -20");
+    assert_eq!(label, "cd /Users/bohu/github/evotai/evot && mak…");
+    assert!(
+        label.chars().count() <= 41,
+        "got {} chars",
+        label.chars().count()
+    );
+}
+
+#[test]
+fn a_multi_line_command_collapses_to_one_line() {
+    // A newline in a single-line headline would break the card geometry.
+    let label = task_label("cargo build \\\n  --release\n\n# then ship");
+    assert!(!label.contains('\n'), "got: {label}");
+    assert_eq!(label, "cargo build \\ --release # then ship");
+}
+
+#[test]
+fn a_multibyte_command_is_not_cut_mid_character() {
+    // Byte slicing at a fixed offset would panic on a CJK boundary.
+    let label = task_label(&"检查".repeat(40));
+    assert_eq!(label.chars().count(), 41);
+    assert!(label.ends_with('…'), "got: {label}");
+}
+
 #[tokio::test]
 async fn task_output_details_carry_the_fields_a_card_needs() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
@@ -1228,7 +1303,9 @@ async fn task_stop_details_carry_the_command_and_runtime() -> Result<(), Box<dyn
 async fn notifications_arrive_in_completion_order() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
 
     // Started together, staggered so completion order is deterministic and the
     // reverse of nothing in particular — it must follow finishing, not spawning.
@@ -1247,7 +1324,6 @@ async fn notifications_arrive_in_completion_order() -> Result<(), Box<dyn Error>
             .execute(
                 serde_json::json!({
                     "command": format!("sleep {delay}; echo {label}"),
-                    "yield_time_ms": 20,
                 }),
                 context("bash", dir.path()),
             )
@@ -1284,13 +1360,15 @@ async fn summaries_are_ordered_by_runtime_so_the_newest_task_is_last() -> Result
     // rows from jumping between polls.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
 
     let mut ids = Vec::new();
     for _ in 0..3 {
         let started = bash
             .execute(
-                serde_json::json!({"command": "sleep 5", "yield_time_ms": 20}),
+                serde_json::json!({"command": "sleep 5"}),
                 context("bash", dir.path()),
             )
             .await?;
@@ -1421,11 +1499,13 @@ async fn a_model_stop_is_not_attributed_to_the_user() -> Result<(), Box<dyn Erro
 async fn stop_all_attributes_every_task_to_the_user() -> Result<(), Box<dyn Error>> {
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
 
     for _ in 0..3 {
         bash.execute(
-            serde_json::json!({"command": "sleep 30", "yield_time_ms": 20}),
+            serde_json::json!({"command": "sleep 30"}),
             context("bash", dir.path()),
         )
         .await?;
@@ -1562,7 +1642,8 @@ async fn a_blocking_wait_reports_progress_while_it_waits() -> Result<(), Box<dyn
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new().with_process_manager(manager.clone());
-    let output = TaskOutputTool::new(manager.clone());
+    let output =
+        TaskOutputTool::new(manager.clone()).with_blocking_wait_limit(Duration::from_secs(7));
 
     let started = bash
         .execute(
@@ -1607,7 +1688,8 @@ async fn a_blocking_wait_streams_new_output_as_it_arrives() -> Result<(), Box<dy
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new().with_process_manager(manager.clone());
-    let output = TaskOutputTool::new(manager.clone());
+    let output =
+        TaskOutputTool::new(manager.clone()).with_blocking_wait_limit(Duration::from_secs(6));
 
     let started = bash
         .execute(
@@ -1652,7 +1734,8 @@ async fn a_wait_that_finishes_quickly_stays_quiet() -> Result<(), Box<dyn Error>
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new().with_process_manager(manager.clone());
-    let output = TaskOutputTool::new(manager.clone());
+    let output =
+        TaskOutputTool::new(manager.clone()).with_blocking_wait_limit(Duration::from_secs(5));
 
     let started = bash
         .execute(
@@ -2539,21 +2622,18 @@ async fn with_background_support_the_same_deadline_spares_the_command() -> Resul
 }
 
 #[tokio::test]
-async fn the_yield_lede_reports_the_wait_that_actually_elapsed() -> Result<(), Box<dyn Error>> {
-    // The lede used to interpolate DEFAULT_YIELD_TIME regardless of what was
-    // asked for, so a model requesting a 1s yield was told its command "did not
-    // finish within its 120s foreground wait". False, and it overstates how long
-    // the command has been running -- which is exactly the input a model uses to
-    // decide whether to keep waiting or move on.
+async fn the_yield_lede_reports_the_runtime_wait() -> Result<(), Box<dyn Error>> {
+    // The lede reports the host-owned wait, not an AI-supplied argument.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new()
         .with_timeout(Duration::from_secs(30))
-        .with_process_manager(manager.clone());
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_secs(1));
 
     let result = bash
         .execute(
-            serde_json::json!({"command": "sleep 30", "yield_time_ms": 1_000}),
+            serde_json::json!({"command": "sleep 30", "yield_time_ms": 1}),
             context("bash", dir.path()),
         )
         .await?;
@@ -2562,24 +2642,25 @@ async fn the_yield_lede_reports_the_wait_that_actually_elapsed() -> Result<(), B
     let body = text(&result);
     assert!(body.contains("its 1s foreground wait"), "got: {body}");
     // The default must not appear when it is not the wait that happened.
-    assert!(!body.contains("120s"), "got: {body}");
+    assert!(!body.contains("60s"), "got: {body}");
 
     manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
 }
 
 #[tokio::test]
-async fn the_default_yield_lede_still_names_the_default() -> Result<(), Box<dyn Error>> {
-    // The other direction: with no yield_time_ms the number quoted must be the
-    // default that actually governed the wait.
+async fn a_yield_with_no_configured_wait_quotes_no_number() -> Result<(), Box<dyn Error>> {
+    // The other direction: with no host-configured wait there is no number that
+    // governed anything, so the lede must not invent one. Quoting a default here
+    // is what taught the model to expect a hand-back on a schedule.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new()
         .with_timeout(Duration::from_secs(30))
         .with_process_manager(manager.clone());
 
-    // Detach externally, which reports the configured yield rather than a
-    // deadline -- waiting out the real 120s default would stall the suite.
+    // Detach externally, which is now the only way this reason arises: nothing
+    // in the runtime yields on a timer any more.
     let tool = Arc::new(bash);
     let watcher = tool.clone();
     let dir_path = dir.path().to_path_buf();
@@ -2600,7 +2681,34 @@ async fn the_default_yield_lede_still_names_the_default() -> Result<(), Box<dyn 
     );
 
     let body = text(&handle.await??);
-    assert!(body.contains("its 120s foreground wait"), "got: {body}");
+    assert!(body.contains("its foreground wait"), "got: {body}");
+    assert!(!body.contains("60s"), "got: {body}");
+    assert!(body.contains("was not interrupted"), "got: {body}");
+
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ai_cannot_override_the_runtime_foreground_wait() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let tool = BashTool::new()
+        .with_timeout(Duration::from_secs(30))
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
+
+    let started = std::time::Instant::now();
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "sleep 30", "yield_time_ms": 600_000}),
+            context("bash", dir.path()),
+        )
+        .await?;
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(result.details["background_reason"], "yield_elapsed");
+    assert!(text(&result).contains("its 0s foreground wait"));
 
     manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
@@ -2616,7 +2724,8 @@ async fn the_running_limit_tells_the_model_how_to_free_a_slot() -> Result<(), Bo
     let manager = Arc::new(ProcessManager::new());
     let bash = BashTool::new()
         .with_timeout(Duration::from_secs(30))
-        .with_process_manager(manager.clone());
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(20));
 
     let mut refused = None;
     // Climb until the per-session cap answers; the exact number is the
@@ -2628,7 +2737,7 @@ async fn the_running_limit_tells_the_model_how_to_free_a_slot() -> Result<(), Bo
     for _ in 0..64 {
         match bash
             .execute(
-                serde_json::json!({"command": "sleep 30", "yield_time_ms": 20}),
+                serde_json::json!({"command": "sleep 30"}),
                 context("bash", dir.path()),
             )
             .await
@@ -2738,7 +2847,9 @@ async fn a_yielded_command_is_not_blocked_by_the_single_task_cap() -> Result<(),
     // live work or strand the caller, so it must go through regardless.
     let dir = tempfile::tempdir()?;
     let manager = Arc::new(ProcessManager::new());
-    let bash = BashTool::new().with_process_manager(manager.clone());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(250));
 
     bash.execute(
         serde_json::json!({ "command": "sleep 30", "run_in_background": true }),
@@ -2748,7 +2859,7 @@ async fn a_yielded_command_is_not_blocked_by_the_single_task_cap() -> Result<(),
 
     let yielded = bash
         .execute(
-            serde_json::json!({ "command": "sleep 30", "yield_time_ms": 250 }),
+            serde_json::json!({ "command": "sleep 30" }),
             context("bash", dir.path()),
         )
         .await?;

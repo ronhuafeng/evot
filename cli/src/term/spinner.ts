@@ -266,9 +266,11 @@ export function formatSpinnerLine(
   const tokenSuffix = isLongWaitPhase(state.phase) || isPassiveWaitPhase(state.phase)
     ? ''
     : formatSpinnerTokenSuffix(state, now, stats)
-  // A passive wait offers no gesture: esc does not reach the detached task, and
-  // ctrl+b cannot background work that is already backgrounded. The panel is the
-  // way in, and the footer chip already names it.
+  // Ctrl+B is named again. It used to be hidden because foreground shells were
+  // handed back on a timer, which made the shortcut look like a required manual
+  // step for something the runtime did anyway. Nothing yields on a timer now, so
+  // this is the only way to get the turn back without killing the work — and an
+  // unadvertised key is one nobody presses.
   const interruptHint = options.interruptible === false || isPassiveWaitPhase(state.phase)
     ? ''
     : options.backgroundable

@@ -35,7 +35,16 @@ describe('slash command completion', () => {
     expect(result).toBeNull()
   })
 
-  test('completes /rest to /restart', () => {
+  test('visible /resume owns short prefixes over hidden /restart', () => {
+    for (const prefix of ['/re', '/res']) {
+      const result = complete(prefix, prefix.length)
+      expect(result).not.toBeNull()
+      expect(result!.replacement).toBe('/resume ')
+      expect(result!.candidates).toEqual(['/resume'])
+    }
+  })
+
+  test('completes /rest to /restart once /resume no longer matches', () => {
     const result = complete('/rest', 5)
     expect(result).not.toBeNull()
     expect(result!.replacement).toBe('/restart ')
@@ -126,6 +135,20 @@ describe('file path completion', () => {
 })
 
 describe('ghost hints', () => {
+  test('bare slash keeps resume visible and hides restart', () => {
+    const hint = getGhostHint('/', 1)
+    expect(hint).toContain('resume')
+    expect(hint).not.toContain('restart')
+  })
+
+  test('short resume prefixes do not advertise hidden restart', () => {
+    for (const prefix of ['/re', '/res']) {
+      const hint = getGhostHint(prefix, prefix.length)
+      expect(hint).toContain('ume')
+      expect(hint).not.toContain('restart')
+    }
+  })
+
   test('shows clip all subcommand', () => {
     expect(getGhostHint('/clip ', 6)).toContain('all')
     expect(getGhostHint('/clip a', 7)).toBe('ll')

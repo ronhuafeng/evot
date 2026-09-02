@@ -287,38 +287,30 @@ describe('formatSpinnerLine', () => {
     expect(line).toContain('esc to interrupt')
   })
 
-  test('offers ctrl+b alongside esc while work can be backgrounded', () => {
-    // Both keys are shown because both apply: esc always kills, ctrl+b never
-    // does. Replacing the interrupt hint would hide the kill gesture exactly
-    // when a user might want it.
-    //
-    // TMUX is cleared rather than read: inside tmux the chord is spelled as a
-    // double press, so a test that trusted the ambient environment would pass or
-    // fail depending on where it was run.
-    const tmux = process.env.TMUX
-    delete process.env.TMUX
-    try {
-      const state = createSpinnerState()
-      const line = stripAnsi(formatSpinnerLine(state, Date.now(), undefined, { backgroundable: true }))
-      expect(line).toContain('esc to interrupt')
-      expect(line).toContain('ctrl+b to background')
-    } finally {
-      if (tmux !== undefined) process.env.TMUX = tmux
-    }
+  test('names ctrl+b while work can be detached', () => {
+    // The hint used to advertise a timer instead of the key. With nothing
+    // yielding on a timer, ctrl+b is the only non-destructive way out of a
+    // wait, so it has to be the thing the line names.
+    const state = createSpinnerState()
+    const line = stripAnsi(formatSpinnerLine(state, Date.now(), undefined, { backgroundable: true }))
+    expect(line).toContain('esc to interrupt')
+    expect(line).toContain('ctrl+b to background')
+    expect(line).not.toContain('auto-background')
   })
 
-  test('spells the chord as a double press inside tmux', () => {
-    // Ctrl+B is tmux's prefix, so one press never arrives. The hint has to say
-    // so or backgrounding looks broken to every tmux user.
-    const tmux = process.env.TMUX
-    process.env.TMUX = 'socket,1,0'
+  test('inside tmux the hint spells the chord the way tmux forwards it', () => {
+    // Ctrl+B is tmux's own prefix, so a single press never reaches us there.
+    // Advertising the plain spelling would send a tmux user pressing a key that
+    // does nothing and concluding backgrounding is broken.
+    const previous = process.env.TMUX
+    process.env.TMUX = '/tmp/tmux-1000/default,1234,0'
     try {
       const state = createSpinnerState()
       const line = stripAnsi(formatSpinnerLine(state, Date.now(), undefined, { backgroundable: true }))
       expect(line).toContain('ctrl+b ctrl+b (twice) to background')
     } finally {
-      if (tmux === undefined) delete process.env.TMUX
-      else process.env.TMUX = tmux
+      if (previous === undefined) delete process.env.TMUX
+      else process.env.TMUX = previous
     }
   })
 
