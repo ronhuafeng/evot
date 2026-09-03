@@ -240,6 +240,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     getCompactLines: () => compactLines,
     getConfigInfo: () => configInfo ?? null,
     commitSystem,
+    commitRevealed,
     commitLines,
     requestRender: () => renderer.requestRender(),
   }
@@ -421,6 +422,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     columns: () => renderer.termCols,
     logLines: lines => screenLog.logLines(lines),
     requestRender: () => renderer.requestRender(),
+    invalidateHistory: () => resetHistoryCache(),
   })
   let liveContentMaxHeight = 0
   let liveContentWidth = renderer.termCols
@@ -1004,6 +1006,17 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   function commitSystem(id: string, text: string, kind: OutputLine['kind'] = 'system') {
     committer.system(id, text, kind)
+  }
+
+  /**
+   * Show a secret on screen, then take it back.
+   *
+   * The mechanics live on the Committer, which owns the line arrays and the
+   * timer, so the erase is reachable by tests. Here this is only the wiring the
+   * command layer calls through.
+   */
+  function commitRevealed(id: string, text: string, erasedText: string, delayMs: number) {
+    committer.revealTemporarily(id, text, erasedText, delayMs)
   }
 
   /** Commit a transient status line (model / thinking level). Rapid re-toggles
@@ -2550,7 +2563,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (name === '/compact') {
       await runManualCompaction(args)
     } else if (name === '/env') {
-      handleEnvCommand(replCommands, args)
+      await handleEnvCommand(replCommands, args)
     } else if (name === '/harden') {
       const subject = buildHardenPrompt(args)
       commitLines(buildUserMessage(text.trim()))
@@ -3301,6 +3314,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     gitInfo.dispose()
     updateMgr.cleanup()
     if (exitHintTimer) clearTimeout(exitHintTimer)
+    committer.flushReveals()
     if (escapeFlushTimer) {
       clearTimeout(escapeFlushTimer)
       escapeFlushTimer = undefined

@@ -12,6 +12,8 @@ export interface ReplCommandContext {
   getCompactLines: () => import('../render/output.js').OutputLine[]
   getConfigInfo: () => ConfigInfo | null
   commitSystem: (id: string, text: string, kind?: OutputLine['kind']) => void
+  /** Commit a secret shown on screen only, erased after `delayMs`. */
+  commitRevealed: (id: string, text: string, erasedText: string, delayMs: number) => void
   commitLines: (lines: OutputLine[]) => void
   requestRender: () => void
 }
@@ -27,6 +29,9 @@ function failureText(label: string, err: unknown): string {
   const message = (err as { message?: string })?.message ?? String(err)
   return chalk.red(`  ${label}: ${message}`)
 }
+
+/** Distinguishes concurrent reveals; see the comment at its use site. */
+let nextRevealId = 0
 
 async function defaultLoginCommandDeps(): Promise<LoginCommandDeps> {
   const { deviceFingerprint, openLoginBrowser } = await import('../commands/login.js')
@@ -134,6 +139,11 @@ export async function handleShareCommand(ctx: ReplCommandContext, args: string):
 
 export async function handleSkillCommand(ctx: ReplCommandContext, args: string): Promise<void> {
   const sub = args.trim()
+  const progress = (msg: string): void => {
+    ctx.commitLines([{ id: `sys-skill-${Date.now()}`, kind: 'system', text: `  ${msg}` }])
+    ctx.requestRender()
+  }
+
   if (!sub || sub === 'list') {
     try {
       const { skillList } = await import('../commands/skill.js')
@@ -141,23 +151,27 @@ export async function handleSkillCommand(ctx: ReplCommandContext, args: string):
     } catch {
       ctx.commitSystem('sys-skill-err', '  skill list unavailable')
     }
-  } else if (sub.startsWith('install ')) {
-    const source = sub.slice(8).trim()
-    if (!source) {
-      ctx.commitSystem('sys-skill-err', '  Usage: /skill install <owner/repo>')
-    } else {
-      ctx.commitSystem('sys-skill-inst', `  installing ${source}...`)
-      ctx.requestRender()
-      try {
-        const { skillInstall } = await import('../commands/skill.js')
-        const result = await skillInstall(source, (msg) => {
-          ctx.commitLines([{ id: `sys-skill-${Date.now()}`, kind: 'system', text: `  ${msg}` }])
-          ctx.requestRender()
-        })
-        ctx.commitSystem('sys-skill-done', `  ${result}`)
-      } catch (err) {
-        ctx.commitSystem('sys-skill-err', failureText('install failed', err))
-      }
+  } else if (sub === 'install' || sub.startsWith('install ')) {
+    const source = sub.slice(7).trim()
+    ctx.commitSystem('sys-skill-inst', `  installing ${source || 'official skills'}...`)
+    ctx.requestRender()
+    try {
+      const { skillInstall } = await import('../commands/skill.js')
+      const result = await skillInstall(source || undefined, { progress })
+      ctx.commitSystem('sys-skill-done', result || '  nothing to install')
+    } catch (err) {
+      ctx.commitSystem('sys-skill-err', failureText('install failed', err))
+    }
+  } else if (sub === 'update' || sub.startsWith('update ')) {
+    const name = sub.slice(6).trim()
+    ctx.commitSystem('sys-skill-up', `  updating ${name || 'installed skills'}...`)
+    ctx.requestRender()
+    try {
+      const { skillUpdate } = await import('../commands/skill.js')
+      const result = await skillUpdate(name || undefined, { progress })
+      ctx.commitSystem('sys-skill-done', result || '  nothing to update')
+    } catch (err) {
+      ctx.commitSystem('sys-skill-err', failureText('update failed', err))
     }
   } else if (sub.startsWith('remove ')) {
     const name = sub.slice(7).trim()
@@ -172,7 +186,10 @@ export async function handleSkillCommand(ctx: ReplCommandContext, args: string):
       }
     }
   } else {
-    ctx.commitSystem('sys-skill-err', '  Usage: /skill [list | install <source> | remove <name>]')
+    ctx.commitSystem(
+      'sys-skill-err',
+      '  Usage: /skill [list | install [name | source] | update [name] | remove <name>]',
+    )
   }
   ctx.requestRender()
 }
@@ -310,33 +327,37 @@ export async function handleUpdateCommand(ctx: ReplCommandContext): Promise<void
   }
 }
 
-export function handleEnvCommand(ctx: ReplCommandContext, args: string): void {
-  const sub = args.trim()
-  if (!sub) {
-    const vars = ctx.agent.listVariables()
-    if (vars.length === 0) {
-      ctx.commitSystem('sys-env', '  No variables set')
-    } else {
-      for (const v of vars) {
-        ctx.commitLines([{ id: `sys-env-${v.key}`, kind: 'system', text: `  ${v.key}=${v.value}` }])
-      }
-    }
-  } else if (sub.startsWith('set ')) {
-    const eq = sub.slice(4).trim()
-    const eqIdx = eq.indexOf('=')
-    if (eqIdx <= 0) {
-      ctx.commitSystem('sys-env-err', '  Usage: /env set KEY=VALUE')
-    } else {
-      const key = eq.slice(0, eqIdx)
-      const value = eq.slice(eqIdx + 1)
-      ctx.agent.setVariable(key, value)
-      ctx.commitSystem('sys-env-set', `  ${key}=${value}`)
-    }
-  } else if (sub.startsWith('del ')) {
-    const key = sub.slice(4).trim()
-    ctx.agent.deleteVariable(key)
-    ctx.commitSystem('sys-env-del', `  deleted: ${key}`)
-  } else {
-    ctx.commitSystem('sys-env-err', '  Usage: /env [set K=V | del K]')
+export async function handleEnvCommand(ctx: ReplCommandContext, args: string): Promise<void> {
+  const { runEnvCommand, parseRevealTarget, renderRevealed, REVEAL_ERASE_MS } = await import('../commands/env.js')
+  const port = {
+    list: () => ctx.agent.listVariables(),
+    set: (key: string, value: string) => ctx.agent.setVariable(key, value),
+    del: (key: string) => ctx.agent.deleteVariable(key),
+    readFile: async (path: string) => {
+      const { readFile } = await import('fs/promises')
+      const { homedir } = await import('os')
+      const expanded = path.startsWith('~/') ? `${homedir()}${path.slice(1)}` : path
+      return readFile(expanded, 'utf8')
+    },
   }
+  try {
+    // A reveal is committed differently from every other `/env` output: shown on
+    // screen, withheld from the screen log, and erased on a timer. Everything
+    // else is ordinary history.
+    const revealKey = parseRevealTarget(args)
+    const revealRow = revealKey ? port.list().find((row) => row.key === revealKey) : undefined
+    if (revealRow) {
+      const { text, erasedText } = renderRevealed(revealRow)
+      // A fresh id per reveal. The erase finds its line by id, so a shared one
+      // made the second reveal mask the first line twice and leave its own
+      // value on screen for good.
+      ctx.commitRevealed(`sys-env-reveal-${nextRevealId++}`, text, erasedText, REVEAL_ERASE_MS)
+      ctx.requestRender()
+      return
+    }
+    ctx.commitSystem('sys-env', await runEnvCommand(port, args))
+  } catch (err) {
+    ctx.commitSystem('sys-env-err', failureText('env failed', err))
+  }
+  ctx.requestRender()
 }
