@@ -7,6 +7,7 @@ import { SELECTOR_VIEWPORT, type SelectorItem, type SelectorState } from '../sel
 import { HINT_SEPARATOR, backgroundChordLabel, formatChord, type Hint } from '../app/hint.js'
 import type { AskState } from '../ask.js'
 import { getTheme } from '../../render/theme.js'
+import { buildSelectorRow } from './selector-row.js'
 
 export type OverlayState =
   | { kind: 'none' }
@@ -21,7 +22,7 @@ export function buildOverlayBlocks(overlay: OverlayState, columns: number): View
     case 'help':
       return buildHelpBlocks(columns)
     case 'selector':
-      return buildSelectorBlocks(overlay.state, columns)
+      return buildSelectorBlocks(overlay.state, columns, true)
     case 'ask-user':
       return buildAskBlocks(overlay.state, columns)
   }
@@ -36,16 +37,21 @@ export function buildAskRegionLines(state: AskState, columns: number): string[] 
 }
 
 /** Render a selector in pi's editorContainer position, never as a modal. */
-export function buildSelectorRegionLines(state: SelectorState, columns: number, rows = 24): string[] {
+export function buildSelectorRegionLines(
+  state: SelectorState,
+  columns: number,
+  rows = 24,
+  active = true,
+): string[] {
   const width = Number.isFinite(columns) ? Math.max(1, Math.floor(columns)) : 80
-  if (state.presentation === 'model') return ['', ...buildModelSelectorRegionLines(state, width)]
+  if (state.presentation === 'model') return ['', ...buildModelSelectorRegionLines(state, width, active)]
 
   const border = styledLineToAnsi(line(dim('─'.repeat(width))))
   if (state.presentation === 'background-output') {
     return ['', border, ...buildBackgroundOutputRegionLines(state, width, rows), border]
   }
 
-  return ['', border, ...blocksToLines(buildSelectorBlocks(state, width)), border]
+  return ['', border, ...blocksToLines(buildSelectorBlocks(state, width, active)), border]
 }
 
 /** Full-width, tail-following view for one background shell. */
@@ -78,14 +84,17 @@ function buildBackgroundOutputRegionLines(state: SelectorState, width: number, r
 }
 
 /** Mirrors pi's ModelSelectorComponent hierarchy and line geometry. */
-function buildModelSelectorRegionLines(state: SelectorState, width: number): string[] {
+function buildModelSelectorRegionLines(state: SelectorState, width: number, active: boolean): string[] {
+  // Keyboard ownership only controls the search caret. The current model row
+  // keeps the same shared selection treatment in previews and focused windows.
+  const searchFocused = active && state.listFocused !== true
   const border = line(dim('─'.repeat(width)))
   const lines: StyledLine[] = [
     border,
     line(plain('')),
     line(dim('Only showing models from configured providers. Run /login to add cloud models.')),
     line(plain('')),
-    buildModelSearchLine(state.query, width),
+    buildModelSearchLine(state.query, width, searchFocused),
     line(plain('')),
   ]
 
@@ -99,7 +108,7 @@ function buildModelSelectorRegionLines(state: SelectorState, width: number): str
   )
   const end = Math.min(start + maxVisible, state.items.length)
 
-  const { brandHex, accentHex, selectionBgHex, selectionMutedHex } = getTheme()
+  const { accentHex } = getTheme()
   let visibleListRowSeen = false
   for (let index = start; index < end; index++) {
     const item = state.items[index]!
@@ -114,26 +123,13 @@ function buildModelSelectorRegionLines(state: SelectorState, width: number): str
       continue
     }
 
-    const focused = index === state.focusIndex
-    const bg = focused ? selectionBgHex : undefined
-    const prefix = focused
-      ? { text: '❯ ', hex: brandHex, bold: true, bg }
-      : plain('  ')
-    const name = focused
-      ? { text: item.label, hex: brandHex, bold: true, bg }
-      : dim(item.label)
-    const detail = item.detail
-      ? focused
-        ? { text: ` ${item.detail}`, hex: selectionMutedHex, bg }
-        : dim(` ${item.detail}`)
-      : undefined
-    const check = item.selected
-      ? { text: ' ✓', hex: brandHex, bold: true, ...(bg ? { bg } : {}) }
-      : undefined
-    lines.push({
-      spans: [prefix, name, ...(detail ? [detail] : []), ...(check ? [check] : [])],
-      ...(bg ? { bg } : {}),
-    })
+    const highlighted = index === state.focusIndex
+    lines.push(buildSelectorRow(item, {
+      highlighted,
+      query: state.query,
+      dimIdleLabel: true,
+      detailGap: ' ',
+    }))
     visibleListRowSeen = true
   }
 
@@ -166,7 +162,7 @@ function buildModelSelectorRegionLines(state: SelectorState, width: number): str
   })
 }
 
-function buildModelSearchLine(query: string, width: number): StyledLine {
+function buildModelSearchLine(query: string, width: number, active: boolean): StyledLine {
   // pi's Input returns the two-column prompt unchanged when there is no room
   // for input text or a cursor cell.
   if (width <= 2) return line(plain('> '))
@@ -177,7 +173,10 @@ function buildModelSearchLine(query: string, width: number): StyledLine {
     if (stringWidth(char + visibleQuery) > availableTextWidth) break
     visibleQuery = char + visibleQuery
   }
-  const padding = Math.max(0, width - 3 - stringWidth(visibleQuery))
+  const padding = Math.max(0, width - (active ? 3 : 2) - stringWidth(visibleQuery))
+  if (!active) {
+    return line(plain('> '), dim(visibleQuery), plain(' '.repeat(padding)))
+  }
   return line(
     plain('> '),
     plain(visibleQuery),
@@ -290,7 +289,7 @@ function highlightSpans(text: string, query: string, base: Partial<StyledSpan>):
   return spans.length > 0 ? spans : [{ text, ...base }]
 }
 
-function buildSelectorBlocks(state: SelectorState, columns: number): ViewBlock[] {
+function buildSelectorBlocks(state: SelectorState, columns: number, active = true): ViewBlock[] {
   const selectable = (items: SelectorItem[]) => items.filter(i => !i.header).length
   // A selector that supplies its own hints also owns its header: its counts live
   // in the subtitle and group headings, so the generic row tally beside the
@@ -311,8 +310,20 @@ function buildSelectorBlocks(state: SelectorState, columns: number): ViewBlock[]
   // A no-filter list reserves bare letters for actions, so it shows no filter
   // line: offering one would invite typing that goes nowhere.
   if (!state.noFilter) {
+    const filterFocused = active && state.listFocused !== true
     if (state.query) {
-      lines.push(line(colored('Filter  ', 'cyan'), plain(state.query), colored('▌', 'cyan')))
+      lines.push(line(
+        colored('Filter  ', 'cyan'),
+        plain(state.query),
+        ...(filterFocused ? [plain(CURSOR_MARKER), colored('▌', 'cyan')] : []),
+      ))
+    } else if (filterFocused) {
+      lines.push(line(
+        colored('Filter  ', 'cyan'),
+        plain(CURSOR_MARKER),
+        colored('▌', 'cyan'),
+        dim(` ${PLACEHOLDER_HINT}`),
+      ))
     } else {
       // Nothing typed yet: the filter line doubles as the discoverability hint,
       // otherwise there is no on-screen signal that typing filters at all.
@@ -420,18 +431,11 @@ function buildSelectorListLines(state: SelectorState): StyledLine[] {
       continue
     }
     seenRow = true
-    const focused = i === state.focusIndex
-    const prefix: StyledSpan = focused ? colored('❯ ', 'cyan', { bold: true }) : plain('  ')
-    const labelSpans = state.query
-      ? highlightSpans(item.label, state.query, focused ? { bold: true } : {})
-      : [focused ? bold(item.label) : plain(item.label)]
-    const detailSpans = item.detail && state.query
-      ? highlightSpans(`  ${item.detail}`, state.query, { dim: true })
-      : [item.detail ? dim(`  ${item.detail}`) : plain('')]
-    const selectedSpans = item.selected
-      ? [plain(' '), colored('✓', 'green')]
-      : []
-    lines.push(line(prefix, ...labelSpans, ...detailSpans, ...selectedSpans))
+    const highlighted = i === state.focusIndex
+    lines.push(buildSelectorRow(item, {
+      highlighted,
+      query: state.query,
+    }))
   }
   if (end < state.items.length) {
     lines.push(line(dim(`  ↓ ${state.items.length - end} below`)))
@@ -612,6 +616,8 @@ function joinPaneColumns(listLines: StyledLine[], paneLines: StyledLine[], listW
     const right = paneLines[i]?.spans ?? [plain('')]
     const spans = spansWidth(left) > listWidth ? truncateSpansToWidth(left, listWidth) : left
     const padding = Math.max(0, listWidth - spansWidth(spans))
+    // Layout only supplies spacing; the shared row component exclusively owns
+    // selection styling, so pane-backed rows look exactly like model rows.
     result.push(line(...spans, plain(' '.repeat(padding)), dim(PANE_DIVIDER), ...right))
   }
   return result
