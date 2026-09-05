@@ -1,9 +1,10 @@
 import { describe, test, expect } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getTheme } from '../../src/render/theme.js'
+import { smokeEnvironment, seedSmokeHome } from '../helpers/smoke-home.js'
+import { getTheme } from '../../src/render/theme/index.js'
 
 const EVOT_BIN = process.env.EVOT_TEST_BIN || join(import.meta.dirname, '..', '..', 'dist', 'evot')
 const canRun = process.platform !== 'win32' && existsSync(EVOT_BIN) && !!spawnSync('python3', ['--version']).stdout
@@ -66,6 +67,7 @@ type Session = {
   waitFor: (match: string | RegExp, timeoutMs?: number) => Promise<string>
   checkpoint: () => void
   persistedSessionCount: () => number
+  historyEntries: () => string[]
   kill: () => Promise<void>
 }
 
@@ -156,28 +158,22 @@ async function startEvot(
   seedOtherCwd = false,
   seedPreviewCacheMiss = false,
 ): Promise<Session> {
-  // Isolated EVOT_HOME: a dev machine may hold a staged release newer than this binary.
+  // Isolate HOME as well as EVOT_HOME: some TS and Rust stores use ~/.evotai.
+  // This must also protect developer state when testing an older compiled binary.
   const isolatedHome = mkdtempSync(join(tmpdir(), 'evot-smoke-home-'))
-  if (seedSession) seedResumeSession(isolatedHome)
+  const stateHome = seedSmokeHome(isolatedHome)
+  if (seedSession) seedResumeSession(stateHome)
   if (seedOtherCwd) {
-    seedResumeSession(isolatedHome, {
+    seedResumeSession(stateHome, {
       id: OTHER_CWD_SESSION_ID,
       cwd: '/tmp/other-project',
       title: 'other cwd fixture',
     })
   }
-  if (seedPreviewCacheMiss) seedResumePreviewCacheMiss(isolatedHome)
+  if (seedPreviewCacheMiss) seedResumePreviewCacheMiss(stateHome)
   const child = spawn('python3', ['-c', PTY_RELAY, EVOT_BIN], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      TERM: 'xterm-256color',
-      COLORTERM: 'truecolor',
-      EVOT_THEME: 'dark',
-      EVOT_MOUSE: '0',
-      EVOT_HOME: isolatedHome,
-      EVOT_STORAGE_FS_ROOT_DIR: isolatedHome,
-    },
+    env: smokeEnvironment(isolatedHome),
   })
   let all = ''
   let seen = 0
@@ -205,27 +201,40 @@ async function startEvot(
     }
   }
 
-  // The composer prompt is the readiness signal, so boot time is waited out
-  // rather than guessed at.
-  await waitFor('Enter a coding task')
+  const kill = async (): Promise<void> => {
+    seen = all.length
+    child.stdin!.write('\x03')
+    await wait(300)
+    child.stdin!.write('\x03')
+    await wait(500)
+    child.kill('SIGKILL')
+    rmSync(isolatedHome, { recursive: true, force: true })
+  }
+  // Readiness failures must not leave a subprocess or its temporary home behind.
+  try {
+    await waitFor('Enter a coding task')
+  } catch (err) {
+    await kill()
+    throw err
+  }
   return {
     write: data => { child.stdin!.write(data) },
     outputSince,
     waitFor,
     checkpoint: () => { seen = all.length },
     persistedSessionCount: () => {
-      const sessionsDir = join(isolatedHome, 'sessions')
+      const sessionsDir = join(stateHome, 'sessions')
       return existsSync(sessionsDir) ? readdirSync(sessionsDir).length : 0
     },
-    kill: async () => {
-      seen = all.length
-      child.stdin!.write('\x03')
-      await wait(300)
-      child.stdin!.write('\x03')
-      await wait(500)
-      child.kill('SIGKILL')
-      rmSync(isolatedHome, { recursive: true, force: true })
+    historyEntries: () => {
+      const projects = join(stateHome, 'projects')
+      if (!existsSync(projects)) return []
+      return readdirSync(projects).flatMap(slug => {
+        const path = join(projects, slug, 'evot_history')
+        return existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean) : []
+      })
     },
+    kill,
   }
 }
 
@@ -256,26 +265,28 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
     }
   }, 60_000)
 
-  test('a command window previews live, then arrows transfer focus', async () => {
+  test('a command window previews live, then the first arrow focuses and navigates', async () => {
     const session = await startEvot()
     try {
       // A unique prefix immediately renders the formal model window above the
       // composer, but the highlighted row already uses the selector's complete
       // current-row treatment while keyboard focus remains in the composer.
       session.checkpoint()
-      session.write('/mo')
+      session.write('/m')
       const preview = await session.waitFor('Only showing models from configured providers')
       expect(preview).toContain('Model Name:')
-      expect(preview).toContain('/mo')
-      expect(preview).toMatch(/❯\s+GPT 5\.6 Sol/)
+      expect(preview).toContain('/m')
+      const activeModel = preview.match(/Model Name: ([^\r\n]+)/)?.[1]?.trim()
+      expect(activeModel).toBeTruthy()
+      expect(preview).toContain(`❯ ${activeModel}`)
       expect(session.outputSince()).toContain(selectionBackgroundAnsi())
 
       // Continued typing still belongs to the composer, not the model filter.
       session.checkpoint()
-      session.write('del')
+      session.write('odel')
       const continued = await session.waitFor('/model')
       expect(continued).toContain('/model')
-      expect(continued).not.toContain('> del')
+      expect(continued).not.toContain('> odel')
 
       // Argument entry hides the no-argument command window immediately. When
       // the command becomes argument-free again, the same preview returns.
@@ -287,20 +298,35 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       const restored = await session.waitFor('Only showing models from configured providers')
       expect(restored).toContain('/model')
 
-      // The first arrow transfers focus without replacing the layout. The
-      // blurred composer stays in the same frame below the active selector.
-      // Promotion lands on the model the preview already highlighted, so its
-      // unified current-row appearance does not need to be repainted.
-      session.checkpoint()
-      session.write('\x1b[B')
-      await Bun.sleep(100)
-      expect(session.outputSince()).not.toContain('\x1b[2J')
-
-      // Once promoted, subsequent arrows belong to the formal selector.
+      // The first arrow both focuses and navigates, without replacing the
+      // selector/composer layout or requiring a focus-only keypress.
       session.checkpoint()
       session.write('\x1b[B')
       const navigated = await session.waitFor('Model Name:')
-      expect(navigated).toContain('Model Name: Claude Opus 5')
+      expect(navigated).not.toContain(`Model Name: ${activeModel}`)
+      expect(session.outputSince()).not.toContain('\x1b[2J')
+
+      session.checkpoint()
+      session.write('\x1b[A')
+      await session.waitFor(`Model Name: ${activeModel}`)
+
+      session.checkpoint()
+      session.write('\x1b')
+      await session.waitFor('Enter a coding task')
+
+      // Up must also navigate on its first press. Down then returns to the
+      // original active model; this does not depend on the catalog's ordering.
+      session.checkpoint()
+      session.write('/m')
+      await session.waitFor(`Model Name: ${activeModel}`)
+      session.checkpoint()
+      session.write('\x1b[A')
+      const navigatedUp = await session.waitFor('Model Name:')
+      expect(navigatedUp).not.toContain(`Model Name: ${activeModel}`)
+      expect(session.outputSince()).not.toContain('\x1b[2J')
+      session.checkpoint()
+      session.write('\x1b[B')
+      await session.waitFor(`Model Name: ${activeModel}`)
 
       session.checkpoint()
       session.write('\x1b')
@@ -330,10 +356,9 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       expect(preview).toContain('/ski')
       expect(preview).not.toContain('\x1b[2J')
 
-      // The first arrow transfers focus without replacing or clearing the
-      // selector/composer frame. The current-row marker is already present;
-      // promotion changes keyboard ownership only. Enter is intentionally inert
-      // in this read-only inventory; management stays explicit via `/skill ...`.
+      // The first arrow focuses and navigates without replacing or clearing
+      // the selector/composer frame. Enter is intentionally inert in this
+      // read-only inventory; management stays explicit via `/skill ...`.
       session.checkpoint()
       session.write('\x1b[B')
       await Bun.sleep(100)
@@ -452,7 +477,7 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       await session.waitFor('No sessions found')
       session.checkpoint()
       session.write('cache refresh smoke\x0d')
-      await session.waitFor('▍ cache refresh smoke')
+      await session.waitFor('┃ cache refresh smoke')
       for (let i = 0; i < 100 && session.persistedSessionCount() !== 1; i++) {
         await Bun.sleep(20)
       }
@@ -469,7 +494,9 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       const reopened = await session.waitFor('Resume session')
       expect(reopened).toMatch(/Resume session.*\s1(?:\r|\n)/)
       expect(reopened).toContain('Current cwd')
-      expect(reopened).toContain('(untitled)')
+      // The local provider fails promptly, so the fallback title can already
+      // be set. Assert the actual prompt rather than racing title generation.
+      expect(reopened).toContain('cache refresh smoke')
     } finally {
       await session.kill()
     }
@@ -486,8 +513,8 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       expect(current).not.toContain('Other cwd')
       expect(current).not.toContain('other cwd fixture')
 
-      // The first arrow lands on the first current-project session instead of
-      // stopping in the filter input or skipping to the second row.
+      // With only one current-project session, the first arrow focuses that
+      // row without stopping in the filter input.
       session.checkpoint()
       session.write('\x1b[B')
       await Bun.sleep(100)
@@ -530,8 +557,10 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
   test('submitting a prompt commits it to the transcript', async () => {
     const session = await startEvot()
     try {
+      expect(session.historyEntries()).toEqual([])
       session.write('echo smoke test\x0d')
-      await session.waitFor('▍ echo smoke test')
+      await session.waitFor('┃ echo smoke test')
+      expect(session.historyEntries()).toEqual(['echo smoke test'])
     } finally {
       await session.kill()
     }
