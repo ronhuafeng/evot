@@ -559,11 +559,11 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       await session.waitFor('production alerts')
       session.checkpoint()
       session.write('/production')
-      // Search snippets can truncate the inline ID. Check the actual filtered
-      // row and count rather than requiring hidden metadata to fit on screen.
+      // Full session rows put the complete ID before the chosen title.
+      // Verify both identity and the persisted rename in the filtered result.
       const filtered = await session.waitForScreen(/Search\s+production(?:\s|$)/)
       expect(filtered).toMatch(/Sessions\s+1 \/ 1(?:\r|\n)/)
-      expect(filtered).toMatch(/·\s+production alerts/)
+      expect(filtered).toMatch(new RegExp(`·\\s+${SEEDED_SESSION_ID}\\s+production alerts(?:\\s|$)`))
       session.write('\x1b')
     } finally {
       await session.kill()
@@ -590,7 +590,7 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       // the complete shared current-row treatment before keyboard promotion.
       const populated = await session.waitForScreen(createdSessionId)
       expect(populated).toMatch(/Sessions\s+1(?:\r|\n)/)
-      expect(populated).toMatch(/·\s+smoke resume fixture/)
+      expect(populated).toMatch(new RegExp(`·\\s+${SEEDED_SESSION_ID}\\s+smoke resume fixture(?:\\s|$)`))
       expect(session.outputSince()).toContain(selectionBackgroundAnsi())
 
       // An ambiguous bare slash is a bridge between command windows. Keep the
@@ -713,7 +713,8 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
     try {
       session.checkpoint()
       session.write('/re')
-      const current = await session.waitForScreen(SEEDED_SESSION_ID.slice(0, 8))
+      // The height-constrained command preview shows labels, not session IDs.
+      const current = await session.waitForScreen(/·[ \t]+smoke resume fixture(?:[ \t]*\n|$)/)
       expect(current).toMatch(/Sessions\s+1(?:\r|\n)/)
       expect(current).toContain('smoke resume fixture')
       expect(current).not.toContain('Other cwd')
@@ -730,10 +731,13 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       // cross-project history without making it part of the default recents.
       session.checkpoint()
       session.write('other cwd fixture')
-      // The title search produces a context snippet instead of the inline ID.
-      const searched = await session.waitForScreen(/Search\s+other cwd fixture(?:\s|$)/)
+      // Focused search can use the full row while the compact preview omits
+      // IDs. Accept only those two layouts, with the exact fixture identity.
+      const otherRow = new RegExp(`·[ \t]+(?:${OTHER_CWD_SESSION_ID}[ \t]+)?other cwd fixture(?:[ \t]|\\n|$)`)
+      const searched = await session.waitForScreen(otherRow)
+      expect(searched).toMatch(/Search\s+other cwd fixture(?:\s|$)/)
       expect(searched).toContain('Other cwd')
-      expect(searched).toMatch(/·\s+other cwd fixture/)
+      expect(searched).toMatch(otherRow)
       expect(searched).not.toContain('smoke resume fixture')
     } finally {
       await session.kill()
@@ -750,11 +754,15 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       // these current-project rows can come from the bounded startup cache.
       // Seeing all three proves the live preview automatically loaded the same
       // complete metadata catalog used by submitted `/resume`.
-      await session.waitForScreen('11000000')
-      await session.waitForScreen('12000000')
-      const expanded = await session.waitForScreen('13000000')
+      // Compact command previews omit IDs; these unique labels identify all
+      // three current-project fixtures without requiring hidden metadata.
+      await session.waitForScreen('older current session 1')
+      await session.waitForScreen('older current session 2')
+      const expanded = await session.waitForScreen('older current session 3')
       expect(expanded).toMatch(/Sessions\s+3(?:\r|\n)/)
-      expect(expanded).toContain('older current session 1')
+      for (const index of [1, 2, 3]) {
+        expect(expanded).toMatch(new RegExp(`·[ \t]+older current session ${index}(?:[ \t]*\\n|$)`))
+      }
       expect(expanded).not.toContain('Other cwd')
       expect(expanded).not.toContain('newer other session')
     } finally {
@@ -1617,11 +1625,18 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
   test('background suggestions follow the live task both during a reply and after interruption', async () => {
     let mainCalls = 0
     const states: string[] = []
+    // Upstream intentionally supplies bounded command context, never the full script.
+    const backgroundCommand = `sleep 30 # ${'bounded context '.repeat(50)}PRIVATE_SHELL_MARKER`
     const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: async request => {
       const body = await request.json() as Record<string, unknown>
       if (body.model === 'suggestion-fixture') {
         const prompt = suggestionInstructions(body)
-        expect(suggestionWorkflow(body).runtime.activities?.length).toBeGreaterThan(0)
+        const activities = suggestionWorkflow(body).runtime.activities ?? []
+        expect(activities.length).toBeGreaterThan(0)
+        const background = activities.find(activity => activity.kind === 'background')
+        expect(background?.command).toBe(backgroundCommand.slice(0, 600))
+        expect(background).not.toHaveProperty('cwd')
+        expect(background).not.toHaveProperty('output_path')
         expect(prompt).toContain('Run focused authentication tests')
         expect(prompt).toContain('"kind":"background"')
         expect(prompt).not.toContain('PRIVATE_SHELL_MARKER')
@@ -1631,7 +1646,7 @@ describe.skipIf(!canRun)('evot binary smoke (PTY)', () => {
       }
       mainCalls++
       if (mainCalls === 1) {
-        const chunk = { id: 'bg', model: body.model, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'bg-auth', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: 'sleep 30 # PRIVATE_SHELL_MARKER', description: 'Run focused authentication tests', run_in_background: true }) } }] }, finish_reason: 'tool_calls' }] }
+        const chunk = { id: 'bg', model: body.model, choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'bg-auth', type: 'function', function: { name: 'bash', arguments: JSON.stringify({ command: backgroundCommand, description: 'Run focused authentication tests', run_in_background: true }) } }] }, finish_reason: 'tool_calls' }] }
         return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, { headers: { 'content-type': 'text/event-stream' } })
       }
       return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(': waiting\n\n')) } }), { headers: { 'content-type': 'text/event-stream' } })
