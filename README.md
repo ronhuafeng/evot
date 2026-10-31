@@ -1,40 +1,32 @@
-<p align="center">
-  <strong>Evot</strong>
-</p>
-
-<p align="center"><strong>High-quality AI work, at low or even zero cost.</strong></p>
-
-<p align="center">We pick great models — including free stealth ones like <code>stealth/ox-alpha</code> (free this week) — so everyone can run long tasks affordably.</p>
+<p align="center"><strong>Evot</strong></p>
+<p align="center"><strong>The lightest harness for agentic work.</strong></p>
+<p align="center">An open-source terminal coding agent. A short prompt, four core tools, and the model does the thinking.</p>
 
 <p align="center">
   <a href=".github/assets/demo.gif"><img src=".github/assets/demo.gif" alt="evot demo" width="960" /></a>
 </p>
 
-## 📢 News
+## News
 
-- **2026-09-02** `ctrl+b` backgrounds a long-running command so you can keep talking.
-- **2026-09-01** `GPT-5.6 Luna` is free through Sep 3 🎉.
-- **2026-08-31** [herdr](https://herdr.dev) works with evot 🐑 — point `EVOT_SESSION_HOOK` at an adapter and your panes show `working` / `blocked` / `idle` live.
-- **2026-08-27** `GPT-5.6 Luna` is free through Aug 31 🎉 — just `evot login`.
-- **2026-08-24** Free model of the week: [`stealth/ox-alpha`](https://openrouter.ai/stealth/ox-alpha) — free on OpenRouter for a week.
+- **2026-10-18** `Tab` — context-aware suggestions, e.g. “Run the tests.” `Tab` cycles; `→` accepts without sending.
+- **2026-10-14** `/loop` — babysit a PR, poll a deploy, check back on a build; the agent picks when to wake and when to stop.
+- **2026-09-16** `/task` — scheduled runs with push delivery.
+- **2026-09-13** `/share` — read-only session links on evot.ai.
+- **2026-09-02** `ctrl+b` — background a running command and keep talking.
 
-## Performance
-
-Same task, same eval environment, three agents × three models — cost and tool calls, lower is better.
-
-<p align="center">
-  <a href=".github/assets/benchmark-agent-model-comparison.png"><img src=".github/assets/benchmark-agent-model-comparison.png" alt="Benchmark comparing evot, Claude Code, and pi" width="960" /></a>
-</p>
-
-> Task: fix a real bug in serde_json ([issue #979](https://github.com/serde-rs/json/issues/979)) end to end.
-
-All nine runs produce correct, passing code — but evot costs **72–78% less** than Claude Code with **fewer tool calls** on every model.
-
-## Installation
+## Quick start
 
 ```bash
 curl -fsSL https://evot.ai/install | sh
 ```
+
+The installer configures your PATH. Open a new terminal, or run the command it prints to use evot in the current terminal. Then log in:
+
+```bash
+evot login
+```
+
+Login opens the TUI. Use hosted models or bring your own API keys.
 
 <details>
 <summary>Build from source</summary>
@@ -47,75 +39,74 @@ make setup && make install
 
 </details>
 
-## Login
-
-```bash
-evot login     # follow the prompts; you land straight in the TUI after login
-```
-
-```bash
-evot           # interactive TUI
-evot -c        # continue the latest session in this directory
-```
-
-> In the TUI: `/help` lists all commands.
-
-## External session hooks
-
-Evot can emit generic session lifecycle events to an external executable without embedding integration-specific code:
-
-```bash
-EVOT_SESSION_HOOK=/path/to/session-adapter evot
-```
-
-The adapter receives one versioned NDJSON object per line on stdin. Events include `session_started`, `run_started`, `run_finished`, `run_failed`, `state_changed`, and `session_ended`; `state_changed.state` is `working`, `blocked`, or `idle`. Session identity is available as `session_id`, and run identity as `run_id`.
-
-The hook is best-effort: a missing or failing adapter never changes evot's main execution path. The same protocol is used by the interactive TUI and one-shot `evot -p` mode, so adapters can remain independent of the UI.
-
 <details>
-<summary>Custom configuration (bring your own models via <code>~/.evotai/evot.env</code>)</summary>
+<summary>Bring your own models</summary>
+
+Configure providers in `~/.evotai/evot.env`. Examples:
 
 ```env
-# Anthropic (default)
+# Anthropic
 EVOT_LLM_ANTHROPIC_API_KEY=sk-ant-...
 EVOT_LLM_ANTHROPIC_BASE_URL=your-anthropic-base-url
 EVOT_LLM_ANTHROPIC_MODEL=claude-opus-4.8
-# Multiple models: EVOT_LLM_ANTHROPIC_MODEL=claude-sonnet-5.0,claude-opus-4.8,claude-fable-5
 
-# Or OpenAI Chat Completions
-# EVOT_LLM_OPENAI_API_KEY=sk-...
-# EVOT_LLM_OPENAI_BASE_URL=your-openai-compatible-base-url
-# EVOT_LLM_OPENAI_MODEL=gpt-5.6-sol
-# EVOT_LLM_OPENAI_PROTOCOL=openai
-
-# Or OpenAI Responses API (official OpenAI GPT/Codex models)
-# Using the official endpoint enables provider-native "remote compaction":
-# context is compacted server-side with far higher recall, taking priority
-# over the local algorithmic path (auto — falls back to local on any failure).
+# OpenAI Responses API
 # EVOT_LLM_OPENAI_API_KEY=sk-...
 # EVOT_LLM_OPENAI_MODEL=gpt-5.6-sol
 # EVOT_LLM_OPENAI_PROTOCOL=openai_responses
 
-# Or DeepSeek (Anthropic-compatible)
+# DeepSeek (Anthropic-compatible)
 # EVOT_LLM_DEEPSEEK_API_KEY=sk-...
 # EVOT_LLM_DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
 # EVOT_LLM_DEEPSEEK_PROTOCOL=anthropic
 # EVOT_LLM_DEEPSEEK_MODEL=deepseek-v4-pro
 
-# Or Kimi Coding (Anthropic-compatible)
+# Kimi Coding (Anthropic-compatible)
 # EVOT_LLM_KIMI_API_KEY=sk-...
 # EVOT_LLM_KIMI_BASE_URL=https://api.kimi.com/coding
 # EVOT_LLM_KIMI_PROTOCOL=anthropic
 # EVOT_LLM_KIMI_MODEL=kimi-for-coding
 
-# Or OpenRouter (Anthropic-compatible)
+# OpenRouter (Anthropic-compatible)
 # EVOT_LLM_OPENROUTER_API_KEY=sk-or-...
 # EVOT_LLM_OPENROUTER_BASE_URL=https://openrouter.ai/api/
 # EVOT_LLM_OPENROUTER_PROTOCOL=anthropic
 # EVOT_LLM_OPENROUTER_MODEL=stealth/ox-alpha
 ```
 
+Use comma-separated model names to configure multiple models. For OpenAI-compatible Chat Completions, set `EVOT_LLM_OPENAI_PROTOCOL=openai` and `EVOT_LLM_OPENAI_BASE_URL` to your endpoint. The official Responses API supports server-side context compaction, with local fallback.
+
 </details>
+
+<details>
+<summary>Use evot from editors and other tools (ACP)</summary>
+
+`evot acp` serves the [Agent Client Protocol](https://agentclientprotocol.com) v1 on stdin/stdout, so any ACP client can drive evot:
+
+```bash
+evot acp                            # full coding tools
+evot acp --tools readonly           # read and search only
+evot acp --tools none --ephemeral   # answer-only, sessions kept in memory
+```
+
+Supported methods: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/list`, `session/resume`, `session/close`, and `session/set_config_option` for the per-session `model` selector. Tools run inside evot; it does not send `session/request_permission`. `--tools none` offers the model no tools, skills, or project instructions. `--ephemeral` writes no sessions to disk.
+
+</details>
+
+## Less harness. More model.
+
+- **Small by design.** ~1k prompt tokens and four core tools: `read`, `bash`, `edit`, `write`.
+- **Less waiting.** Long-running commands continue in the background while the agent works on independent tasks.
+- **Lean context.** [TypeSafe Jev](https://typesafe.ai) prunes obsolete tool calls and trims stale results without summarising. Compaction is a fallback.
+- **Your choice of model.** Free and low-cost hosted models, or your own provider keys.
+
+## Performance
+
+<p align="center">
+  <a href="https://trace.evot.ai/performance.html"><img src=".github/assets/benchmark-latest-models.png" alt="Evot model request comparison with pi and dsh" width="960" /></a>
+</p>
+
+[Live performance & comparisons →](https://trace.evot.ai/performance.html)
 
 ## License
 

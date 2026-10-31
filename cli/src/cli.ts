@@ -1,12 +1,14 @@
 import type { Agent } from './native/index.js'
 
 export interface CliOptions {
-  command: 'repl' | 'serve' | 'prompt' | 'update' | 'login' | 'logout' | 'whoami'
+  command: 'repl' | 'serve' | 'prompt' | 'update' | 'login' | 'logout' | 'whoami' | 'acp'
   model?: string
   prompt?: string
   port?: number
   resume?: string
   continueLatest: boolean
+  /** `--fork [id]`: start in a fresh fork of `id`, or of the latest session in cwd. */
+  fork?: { sessionId?: string }
   envFile?: string
   outputFormat: 'text' | 'stream-json'
   maxTurns: number
@@ -16,6 +18,12 @@ export interface CliOptions {
   skillsDirs: string[]
   skillNames: string[]
   files: string[]
+  /** `evot acp --tools`: tools ACP sessions may use. */
+  acpTools: 'full' | 'readonly' | 'none'
+  /** `evot acp --permission`: ask the client before every tool call, or not. */
+  acpPermission: 'ask' | 'allow'
+  /** `evot acp --ephemeral`: keep ACP sessions in memory only. */
+  ephemeral: boolean
 }
 
 export async function parseArgs(argv: string[]): Promise<CliOptions> {
@@ -29,6 +37,9 @@ export async function parseArgs(argv: string[]): Promise<CliOptions> {
     skillsDirs: [],
     skillNames: [],
     files: [],
+    acpTools: 'full',
+    acpPermission: 'ask',
+    ephemeral: false,
   }
 
   for (let i = 0; i < argv.length; i++) {
@@ -44,6 +55,26 @@ export async function parseArgs(argv: string[]): Promise<CliOptions> {
       continue
     }
 
+    if (arg === 'acp') { opts.command = 'acp'; continue }
+    if (arg === '--tools' && argv[i + 1]) {
+      const tools = argv[++i]
+      if (tools !== 'full' && tools !== 'readonly' && tools !== 'none') {
+        console.error(`Invalid --tools: ${tools} (expected full, readonly, or none)`)
+        process.exit(1)
+      }
+      opts.acpTools = tools
+      continue
+    }
+    if (arg === '--permission' && argv[i + 1]) {
+      const permission = argv[++i]
+      if (permission !== 'ask' && permission !== 'allow') {
+        console.error(`Invalid --permission: ${permission} (expected ask or allow)`)
+        process.exit(1)
+      }
+      opts.acpPermission = permission
+      continue
+    }
+    if (arg === '--ephemeral') { opts.ephemeral = true; continue }
     if (arg === 'login') { opts.command = 'login'; continue }
     if (arg === 'logout') { opts.command = 'logout'; continue }
     if (arg === 'whoami') { opts.command = 'whoami'; continue }
@@ -59,6 +90,11 @@ export async function parseArgs(argv: string[]): Promise<CliOptions> {
     if (arg === '--port' && argv[i + 1]) { opts.port = parseIntArg(argv[++i], '--port'); continue }
     if ((arg === '-r' || arg === '--resume') && argv[i + 1]) { opts.resume = argv[++i]; continue }
     if (arg === '-c' || arg === '--continue') { opts.continueLatest = true; continue }
+    if (arg === '--fork') {
+      const next = argv[i + 1]
+      opts.fork = next && !next.startsWith('-') ? { sessionId: argv[++i] } : {}
+      continue
+    }
     if (arg === '--output-format' && argv[i + 1]) {
       const fmt = argv[++i]
       if (fmt !== 'text' && fmt !== 'stream-json') {
@@ -109,6 +145,7 @@ export async function printHelp() {
   console.log('Commands:')
   console.log('  (default)              Interactive REPL')
   console.log('  serve                  Start HTTP server')
+  console.log('  acp                    Serve the Agent Client Protocol (ACP) on stdio')
   console.log('  update                 Update evot to latest version')
   console.log()
   console.log('Options:')
@@ -116,9 +153,10 @@ export async function printHelp() {
   console.log('  -f, --file <path>      Attach file/directory context (repeatable)')
   console.log('  --model <name>         Override the model')
   console.log('  --env-file <path>      Path to evot.env file')
-  console.log('  --port <number>        Server port (default: 8082)')
+  console.log('  --port <number>        Dashboard port (default: 8082)')
   console.log('  -r, --resume <id>      Resume or create a session by ID')
   console.log('  -c, --continue         Resume the latest session in the current directory')
+  console.log('  --fork [id]            Start in a fork of a session (default: latest in cwd)')
   console.log('  --output-format <fmt>  text | stream-json (default: text)')
   console.log('  --max-turns <n>        Max turns (default: 512)')
   console.log('  --max-tokens <n>       Max tokens (default: 100000000)')
@@ -126,6 +164,9 @@ export async function printHelp() {
   console.log('  --append-system-prompt <text>')
   console.log('  --skills <dir>         Skills directory (repeatable)')
   console.log('  --skill <name>         One-shot only: enable a skill by name (repeatable)')
+  console.log('  --tools <policy>       acp only: full | readonly | none (default: full)')
+  console.log('  --permission <policy>  acp only: ask | allow — ask the client before each tool call (default: ask)')
+  console.log('  --ephemeral            acp only: keep sessions in memory, write nothing to disk')
   console.log('  --version, -v          Show version')
   console.log('  --update               Update evot to latest version')
   console.log('  --help, -h             Show this help')

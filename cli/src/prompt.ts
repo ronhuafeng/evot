@@ -1,3 +1,4 @@
+import { isHostToolEvent, type RunEvent } from './native/contracts/query-event.js'
 import { Agent } from './native/index.js'
 import type { CliOptions } from './cli.js'
 import { createAgent } from './cli.js'
@@ -13,6 +14,12 @@ export async function runPrompt(opts: CliOptions) {
   }
 
   const agent: Agent = await createAgent(opts)
+  // Non-interactive runs have no picker to repair a stale `--model`, and a
+  // silent swap would make scripted output lie about which model ran.
+  if (agent.startupWarning) {
+    console.error(agent.startupWarning)
+    process.exit(1)
+  }
 
   let contentJson: string | undefined
   try {
@@ -41,6 +48,7 @@ export async function runPrompt(opts: CliOptions) {
     sessionHook.startSession(stream.sessionId, agent.cwd)
 
     for await (const event of stream) {
+      if (isHostToolEvent(event)) throw new Error('Headless prompt requested a host tool')
       if (event.kind === 'run_started') {
         sessionHook.runStarted(event.run_id)
       } else if (event.kind === 'run_finished') {
@@ -64,10 +72,10 @@ export async function runPrompt(opts: CliOptions) {
   } finally {
     await sessionHook.close(closeReason)
   }
-  process.exit(0)
+  process.exit(closeReason === 'failed' ? 1 : 0)
 }
 
-function printEventText(event: any) {
+function printEventText(event: RunEvent) {
   switch (event.kind) {
     case 'assistant_delta':
       if (event.payload?.content_type === 'text' && event.payload?.delta) process.stdout.write(String(event.payload.delta))

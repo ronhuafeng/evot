@@ -14,15 +14,16 @@
 use async_trait::async_trait;
 
 use super::diff;
+use super::hint;
 use super::mutex::acquire_file_lock;
+use super::snippet;
+use super::snippet::line_at as byte_offset_to_line;
 use crate::types::*;
 
 // ─── Tool ─────────────────────────────────────────────────────────────────
 
 /// Surgical file editing via exact text search/replace.
-pub struct EditFileTool {
-    disallow_message: Option<String>,
-}
+pub struct EditFileTool;
 
 impl Default for EditFileTool {
     fn default() -> Self {
@@ -32,16 +33,7 @@ impl Default for EditFileTool {
 
 impl EditFileTool {
     pub fn new() -> Self {
-        Self {
-            disallow_message: None,
-        }
-    }
-
-    /// Mark this tool as disallowed. `execute()` will return the given message
-    /// instead of performing the edit.
-    pub fn disallow(mut self, message: impl Into<String>) -> Self {
-        self.disallow_message = Some(message.into());
-        self
+        Self
     }
 }
 
@@ -96,7 +88,7 @@ impl AgentTool for EditFileTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the file to edit (relative or absolute)"
+                    "description": "Path to the file to edit (relative or absolute). Emit path first, before edits."
                 },
                 "edits": {
                     "type": "array",
@@ -131,10 +123,6 @@ impl AgentTool for EditFileTool {
         params: serde_json::Value,
         ctx: ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        if let Some(msg) = &self.disallow_message {
-            return Err(ToolError::Failed(format!("Error: {msg}")));
-        }
-
         let path_str = params["path"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidArgs("missing 'path' parameter".into()))?;
@@ -217,13 +205,22 @@ impl AgentTool for EditFileTool {
             }
         }
 
-        // Apply in reverse order to preserve offsets
-        let mut new_content_lf = content_lf.clone();
         let match_kind = resolved
             .last()
             .map(|r| r.kind.as_str().to_string())
             .unwrap_or_else(|| "exact".to_string());
         let replacement_count = resolved.len();
+
+        // Track where each replacement lands in the new content (forward pass),
+        // then apply in reverse order so earlier offsets stay valid.
+        let mut new_spans = Vec::with_capacity(resolved.len());
+        let mut delta: isize = 0;
+        for r in &resolved {
+            let start = (r.start as isize + delta) as usize;
+            new_spans.push((start, start + r.new_text.len()));
+            delta += r.new_text.len() as isize - (r.end - r.start) as isize;
+        }
+        let mut new_content_lf = content_lf.clone();
         for r in resolved.into_iter().rev() {
             new_content_lf.replace_range(r.start..r.end, &r.new_text);
         }
@@ -264,7 +261,10 @@ impl AgentTool for EditFileTool {
 
         Ok(ToolResult {
             content: vec![Content::Text {
-                text: format!("Updated {path_str}."),
+                text: format!(
+                    "Updated {path_str}.\n\n{}",
+                    changed_regions(&new_content_lf, &new_spans)
+                ),
             }],
             details: serde_json::json!({
                 "path": path_str,
@@ -290,6 +290,7 @@ impl EditFileTool {
         if arr.is_empty() {
             return Err(ToolError::InvalidArgs("edits[] must not be empty".into()));
         }
+        let n = arr.len();
         let mut edits = Vec::with_capacity(arr.len());
         for (i, entry) in arr.iter().enumerate() {
             let old = entry
@@ -309,6 +310,13 @@ impl EditFileTool {
             if old_lf.is_empty() {
                 return Err(ToolError::Failed(format!(
                     "edits[{i}].oldText must not be empty."
+                )));
+            }
+            if old_lf == new_lf {
+                return Err(ToolError::Failed(format!(
+                    "{}oldText and newText are identical; nothing to change. \
+                     Put the current file content in oldText and the desired content in newText.",
+                    edit_prefix(i, n)
                 )));
             }
             edits.push((old_lf, new_lf));
@@ -335,11 +343,10 @@ impl EditFileTool {
                 ToolError::Failed(format!("{prefix}oldText must not be empty."))
             }
             MatchError::NotFound => {
-                let hint = find_similar_text(content_lf, old_text_lf);
-                let suffix = match hint {
-                    Some(similar) => format!(
-                        "\n\nDid you mean:\n```\n{similar}\n```\n\
-                         Make sure oldText matches the current file content exactly."
+                let suffix = match hint::not_found_hint(content_lf, old_text_lf) {
+                    Some(h) => format!(
+                        "\n\n{h}\nThe file may have changed since you last read it \
+                         (including by your own earlier edits). Use the current content above as oldText."
                     ),
                     None => "\n\nTip: Use Read to see the current file contents.".into(),
                 };
@@ -352,10 +359,23 @@ impl EditFileTool {
                     .map(|l| l.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                ToolError::Failed(format!(
+                let total = snippet::line_count(content_lf);
+                let mut msg = format!(
                     "{prefix}oldText matches {count} locations in {path_str} (lines {line_list}). \
-                     Include more surrounding context to make the match unique."
-                ))
+                     Include more surrounding context to make the match unique.\n"
+                );
+                for &line in lines.iter().take(MAX_LOCATIONS_SHOWN) {
+                    let range = snippet::LineRange {
+                        start: line,
+                        end: line,
+                    }
+                    .widen(2, total);
+                    msg.push_str(&format!(
+                        "\nLine {line}:\n{}",
+                        snippet::render(content_lf, range, &[line], 5)
+                    ));
+                }
+                ToolError::Failed(msg)
             }
         }
     }
@@ -556,15 +576,6 @@ struct LineSpan {
     content_end: usize,
 }
 
-/// Convert a byte offset within `text` to a 1-based line number.
-fn byte_offset_to_line(text: &str, byte_offset: usize) -> usize {
-    text[..byte_offset.min(text.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
-        .count()
-        + 1
-}
-
 /// Build a line span table for `text`. Each entry records the byte range of one line.
 fn build_line_spans(text: &str) -> Vec<LineSpan> {
     let mut spans = Vec::new();
@@ -745,31 +756,45 @@ fn try_nfkc_normalized(
     }
 }
 
-/// Try to find similar text in the file content for error hints.
-pub fn find_similar_text(content: &str, target: &str) -> Option<String> {
-    let target_trimmed = target.trim();
-    if target_trimmed.is_empty() {
-        return None;
+// ─── Result rendering ──────────────────────────────────────────────────────
+
+/// Max ambiguous match locations rendered with context.
+const MAX_LOCATIONS_SHOWN: usize = 5;
+/// Context lines around each changed region in the success message.
+const REGION_CONTEXT: usize = 3;
+/// Cap on rendered lines per changed region.
+const REGION_MAX_LINES: usize = 40;
+
+/// `edits[i]: ` prefix, omitted for single-edit calls.
+fn edit_prefix(i: usize, total: usize) -> String {
+    if total > 1 {
+        format!("edits[{i}].")
+    } else {
+        String::new()
     }
+}
 
-    let first_line = target_trimmed.lines().next()?;
-    let first_line_trimmed = first_line.trim();
-
-    if first_line_trimmed.is_empty() {
-        return None;
+/// Render the post-edit content around every replaced span so the model's
+/// view of the file stays current for follow-up edits.
+fn changed_regions(new_content: &str, spans: &[(usize, usize)]) -> String {
+    let total = snippet::line_count(new_content);
+    let ranges = snippet::merge_ranges(
+        spans
+            .iter()
+            .map(|&(s, e)| snippet::range_of_span(new_content, s, e).widen(REGION_CONTEXT, total))
+            .collect(),
+        0,
+    );
+    let mut out = String::from("Current content of the changed region(s):\n");
+    for r in ranges {
+        out.push_str(&format!(
+            "\nLines {}-{}:\n{}",
+            r.start,
+            r.end,
+            snippet::render(new_content, r, &[], REGION_MAX_LINES)
+        ));
     }
-
-    let lines: Vec<&str> = content.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        if line.contains(first_line_trimmed) {
-            let start = i;
-            let target_line_count = target_trimmed.lines().count();
-            let end = (i + target_line_count + 1).min(lines.len());
-            return Some(lines[start..end].join("\n"));
-        }
-    }
-
-    None
+    out
 }
 
 // ─── Normalization ─────────────────────────────────────────────────────────

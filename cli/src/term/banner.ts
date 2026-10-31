@@ -1,8 +1,7 @@
 import { existsSync } from 'fs'
-import { homedir } from 'os'
 import { join } from 'path'
 import chalk from 'chalk'
-import { renderSkillInventoryLines, skillListView } from '../commands/skill.js'
+import { renderSkillStartupLines, skillListView } from '../commands/skill.js'
 import type { SkillListView } from '../commands/skill/render.js'
 import type { ConfigInfo } from '../native/index.js'
 import { getTheme } from '../render/theme/index.js'
@@ -74,7 +73,7 @@ function renderSection(title: string, values: string[], columns: number): string
 function renderSkillSection(view: SkillListView, columns: number): string[] {
   if (view.units.length === 0) return []
 
-  return renderSkillInventoryLines(view, columns)
+  return renderSkillStartupLines(view, columns)
 }
 
 function appendBlock(lines: string[], block: string[]): void {
@@ -101,6 +100,8 @@ export interface BannerOptions {
   releaseNotes?: string[] | null
   /** Install bookkeeping mismatch worth surfacing (see update/state.ts). */
   installDrift?: string | null
+  /** Non-fatal startup diagnostic from the agent (e.g. an ignored `--model`). */
+  startupWarning?: string | null
   /** Fully resolved, ordered skill directories from the agent. */
   skillsDirs?: string[]
 }
@@ -127,6 +128,7 @@ export function renderBanner(opts: BannerOptions, data?: BannerData): string {
     serverState,
     releaseNotes,
     installDrift,
+    startupWarning,
     skillsDirs,
   } = opts
 
@@ -135,7 +137,7 @@ export function renderBanner(opts: BannerOptions, data?: BannerData): string {
   appendBlock(detailLines, renderSection('Context', snapshot.contextFiles, columns))
   appendBlock(detailLines, renderSkillSection(snapshot.skills, columns))
   if (serverState) {
-    appendBlock(detailLines, renderSection('Server', [serverState.address], columns))
+    appendBlock(detailLines, renderSection('Dashboard', [serverState.address], columns))
   }
 
   if (detailLines.length > 0) detailLines.push('')
@@ -160,6 +162,12 @@ export function renderBanner(opts: BannerOptions, data?: BannerData): string {
     detailLines.push('')
     detailLines.push(chalk.hex('#ffff00')(`  ⚠ Install mismatch: ${installDrift}`))
     detailLines.push(chalk.hex(MUTED)('    run /update to reinstall'))
+  }
+
+  if (startupWarning) {
+    detailLines.push('')
+    detailLines.push(chalk.hex('#ffff00')(`  ⚠ ${startupWarning}`))
+    detailLines.push(chalk.hex(MUTED)('    pick another with /model, or drop --model'))
   }
 
   const fullBannerLines = wrapBannerLines(

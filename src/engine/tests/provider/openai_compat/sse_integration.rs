@@ -24,6 +24,29 @@ fn openai_config() -> StreamConfig {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn bounded_provider_preserves_delta_order_under_backpressure(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = openai_sse::body(vec![
+        openai_sse::text_chunk("one", None),
+        openai_sse::text_chunk("two", None),
+        openai_sse::finish_with_usage("stop", 10, 2),
+        openai_sse::done(),
+    ]);
+    let (_, events) =
+        run_provider_sse_bounded(&OpenAiCompatProvider, openai_config(), &body).await?;
+    let deltas: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["one", "two"]);
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    Ok(())
+}
+
+#[tokio::test]
 async fn openai_sse_text_response() {
     let sse = openai_sse::body(vec![
         openai_sse::text_chunk("Hello, ", None),
@@ -140,7 +163,7 @@ async fn openai_sse_uses_first_non_empty_reasoning_alias_once() {
     assert!(matches!(
         message,
         Message::Assistant { content, .. }
-            if matches!(&content[0], Content::Thinking { thinking, metadata: Some(ThinkingMetadata::OpenAiCompletions { field: ReasoningField::ReasoningContent }) }
+            if matches!(&content[0], Content::Thinking { thinking, metadata: Some(ThinkingMetadata::OpenAiCompletions { field: ReasoningField::ReasoningContent, .. }) }
                 if thinking == "one two three")
     ));
 }
@@ -201,6 +224,121 @@ async fn openai_sse_interleaved_reasoning_and_text_append_in_arrival_order() {
 }
 
 #[tokio::test]
+async fn openai_sse_reasoning_details_are_coalesced_onto_thinking_block() {
+    // OpenRouter-style streaming: summary fragments arrive as separate deltas
+    // and must merge; the encrypted entry stays discrete. None of this is a
+    // user-visible delta.
+    let sse = openai_sse::body(vec![
+        openai_sse::reasoning_details_chunk(Some("plan "), vec![serde_json::json!({
+            "type": "reasoning.summary", "summary": "plan ", "id": "rs_1", "format": "openai-responses-v1", "index": 0
+        })]),
+        openai_sse::reasoning_details_chunk(Some("it"), vec![serde_json::json!({
+            "type": "reasoning.summary", "summary": "it", "id": "rs_1", "format": "openai-responses-v1", "index": 0
+        })]),
+        openai_sse::reasoning_details_chunk(None, vec![serde_json::json!({
+            "type": "reasoning.encrypted", "data": "ENC", "id": "rs_1", "format": "openai-responses-v1", "index": 0
+        })]),
+        openai_sse::tool_call_start(0, "call_1", "read"),
+        openai_sse::tool_call_args(0, "{}"),
+        openai_sse::finish_with_usage("tool_calls", 50, 10),
+        openai_sse::done(),
+    ]);
+
+    let (message, events) = run_provider_sse(&OpenAiCompatProvider, openai_config(), &sse, 200)
+        .await
+        .unwrap();
+
+    let deltas = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deltas, vec!["plan ", "it"]);
+
+    let Message::Assistant { content, .. } = message else {
+        panic!("expected assistant");
+    };
+    let Some(Content::Thinking {
+        thinking,
+        metadata:
+            Some(ThinkingMetadata::OpenAiCompletions {
+                field: ReasoningField::ReasoningContent,
+                details: Some(details),
+            }),
+    }) = content.first()
+    else {
+        panic!("expected thinking block with details, got {content:?}");
+    };
+    assert_eq!(thinking, "plan it");
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0]["type"], "reasoning.summary");
+    assert_eq!(details[0]["summary"], "plan it");
+    assert_eq!(details[0]["id"], "rs_1");
+    assert_eq!(details[1]["type"], "reasoning.encrypted");
+    assert_eq!(details[1]["data"], "ENC");
+    assert!(matches!(&content[1], Content::ToolCall { name, .. } if name == "read"));
+}
+
+#[tokio::test]
+async fn openai_sse_encrypted_only_reasoning_keeps_empty_thinking_block() {
+    // Models that never stream reasoning text still need their encrypted
+    // state carried across tool calls.
+    let sse = openai_sse::body(vec![
+        openai_sse::reasoning_details_chunk(None, vec![serde_json::json!({
+            "type": "reasoning.encrypted", "data": "ENC", "id": "rs_1"
+        })]),
+        openai_sse::text_chunk("done", None),
+        openai_sse::finish_with_usage("stop", 50, 10),
+        openai_sse::done(),
+    ]);
+
+    let (message, events) = run_provider_sse(&OpenAiCompatProvider, openai_config(), &sse, 200)
+        .await
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::ThinkingDelta { .. })));
+
+    let Message::Assistant { content, .. } = message else {
+        panic!("expected assistant");
+    };
+    assert!(matches!(
+        content.as_slice(),
+        [
+            Content::Thinking {
+                thinking,
+                metadata: Some(ThinkingMetadata::OpenAiCompletions { details: Some(details), .. }),
+            },
+            Content::Text { text },
+        ] if thinking.is_empty() && details.len() == 1 && text == "done"
+    ));
+}
+
+#[tokio::test]
+async fn openai_sse_malformed_reasoning_details_are_ignored() {
+    let sse = openai_sse::body(vec![
+        openai_sse::reasoning_details_chunk(None, vec![
+            serde_json::json!({"type": "reasoning.encrypted"}),
+            serde_json::json!({"type": "something.else", "data": "x"}),
+            serde_json::json!("not an object"),
+        ]),
+        openai_sse::text_chunk("done", None),
+        openai_sse::finish_with_usage("stop", 50, 10),
+        openai_sse::done(),
+    ]);
+
+    let (message, _) = run_provider_sse(&OpenAiCompatProvider, openai_config(), &sse, 200)
+        .await
+        .unwrap();
+    let Message::Assistant { content, .. } = message else {
+        panic!("expected assistant");
+    };
+    assert!(matches!(content.as_slice(), [Content::Text { text }] if text == "done"));
+}
+
+#[tokio::test]
 async fn xai_sse_prefers_reasoning_alias_when_multiple_are_present() {
     let sse = openai_sse::body(vec![
         openai_sse::reasoning_chunk(Some("duplicate"), Some("xai"), None),
@@ -230,7 +368,7 @@ async fn xai_sse_prefers_reasoning_alias_when_multiple_are_present() {
     assert!(matches!(
         message,
         Message::Assistant { content, .. }
-            if matches!(&content[0], Content::Thinking { thinking, metadata: Some(ThinkingMetadata::OpenAiCompletions { field: ReasoningField::Reasoning }) }
+            if matches!(&content[0], Content::Thinking { thinking, metadata: Some(ThinkingMetadata::OpenAiCompletions { field: ReasoningField::Reasoning, .. }) }
                 if thinking == "xai")
     ));
 }
@@ -302,6 +440,53 @@ async fn openai_sse_tool_call() {
     assert!(events
         .iter()
         .any(|e| matches!(e, StreamEvent::ToolCallEnd { .. })));
+}
+
+/// Observed from a gateway: the same call_id is announced under one `index`
+/// and its arguments arrive under the next one. That is one call, not two
+/// blocks sharing an id (the UI showed every card twice, the first empty).
+#[tokio::test]
+async fn openai_sse_same_call_id_under_new_index_stays_one_tool_call() {
+    let sse = openai_sse::body(vec![
+        openai_sse::tool_call_chunk(0, Some("call-a"), Some("read"), None),
+        openai_sse::tool_call_chunk(1, Some("call-a"), Some("read"), Some(r#"{"path":"a.md"}"#)),
+        openai_sse::tool_call_chunk(2, Some("call-b"), Some("read"), None),
+        openai_sse::tool_call_chunk(3, Some("call-b"), Some("read"), Some(r#"{"path":"b.md"}"#)),
+        openai_sse::finish_with_usage("tool_calls", 40, 8),
+        openai_sse::done(),
+    ]);
+
+    let (msg, events) = run_provider_sse(&OpenAiCompatProvider, openai_config(), &sse, 200)
+        .await
+        .unwrap();
+
+    let content = match msg {
+        Message::Assistant { content, .. } => content,
+        _ => panic!("Expected Assistant message"),
+    };
+    assert_eq!(content.len(), 2, "one block per call id: {content:?}");
+    assert!(matches!(
+        &content[0],
+        Content::ToolCall { id, arguments, .. } if id == "call-a" && arguments["path"] == "a.md"
+    ));
+    assert!(matches!(
+        &content[1],
+        Content::ToolCall { id, arguments, .. } if id == "call-b" && arguments["path"] == "b.md"
+    ));
+
+    let ends: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ToolCallEnd {
+                content_index, id, ..
+            } => Some((*content_index, id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ends, vec![
+        (0, "call-a".to_string()),
+        (1, "call-b".to_string())
+    ]);
 }
 
 #[tokio::test]
@@ -628,6 +813,92 @@ async fn openai_json_fallback_cache_tokens_are_not_double_counted_as_input() {
     }
 }
 
+#[tokio::test]
+async fn openai_json_fallback_keeps_reasoning_details() {
+    let json = serde_json::json!({
+        "id": "chatcmpl-1",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "done",
+                "reasoning_content": "plan",
+                "reasoning_details": [
+                    {"type": "reasoning.summary", "summary": "plan", "id": "rs_1"},
+                    {"type": "reasoning.encrypted", "data": "ENC", "id": "rs_1"},
+                    {"type": "bogus"}
+                ]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+    });
+
+    let (msg, _) = run_provider_json(
+        &OpenAiCompatProvider,
+        openai_config(),
+        &json.to_string(),
+        200,
+    )
+    .await
+    .unwrap();
+
+    let Message::Assistant { content, .. } = msg else {
+        panic!("expected assistant");
+    };
+    assert!(matches!(
+        content.as_slice(),
+        [
+            Content::Thinking {
+                thinking,
+                metadata: Some(ThinkingMetadata::OpenAiCompletions { details: Some(details), .. }),
+            },
+            Content::Text { text },
+        ] if thinking == "plan" && details.len() == 2 && text == "done"
+    ));
+}
+
+#[tokio::test]
+async fn openai_json_fallback_encrypted_only_reasoning_keeps_block() {
+    let json = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "done",
+                "reasoning_details": [
+                    {"type": "reasoning.encrypted", "data": "ENC", "id": "rs_1"}
+                ]
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+    });
+
+    let (msg, events) = run_provider_json(
+        &OpenAiCompatProvider,
+        openai_config(),
+        &json.to_string(),
+        200,
+    )
+    .await
+    .unwrap();
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, StreamEvent::ThinkingDelta { .. })));
+
+    let Message::Assistant { content, .. } = msg else {
+        panic!("expected assistant");
+    };
+    assert!(matches!(
+        content.as_slice(),
+        [
+            Content::Thinking { thinking, metadata: Some(ThinkingMetadata::OpenAiCompletions { details: Some(details), .. }) },
+            Content::Text { text },
+        ] if thinking.is_empty() && details.len() == 1 && text == "done"
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // JSON fallback — error response
 // ---------------------------------------------------------------------------
@@ -676,4 +947,138 @@ async fn openai_sse_keeps_requested_model_when_upstream_reports_alias() {
         _ => panic!("Expected Assistant message"),
     }
     assert_eq!(outcome.served_model(), Some("grok-4.6-build"));
+}
+
+/// Verbatim chat-completions stream captured from the evot-pro gateway on
+/// 2026-09-20 (request f32ec958). Two parallel `read` calls arrive as
+/// separate `index` slots whose arguments each land in a single chunk.
+/// Regression: the decoder concatenated both argument objects into one
+/// buffer, producing `{..}{..}` for the first call.
+#[tokio::test]
+async fn openai_sse_parallel_calls_with_whole_argument_chunks_stay_separate() {
+    let sse = concat!(
+        r#"data: {"id": "resp_1", "object": "chat.completion.chunk", "created": 1789896386, "model": "gpt-5.6-sol", "choices": [{"index": 0, "delta": {"role": "assistant", "reasoning_content": "**Planning**"}, "finish_reason": null}]}"#,
+        "\n\n",
+        r#"data: {"id": "resp_1", "object": "chat.completion.chunk", "created": 1789896386, "model": "gpt-5.6-sol", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_A", "type": "function", "function": {"name": "read", "arguments": ""}}]}, "finish_reason": null}]}"#,
+        "\n\n",
+        r#"data: {"id": "resp_1", "object": "chat.completion.chunk", "created": 1789896386, "model": "gpt-5.6-sol", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "function": {"arguments": "{\"path\":\"/a/SKILL.md\"}"}}]}, "finish_reason": null}]}"#,
+        "\n\n",
+        r#"data: {"id": "resp_1", "object": "chat.completion.chunk", "created": 1789896386, "model": "gpt-5.6-sol", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 1, "id": "call_B", "type": "function", "function": {"name": "read", "arguments": ""}}]}, "finish_reason": null}]}"#,
+        "\n\n",
+        r#"data: {"id": "resp_1", "object": "chat.completion.chunk", "created": 1789896386, "model": "gpt-5.6-sol", "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 1, "function": {"arguments": "{\"path\":\"/b/list.md\"}"}}]}, "finish_reason": null}]}"#,
+        "\n\n",
+        r#"data: {"id": "resp_1", "object": "chat.completion.chunk", "created": 1789896386, "model": "gpt-5.6-sol", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 15209, "completion_tokens": 138, "total_tokens": 15347}}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let (msg, _events) = run_provider_sse(&OpenAiCompatProvider, openai_config(), sse, 200)
+        .await
+        .unwrap();
+
+    let calls: Vec<_> = match &msg {
+        Message::Assistant { content, .. } => content
+            .iter()
+            .filter_map(|c| match c {
+                Content::ToolCall { id, arguments, .. } => Some((id.clone(), arguments.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => panic!("Expected Assistant message"),
+    };
+    assert_eq!(calls.len(), 2, "got {calls:?}");
+    assert_eq!(calls[0].0, "call_A");
+    assert_eq!(calls[0].1["path"], "/a/SKILL.md");
+    assert_eq!(calls[1].0, "call_B");
+    assert_eq!(calls[1].1["path"], "/b/list.md");
+}
+
+// ---------------------------------------------------------------------------
+// Content filter — surfaced as a safety refusal so recovery can compact
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn openai_sse_content_filter_is_a_refusal_even_with_a_partial_tool_call(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sse = openai_sse::body(vec![
+        openai_sse::text_chunk("partial", None),
+        openai_sse::tool_call_chunk(0, Some("call_1"), Some("bash"), Some("{\"command\"")),
+        openai_sse::finish_with_usage("content_filter", 10, 2),
+        openai_sse::done(),
+    ]);
+
+    let (message, _) = run_provider_sse(&OpenAiCompatProvider, openai_config(), &sse, 200).await?;
+
+    let Message::Assistant {
+        stop_reason,
+        error_message,
+        ..
+    } = message
+    else {
+        return Err("expected assistant message".into());
+    };
+    assert_eq!(stop_reason, StopReason::Error);
+    assert!(error_message
+        .as_deref()
+        .is_some_and(evotengine::provider::error::is_refusal_message));
+    Ok(())
+}
+
+#[tokio::test]
+async fn openai_json_fallback_content_filter_is_a_refusal() -> Result<(), Box<dyn std::error::Error>>
+{
+    let json = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": ""},
+            "finish_reason": "content_filter"
+        }],
+        "usage": {"prompt_tokens": 30, "completion_tokens": 0, "total_tokens": 30}
+    });
+
+    let Err(error) = run_provider_json(
+        &OpenAiCompatProvider,
+        openai_config(),
+        &json.to_string(),
+        200,
+    )
+    .await
+    else {
+        return Err("expected a refusal error".into());
+    };
+    assert!(evotengine::provider::error::is_refusal_message(
+        &error.to_string()
+    ));
+    assert!(!evotengine::retry::should_retry(&error));
+    Ok(())
+}
+
+#[tokio::test]
+async fn azure_http_400_prompt_filter_is_a_refusal() -> Result<(), Box<dyn std::error::Error>> {
+    let body = serde_json::json!({
+        "error": {
+            "message": "The response was filtered due to the prompt triggering Azure OpenAI's content management policy.",
+            "type": null,
+            "param": "prompt",
+            "code": "content_filter",
+            "status": 400,
+            "innererror": {"code": "ResponsibleAIPolicyViolation"}
+        }
+    });
+
+    let Err(error) = run_provider_json(
+        &OpenAiCompatProvider,
+        openai_config(),
+        &body.to_string(),
+        400,
+    )
+    .await
+    else {
+        return Err("expected a refusal error".into());
+    };
+    let message = error.to_string();
+    assert!(evotengine::provider::error::is_refusal_message(&message));
+    assert!(message.contains("content management policy"));
+    assert!(!evotengine::retry::should_retry(&error));
+    Ok(())
 }

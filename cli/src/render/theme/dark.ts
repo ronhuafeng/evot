@@ -29,6 +29,12 @@ export function darkTheme(): Theme {
 
     // Desaturated periwinkle: reads as "same family as the frame" while staying
     // dark enough that brand-hued text on top keeps its contrast.
+    mutedHex: '#777777',
+    // Devin's `--border-default` (#444444) for a gauge's unfilled cells: dark
+    // enough to read as an empty slot, light enough to still show the ladder.
+    subtleHex: '#4a4a4a',
+    // Green → amber → coral → violet, as in Devin's pricing bar; avoids accentHex.
+    effortRampHex: ['#8ccf7e', '#c9d36a', '#e9c26e', '#f0a06a', '#e58a8a', '#c58ad7'],
     selectionBgHex: '#2c2f4a',
     selectionMutedHex: '#9aa0b4',
 
@@ -38,6 +44,9 @@ export function darkTheme(): Theme {
     // black text — bright enough to read, close to a real terminal caret.
     cursorHex: '#9ae65c',
     cursorFgHex: '#1a1d24',
+    // Devin's dark `--status-error`: warm and readable on the slate fills
+    // without the neon edge of most terminals' ANSI red.
+    errorHex: '#f44747',
 
     // The panel is a periwinkle-tinted slate: opencode keeps its panel one
     // step above the page, but evot cannot see the terminal's page colour, so
@@ -45,16 +54,25 @@ export function darkTheme(): Theme {
     // while staying under `selectionBgHex`. Diff rows tint a touch stronger so
     // +/- read through the panel.
     panelBg: '#2a2e44',
-    // pi's lifecycle tints, rebuilt from evot's palette rather than pi's
-    // hexes: pending is the panel cooled and darkened, success leans on the
-    // teal accent instead of a pure green, error is a muted rose. All three
-    // stay low-chroma so body text on them keeps its contrast. Diff rows tint
-    // a touch stronger so +/- read through the card fill.
-    toolPendingBg: '#262838',
-    toolSuccessBg: '#243230',
-    toolErrorBg: '#3a2a32',
+    panelFg: '#e5e7ef',
+    panelMutedFg: '#a6adbf',
+    // One neutral tool fill: a cooled, darkened step of the panel. Lifecycle
+    // state lives in the status glyph, not the slab, so a transcript full of
+    // cards reads as one calm surface. Diff rows tint a touch stronger so +/-
+    // read through the card fill.
+    toolCardBg: '#262838',
     diffAddedBg: '#213a2f',
     diffRemovedBg: '#43262e',
+    // Zed's second layer: changed tokens get their own, stronger fill instead
+    // of inverse video (SGR 7), which on most terminals flips to the terminal's
+    // own palette and tears a bright hole through the card. Contrast against
+    // both the row tint and this fill: add 7.83 / 4.03, del 7.83 / 5.45.
+    diffAddedFg: '#8fe0a8',
+    diffRemovedFg: '#f8b3bd',
+    diffAddedWordBg: '#2f6b49',
+    diffRemovedWordBg: '#7a2b3a',
+    diffGutterFg: '#6f7488',
+    diffContextFg: '#8b90a4',
 
     text: plain,
     // Hue, not just weight: terminals whose font lacks a bold face drop SGR 1,

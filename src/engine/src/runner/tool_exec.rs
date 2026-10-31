@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-
 use super::config::GetMessagesFn;
+use super::event_sink::EventSink;
 use crate::context;
 use crate::context::now_ms;
 use crate::provider::ToolDefinition;
@@ -34,7 +33,7 @@ pub(super) struct ToolExecutionResult {
 pub(super) async fn execute_tool_calls(
     tools: &[Box<dyn AgentTool>],
     tool_calls: &[(String, String, serde_json::Value)],
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
     get_steering: Option<&GetMessagesFn>,
     strategy: &ToolExecutionStrategy,
@@ -104,7 +103,7 @@ pub(super) async fn execute_tool_calls(
                         let executed = (batch_idx + 1) * *size;
                         if executed < tool_calls.len() {
                             for (skip_id, skip_name, _) in &tool_calls[executed..] {
-                                results.push(skip_tool_call(skip_id, skip_name, tx));
+                                results.push(skip_tool_call(skip_id, skip_name, tx).await);
                             }
                         }
                         break;
@@ -125,7 +124,7 @@ pub(super) async fn execute_tool_calls(
 async fn execute_sequential(
     tools: &[Box<dyn AgentTool>],
     tool_calls: &[(String, String, serde_json::Value)],
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
     get_steering: Option<&GetMessagesFn>,
     cwd: &std::path::Path,
@@ -160,7 +159,7 @@ async fn execute_sequential(
             if !steering.is_empty() {
                 steering_messages = Some(steering);
                 for (skip_id, skip_name, _) in &tool_calls[index + 1..] {
-                    results.push(skip_tool_call(skip_id, skip_name, tx));
+                    results.push(skip_tool_call(skip_id, skip_name, tx).await);
                 }
                 break;
             }
@@ -178,7 +177,7 @@ async fn execute_sequential(
 async fn execute_batch(
     tools: &[Box<dyn AgentTool>],
     tool_calls: &[(String, String, serde_json::Value)],
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
     get_steering: Option<&GetMessagesFn>,
     cwd: &std::path::Path,
@@ -237,7 +236,7 @@ async fn execute_single_tool(
     id: &str,
     name: &str,
     args: &serde_json::Value,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
     cwd: &std::path::Path,
     path_guard: &Arc<PathGuard>,
@@ -255,6 +254,7 @@ async fn execute_single_tool(
         args: args.clone(),
         preview_command,
     })
+    .await
     .ok();
 
     let tool_start = std::time::Instant::now();
@@ -266,12 +266,11 @@ async fn execute_single_tool(
         let id = id.to_string();
         let name = name.to_string();
         Some(Arc::new(move |partial: ToolResult| {
-            tx.send(AgentEvent::ToolExecutionUpdate {
+            tx.progress(AgentEvent::ToolExecutionUpdate {
                 tool_call_id: id.clone(),
                 tool_name: name.clone(),
                 partial_result: partial,
-            })
-            .ok();
+            });
         }))
     };
 
@@ -280,12 +279,11 @@ async fn execute_single_tool(
         let id = id.to_string();
         let name = name.to_string();
         Some(Arc::new(move |text: String| {
-            tx.send(AgentEvent::ProgressMessage {
+            tx.progress(AgentEvent::ProgressMessage {
                 tool_call_id: id.clone(),
                 tool_name: name.clone(),
                 text,
-            })
-            .ok();
+            });
         }))
     };
 
@@ -302,59 +300,7 @@ async fn execute_single_tool(
     };
 
     let (result, is_error) = match tool {
-        Some(tool) => {
-            // Step 1: Normalize parameter aliases (file_path → path, etc.)
-            let mut normalized = match tool.parameter_aliases() {
-                Some(aliases) => crate::tools::validation::normalize_aliases(args, aliases),
-                None => args.clone(),
-            };
-
-            // Step 2: Run the tool's compatibility shim before validation.
-            normalized = tool.prepare_arguments(&normalized);
-
-            // Step 3: Schema pre-validation + type coercion
-            let validated_args = crate::tools::validation::validate_and_coerce_with_received(
-                name,
-                &tool.parameters_schema(),
-                &normalized,
-                args,
-            );
-            match validated_args {
-                Err(validation_error) => (
-                    ToolResult {
-                        content: vec![Content::Text {
-                            text: crate::tools::validation::truncate_error(&validation_error),
-                        }],
-                        details: serde_json::Value::Null,
-                        retention: Retention::Normal,
-                    },
-                    true,
-                ),
-                Ok(coerced_args) => {
-                    // Exclude tool wall-time from the execution duration limit:
-                    // a legitimately long command (a build, a training run) or a
-                    // slow user response must not trip `max_duration`. The limit
-                    // bounds the agent's own work (LLM inference + loop
-                    // overhead), not how long a tool takes to run. The guard
-                    // records the elapsed span into the idle clock on drop, so
-                    // it counts on success, error, cancellation, and panic alike.
-                    let _idle = idle_clock.map(|c| c.pause());
-                    match tool.execute(coerced_args, ctx).await {
-                        Ok(r) => (r, false),
-                        Err(e) => (
-                            ToolResult {
-                                content: vec![Content::Text {
-                                    text: e.to_string(),
-                                }],
-                                details: serde_json::Value::Null,
-                                retention: Retention::Normal,
-                            },
-                            true,
-                        ),
-                    }
-                }
-            }
-        }
+        Some(tool) => run_tool_once(tool.as_ref(), name, args, ctx, idle_clock).await,
         None => (
             ToolResult {
                 content: vec![Content::Text {
@@ -377,6 +323,7 @@ async fn execute_single_tool(
             tool_name: name.to_string(),
             text: event.to_progress_text(),
         })
+        .await
         .ok();
     }
 
@@ -391,6 +338,7 @@ async fn execute_single_tool(
         result_tokens,
         duration_ms: tool_duration_ms,
     })
+    .await
     .ok();
 
     let tool_result_msg = Message::ToolResult {
@@ -405,23 +353,85 @@ async fn execute_single_tool(
     tx.send(AgentEvent::MessageStart {
         message: tool_result_msg.clone().into(),
     })
+    .await
     .ok();
     tx.send(AgentEvent::MessageEnd {
         message: tool_result_msg.clone().into(),
     })
+    .await
     .ok();
 
     (tool_result_msg, is_error)
 }
 
-pub(super) fn fail_truncated_tool_calls(
+/// Validate `args` against the tool schema and execute it once.
+async fn run_tool_once(
+    tool: &dyn AgentTool,
+    name: &str,
+    args: &serde_json::Value,
+    ctx: ToolContext,
+    idle_clock: Option<&crate::context::IdleClock>,
+) -> (ToolResult, bool) {
+    // Step 1: Normalize parameter aliases (file_path → path, etc.)
+    let mut normalized = match tool.parameter_aliases() {
+        Some(aliases) => crate::tools::validation::normalize_aliases(args, aliases),
+        None => args.clone(),
+    };
+
+    // Step 2: Run the tool's compatibility shim before validation.
+    normalized = tool.prepare_arguments(&normalized);
+
+    // Step 3: Schema pre-validation + type coercion
+    let validated_args = crate::tools::validation::validate_and_coerce_with_received(
+        name,
+        &tool.parameters_schema(),
+        &normalized,
+        args,
+    );
+    match validated_args {
+        Err(validation_error) => (
+            ToolResult {
+                content: vec![Content::Text {
+                    text: crate::tools::validation::truncate_error(&validation_error),
+                }],
+                details: serde_json::Value::Null,
+                retention: Retention::Normal,
+            },
+            true,
+        ),
+        Ok(coerced_args) => {
+            // Exclude tool wall-time from the execution duration limit:
+            // a legitimately long command (a build, a training run) or a
+            // slow user response must not trip `max_duration`. The limit
+            // bounds the agent's own work (LLM inference + loop
+            // overhead), not how long a tool takes to run. The guard
+            // records the elapsed span into the idle clock on drop, so
+            // it counts on success, error, cancellation, and panic alike.
+            let _idle = idle_clock.map(|c| c.pause());
+            match tool.execute(coerced_args, ctx).await {
+                Ok(r) => (r, false),
+                Err(e) => (
+                    ToolResult {
+                        content: vec![Content::Text {
+                            text: e.to_string(),
+                        }],
+                        details: serde_json::Value::Null,
+                        retention: Retention::Normal,
+                    },
+                    true,
+                ),
+            }
+        }
+    }
+}
+
+pub(super) async fn fail_truncated_tool_calls(
     tool_calls: &[(String, String, serde_json::Value)],
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
 ) -> Vec<Message> {
-    tool_calls
-        .iter()
-        .map(|(tool_call_id, tool_name, args)| {
-            let result = ToolResult {
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for (tool_call_id, tool_name, args) in tool_calls {
+        let result = ToolResult {
                 content: vec![Content::Text {
                     text: format!(
                         "Tool call \"{tool_name}\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments."
@@ -431,51 +441,51 @@ pub(super) fn fail_truncated_tool_calls(
                 retention: Retention::Normal,
             };
 
-            tx.send(AgentEvent::ToolExecutionStart {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                args: args.clone(),
-                preview_command: None,
-            })
-            .ok();
-
-            let result_tokens = context::content_tokens(&result.content);
-            tx.send(AgentEvent::ToolExecutionEnd {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                result: result.clone(),
-                is_error: true,
-                result_tokens,
-                duration_ms: 0,
-            })
-            .ok();
-
-            let message = Message::ToolResult {
-                tool_call_id: tool_call_id.clone(),
-                tool_name: tool_name.clone(),
-                content: result.content,
-                is_error: true,
-                timestamp: now_ms(),
-                retention: Retention::Normal,
-            };
-            tx.send(AgentEvent::MessageStart {
-                message: message.clone().into(),
-            })
-            .ok();
-            tx.send(AgentEvent::MessageEnd {
-                message: message.clone().into(),
-            })
-            .ok();
-            message
+        tx.send(AgentEvent::ToolExecutionStart {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            args: args.clone(),
+            preview_command: None,
         })
-        .collect()
+        .await
+        .ok();
+
+        let result_tokens = context::content_tokens(&result.content);
+        tx.send(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            result: result.clone(),
+            is_error: true,
+            result_tokens,
+            duration_ms: 0,
+        })
+        .await
+        .ok();
+
+        let message = Message::ToolResult {
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            content: result.content,
+            is_error: true,
+            timestamp: now_ms(),
+            retention: Retention::Normal,
+        };
+        tx.send(AgentEvent::MessageStart {
+            message: message.clone().into(),
+        })
+        .await
+        .ok();
+        tx.send(AgentEvent::MessageEnd {
+            message: message.clone().into(),
+        })
+        .await
+        .ok();
+        messages.push(message);
+    }
+    messages
 }
 
-pub(super) fn skip_tool_call(
-    tool_call_id: &str,
-    tool_name: &str,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
-) -> Message {
+pub(super) async fn skip_tool_call(tool_call_id: &str, tool_name: &str, tx: &EventSink) -> Message {
     let result = ToolResult {
         content: vec![Content::Text {
             text: "Skipped due to queued user message.".into(),
@@ -490,6 +500,7 @@ pub(super) fn skip_tool_call(
         args: serde_json::Value::Null,
         preview_command: None,
     })
+    .await
     .ok();
 
     let result_tokens = context::content_tokens(&result.content);
@@ -502,6 +513,7 @@ pub(super) fn skip_tool_call(
         result_tokens,
         duration_ms: 0,
     })
+    .await
     .ok();
 
     let msg = Message::ToolResult {
@@ -516,20 +528,22 @@ pub(super) fn skip_tool_call(
     tx.send(AgentEvent::MessageStart {
         message: msg.clone().into(),
     })
+    .await
     .ok();
     tx.send(AgentEvent::MessageEnd {
         message: msg.clone().into(),
     })
+    .await
     .ok();
 
     msg
 }
 
-pub(super) fn skip_tool_call_doom_loop(
+pub(super) async fn skip_tool_call_doom_loop(
     tool_call_id: &str,
     tool_name: &str,
     args: &serde_json::Value,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
 ) -> Message {
     let result = ToolResult {
         content: vec![Content::Text {
@@ -547,6 +561,7 @@ pub(super) fn skip_tool_call_doom_loop(
         args: args.clone(),
         preview_command: Some(preview),
     })
+    .await
     .ok();
 
     let result_tokens = context::content_tokens(&result.content);
@@ -559,6 +574,7 @@ pub(super) fn skip_tool_call_doom_loop(
         result_tokens,
         duration_ms: 0,
     })
+    .await
     .ok();
 
     let msg = Message::ToolResult {
@@ -573,10 +589,12 @@ pub(super) fn skip_tool_call_doom_loop(
     tx.send(AgentEvent::MessageStart {
         message: msg.clone().into(),
     })
+    .await
     .ok();
     tx.send(AgentEvent::MessageEnd {
         message: msg.clone().into(),
     })
+    .await
     .ok();
 
     msg

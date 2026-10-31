@@ -1,18 +1,43 @@
 //! Compaction controller — integrates trigger, planner, and executor into the agent loop.
 
+use std::sync::Arc;
+
 use tokio_util::sync::CancellationToken;
 
 use super::config::CompactionConfig;
 use super::executor;
 use super::executor::ExecutionResult;
 use super::plan;
+use super::prune::ApplyReport;
+use super::prune::ApplyTrigger;
+use super::prune::DecideReport;
+use super::prune::PruneLedger;
+use super::prune::PruneOptions;
 use super::summarizer::mode::SummarizerContext;
 use super::summary::LlmPolicy;
 use super::summary::SummaryContexts;
 use super::trigger::TriggerInput;
 use super::trigger::{self};
 use super::types::*;
+use crate::context::tokens::total_tokens;
 use crate::types::AgentMessage;
+
+/// Where in the run a compaction check happens. Run end may summarize earlier
+/// (`post_turn_trigger_threshold`) because nobody is waiting on the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpoint {
+    MidRun,
+    RunEnd,
+}
+
+impl Checkpoint {
+    fn summary_threshold(self, config: &CompactionConfig) -> usize {
+        match self {
+            Self::MidRun => config.trigger_threshold(),
+            Self::RunEnd => config.post_turn_trigger_threshold(),
+        }
+    }
+}
 
 /// Threshold-compaction suppression key (droid-style): once a threshold
 /// compaction failed to bring usage back under the limit, further threshold
@@ -34,6 +59,22 @@ pub struct CompactionController {
     /// compactions update the existing summary instead of restarting.
     state: CompactionState,
     observer: Option<CompactionObserver>,
+    /// Judge for the lossless prune branch; `None` keeps the summary-only
+    /// behaviour. With a judge, verdicts collect in the [`PruneLedger`] and
+    /// are applied at run end; every compaction prunes first and summarises
+    /// only what the prune could not bring under the threshold.
+    judge: Option<Arc<dyn crate::judge::Judge>>,
+    prune_options: PruneOptions,
+    /// Shared with the session so verdicts survive across runs; a run holds
+    /// it only while it prunes, and runs of one session never overlap.
+    ledger: Arc<tokio::sync::Mutex<PruneLedger>>,
+}
+
+/// What one run-end prune step did, for the event stream.
+#[derive(Debug, Clone, Default)]
+pub struct PruneOutcome {
+    pub decided: Option<DecideReport>,
+    pub applied: Option<ApplyReport>,
 }
 
 impl CompactionController {
@@ -45,7 +86,106 @@ impl CompactionController {
             threshold_suppression: None,
             state: CompactionState::default(),
             observer: None,
+            judge: None,
+            prune_options: PruneOptions::default(),
+            ledger: Arc::new(tokio::sync::Mutex::new(PruneLedger::default())),
         }
+    }
+
+    /// Share the prune ledger across runs of a session.
+    pub fn with_prune_ledger(mut self, ledger: Arc<tokio::sync::Mutex<PruneLedger>>) -> Self {
+        self.ledger = ledger;
+        self
+    }
+
+    /// Enable the prune branch: the judge decides continuously which tool
+    /// calls still matter and edits are applied in cache-friendly batches.
+    pub fn with_judge(mut self, judge: Arc<dyn crate::judge::Judge>) -> Self {
+        self.judge = Some(judge);
+        self
+    }
+
+    pub fn has_judge(&self) -> bool {
+        self.judge.is_some()
+    }
+
+    /// True when the judge has a say and has not been asked yet in this
+    /// process: the run start of a resumed session is then the same kind of
+    /// boundary as a run end.
+    pub async fn prune_pending_first_ask(&self) -> bool {
+        self.judge.is_some() && self.ledger.lock().await.is_fresh()
+    }
+
+    /// One prune step: ask the judge when the context grew enough since the
+    /// last round, then apply whatever is pending.
+    ///
+    /// Called at every run end (`RunEnd`) and, once the context is past
+    /// `prune_trigger_threshold`, after each response (`Threshold`). Asking
+    /// is a separate request to the judge and leaves the main model's cache
+    /// alone; applying edits history and costs one cache miss, accepted
+    /// because a trimmed context is what the run needs to keep going.
+    pub async fn prune_step(
+        &mut self,
+        messages: &mut Vec<AgentMessage>,
+        context_tokens: usize,
+        trigger: ApplyTrigger,
+        now_ms: u64,
+        cancel: CancellationToken,
+    ) -> PruneOutcome {
+        let Some(judge) = self.judge.clone() else {
+            return PruneOutcome::default();
+        };
+        let mut outcome = PruneOutcome::default();
+        let ledger = self.ledger.clone();
+        let mut ledger = ledger.lock().await;
+        if ledger.should_decide(messages, context_tokens, &self.prune_options) {
+            notify_compaction_phase(&self.observer, CompactionPhase::Pruning);
+            match ledger
+                .decide(messages, judge.as_ref(), &self.prune_options, cancel)
+                .await
+            {
+                Ok(report) => {
+                    tracing::info!(
+                        verdicts = report.verdicts.len(),
+                        pending_tokens = report.pending_tokens,
+                        requests = report.requests,
+                        elapsed_ms = report.elapsed_ms,
+                        "judge prune: decided"
+                    );
+                    outcome.decided = Some(report);
+                }
+                Err(error) => tracing::warn!(error = %error, "judge prune: decide failed"),
+            }
+        }
+        if ledger.has_pending() {
+            outcome.applied = Some(self.apply_with(&mut ledger, messages, trigger, now_ms));
+        }
+        outcome
+    }
+
+    fn apply_with(
+        &mut self,
+        ledger: &mut PruneLedger,
+        messages: &mut Vec<AgentMessage>,
+        trigger: ApplyTrigger,
+        now_ms: u64,
+    ) -> ApplyReport {
+        let (pruned, report) = ledger.apply(std::mem::take(messages), &self.prune_options, trigger);
+        *messages = pruned;
+        if report.removed + report.truncated > 0 {
+            self.last_compaction_ts = Some(now_ms);
+            tracing::info!(
+                removed = report.removed,
+                truncated = report.truncated,
+                skipped = report.skipped,
+                before_tokens = report.before_tokens,
+                after_tokens = report.after_tokens,
+                trigger = ?report.trigger,
+                "judge prune: applied"
+            );
+        }
+        notify_compaction_phase(&self.observer, CompactionPhase::Complete);
+        report
     }
 
     /// Seed cross-compaction state (e.g. restored from a persisted session).
@@ -99,6 +239,7 @@ impl CompactionController {
             usage,
             current_model,
             SummaryContexts::same(summarizer_ctx),
+            Checkpoint::MidRun,
             cancel,
         )
         .await
@@ -112,6 +253,7 @@ impl CompactionController {
         usage: &UsageSnapshot,
         current_model: &ModelId,
         contexts: SummaryContexts<'_>,
+        checkpoint: Checkpoint,
         cancel: CancellationToken,
     ) -> CompactionResponse {
         let trigger_input = TriggerInput {
@@ -123,7 +265,28 @@ impl CompactionController {
         self.clear_suppression_if_recovered(usage, current_model);
 
         match trigger::evaluate(&trigger_input, &self.config) {
-            TriggerDecision::Skip => CompactionResponse::skip(),
+            TriggerDecision::Skip => {
+                // Below the summary threshold. The prune branch has its own,
+                // lower line; usage from another model says nothing about
+                // this context and is not a size.
+                if usage.model == *current_model {
+                    let context_tokens = trigger::calculate_context_tokens(usage);
+                    if context_tokens >= checkpoint.summary_threshold(&self.config) {
+                        return self
+                            .threshold_compact(
+                                messages,
+                                context_tokens,
+                                current_model,
+                                contexts,
+                                checkpoint,
+                                cancel,
+                            )
+                            .await;
+                    }
+                    return self.prune_mid_run(messages, context_tokens, cancel).await;
+                }
+                CompactionResponse::skip()
+            }
 
             TriggerDecision::Overflow {
                 context_tokens,
@@ -138,18 +301,26 @@ impl CompactionController {
                     messages.pop();
                 }
 
-                // Match pi: overflow first uses the normal compaction pipeline.
-                // The provider request is retried only after compaction
-                // completed; cancellation or no plan leaves the turn terminal
-                // instead of resending the same oversized context.
+                // A provider overflow overrides the configured window and
+                // local estimate. Do not accept a prune-only pass merely
+                // because it falls below the ordinary summary threshold:
+                // that would spend the recovery allowance on a request the
+                // provider may still reject. Summarize before retrying.
+                // Cancellation or no plan leaves the turn terminal instead
+                // of resending the same oversized context.
                 let request_overhead_tokens = contexts.request_overhead_tokens();
+                let minimum_first_kept = if will_retry {
+                    self.overflow_minimum_first_kept(messages, request_overhead_tokens)
+                } else {
+                    0
+                };
                 let mut stats = self
-                    .run_compaction(
+                    .summarize_compaction(
                         messages,
                         contexts,
                         request_overhead_tokens,
                         LlmPolicy::Required,
-                        0,
+                        minimum_first_kept,
                         cancel.clone(),
                     )
                     .await;
@@ -160,12 +331,12 @@ impl CompactionController {
                     // same reason (e.g. a relay byte limit). First retry the
                     // same pi-style plan with a deterministic summary.
                     stats = self
-                        .run_compaction(
+                        .summarize_compaction(
                             messages,
                             SummaryContexts::default(),
                             request_overhead_tokens,
                             LlmPolicy::Skip,
-                            0,
+                            minimum_first_kept,
                             cancel.clone(),
                         )
                         .await;
@@ -185,7 +356,7 @@ impl CompactionController {
                     // summarize the complete tool turn rather than resending it.
                     let minimum_first_kept = messages.len();
                     stats = self
-                        .run_compaction(
+                        .summarize_compaction(
                             messages,
                             SummaryContexts::default(),
                             request_overhead_tokens,
@@ -213,6 +384,7 @@ impl CompactionController {
                     overflow_recovery_failed: will_retry
                         && !retry_after_compaction
                         && !cancel.is_cancelled(),
+                    pruned: None,
                 }
             }
 
@@ -227,12 +399,38 @@ impl CompactionController {
                     context_tokens: Some(context_tokens),
                     overflow_exhausted: true,
                     overflow_recovery_failed: false,
+                    pruned: None,
                 }
             }
 
-            TriggerDecision::Threshold { context_tokens } => {
-                self.threshold_compact(messages, context_tokens, current_model, contexts, cancel)
+            TriggerDecision::Refusal { context_tokens } => {
+                self.recover_from_refusal(messages, context_tokens, contexts, cancel)
                     .await
+            }
+
+            TriggerDecision::RefusalExhausted { context_tokens } => CompactionResponse {
+                action: AfterResponseAction::Continue,
+                stats: None,
+                reason: Some(CompactReason::Refusal),
+                context_tokens: Some(context_tokens),
+                overflow_exhausted: true,
+                overflow_recovery_failed: false,
+                pruned: None,
+            },
+
+            TriggerDecision::Threshold { context_tokens } => {
+                // With a judge, `run_compaction` prunes first and only
+                // summarises if the lossless cut is not enough: the prefix is
+                // rebuilt either way, so the prune costs nothing extra here.
+                self.threshold_compact(
+                    messages,
+                    context_tokens,
+                    current_model,
+                    contexts,
+                    checkpoint,
+                    cancel,
+                )
+                .await
             }
         }
     }
@@ -251,6 +449,7 @@ impl CompactionController {
             estimated_tokens,
             current_model,
             SummaryContexts::same(summarizer_ctx),
+            Checkpoint::MidRun,
             cancel,
         )
         .await
@@ -263,17 +462,87 @@ impl CompactionController {
         estimated_tokens: usize,
         current_model: &ModelId,
         contexts: SummaryContexts<'_>,
+        checkpoint: Checkpoint,
         cancel: CancellationToken,
     ) -> CompactionResponse {
         if self.config.context_window == 0 {
             return CompactionResponse::skip();
         }
-        if estimated_tokens < self.config.trigger_threshold() {
+        if estimated_tokens < checkpoint.summary_threshold(&self.config) {
             self.clear_suppression_for(current_model);
+            return self.prune_mid_run(messages, estimated_tokens, cancel).await;
+        }
+        self.threshold_compact(
+            messages,
+            estimated_tokens,
+            current_model,
+            contexts,
+            checkpoint,
+            cancel,
+        )
+        .await
+    }
+
+    /// The prune branch between responses: nothing below its threshold or
+    /// without a judge; otherwise one `prune_step`, reported on the response
+    /// so the runner can emit it.
+    async fn prune_mid_run(
+        &mut self,
+        messages: &mut Vec<AgentMessage>,
+        context_tokens: usize,
+        cancel: CancellationToken,
+    ) -> CompactionResponse {
+        if self.judge.is_none()
+            || self.config.context_window == 0
+            || context_tokens < self.config.prune_trigger_threshold()
+        {
             return CompactionResponse::skip();
         }
-        self.threshold_compact(messages, estimated_tokens, current_model, contexts, cancel)
-            .await
+        let outcome = self
+            .prune_step(
+                messages,
+                context_tokens,
+                ApplyTrigger::Threshold,
+                crate::context::now_ms(),
+                cancel,
+            )
+            .await;
+        let mut response = CompactionResponse::skip();
+        if outcome.decided.is_some() || outcome.applied.is_some() {
+            response.pruned = Some(outcome);
+        }
+        response
+    }
+
+    /// Where an overflow retry's plan must start keeping messages. The
+    /// ordinary plan keeps the final tool batch whole; when that batch by
+    /// itself still fills the window the provider would reject the retry
+    /// again, so the whole active turn is summarized instead (pi's ordinary
+    /// planner never cuts at a tool result). Unknown windows keep the
+    /// ordinary plan: there is no size to judge the retained tail against.
+    fn overflow_minimum_first_kept(
+        &self,
+        messages: &[AgentMessage],
+        request_overhead_tokens: usize,
+    ) -> usize {
+        if self.config.context_window == 0
+            || !matches!(
+                messages.last(),
+                Some(AgentMessage::Llm(crate::types::Message::ToolResult { .. }))
+            )
+        {
+            return 0;
+        }
+        let retained_tail = self.config.retained_tail_budget(request_overhead_tokens);
+        let Some(plan) = plan::plan_messages(messages, retained_tail) else {
+            return 0;
+        };
+        let kept = total_tokens(&messages[plan.first_kept..]);
+        if kept.saturating_add(request_overhead_tokens) >= self.config.trigger_threshold() {
+            messages.len()
+        } else {
+            0
+        }
     }
 
     /// Force a compaction (e.g., manual trigger from user command).
@@ -296,6 +565,82 @@ impl CompactionController {
         .await
     }
 
+    /// Safety-refusal recovery: compact so the retry no longer resends the
+    /// content the provider refused, then retry once.
+    ///
+    /// The judge prune is skipped: it keeps what is still relevant, and the
+    /// refused content is usually the most recent (relevant) tool output, so a
+    /// prune-only pass would resend it and be refused again. The summary uses
+    /// the manual `/compact` policy: LLM first, deterministic fallback when the
+    /// summarizer is refused for the same content.
+    async fn recover_from_refusal(
+        &mut self,
+        messages: &mut Vec<AgentMessage>,
+        context_tokens: usize,
+        contexts: SummaryContexts<'_>,
+        cancel: CancellationToken,
+    ) -> CompactionResponse {
+        // The refused response is not part of the conversation to retry.
+        if matches!(
+            messages.last(),
+            Some(AgentMessage::Llm(crate::types::Message::Assistant { .. }))
+        ) {
+            messages.pop();
+        }
+
+        let request_overhead_tokens = contexts.request_overhead_tokens();
+        let mut stats = self
+            .summarize_compaction(
+                messages,
+                contexts,
+                request_overhead_tokens,
+                LlmPolicy::PreferLlm,
+                0,
+                cancel.clone(),
+            )
+            .await;
+        if stats.is_none()
+            && !cancel.is_cancelled()
+            && matches!(
+                messages.last(),
+                Some(AgentMessage::Llm(crate::types::Message::ToolResult { .. }))
+            )
+        {
+            // The retained tail covers the whole context, typically one active
+            // tool turn whose output was refused. Summarize the complete turn
+            // deterministically so the refused output leaves the request.
+            let minimum_first_kept = messages.len();
+            stats = self
+                .summarize_compaction(
+                    messages,
+                    SummaryContexts::default(),
+                    request_overhead_tokens,
+                    LlmPolicy::Skip,
+                    minimum_first_kept,
+                    cancel.clone(),
+                )
+                .await;
+        }
+
+        let retry = stats.is_some();
+        if retry {
+            self.overflow_recovery_attempted = true;
+        }
+        CompactionResponse {
+            action: if retry {
+                AfterResponseAction::Retry
+            } else {
+                AfterResponseAction::Continue
+            },
+            stats,
+            reason: Some(CompactReason::Refusal),
+            context_tokens: Some(context_tokens),
+            overflow_exhausted: false,
+            overflow_recovery_failed: !retry && !cancel.is_cancelled(),
+            pruned: None,
+        }
+    }
+
     /// Shared threshold path: honor suppression, compact, then arm suppression
     /// so a compaction that could not lower usage does not repeat every turn.
     async fn threshold_compact(
@@ -304,11 +649,12 @@ impl CompactionController {
         context_tokens: usize,
         current_model: &ModelId,
         contexts: SummaryContexts<'_>,
+        checkpoint: Checkpoint,
         cancel: CancellationToken,
     ) -> CompactionResponse {
         let key = ThresholdKey {
             model: current_model.clone(),
-            threshold: self.config.trigger_threshold(),
+            threshold: checkpoint.summary_threshold(&self.config),
         };
         if self.threshold_suppression.as_ref() == Some(&key) {
             tracing::debug!(
@@ -340,12 +686,17 @@ impl CompactionController {
             context_tokens: Some(context_tokens),
             overflow_exhausted: false,
             overflow_recovery_failed: false,
+            pruned: None,
         }
     }
 
     /// Post-compaction usage back under the threshold re-arms threshold
     /// compaction. Stale usage (predating the last compaction) is ignored.
-    fn clear_suppression_if_recovered(&mut self, usage: &UsageSnapshot, current_model: &ModelId) {
+    pub fn clear_suppression_if_recovered(
+        &mut self,
+        usage: &UsageSnapshot,
+        current_model: &ModelId,
+    ) {
         if self.config.context_window == 0 || usage.model != *current_model {
             return;
         }
@@ -370,6 +721,33 @@ impl CompactionController {
     }
 
     async fn run_compaction(
+        &mut self,
+        messages: &mut Vec<AgentMessage>,
+        contexts: SummaryContexts<'_>,
+        request_overhead_tokens: usize,
+        llm_policy: LlmPolicy,
+        minimum_first_kept: usize,
+        cancel: CancellationToken,
+    ) -> Option<CompactionStats> {
+        if let Some(stats) = self
+            .prune_before_summary(messages, request_overhead_tokens, cancel.clone())
+            .await
+        {
+            return Some(stats);
+        }
+        self.summarize_compaction(
+            messages,
+            contexts,
+            request_overhead_tokens,
+            llm_policy,
+            minimum_first_kept,
+            cancel,
+        )
+        .await
+    }
+
+    /// Plan and summarize without the judge prune step.
+    async fn summarize_compaction(
         &mut self,
         messages: &mut Vec<AgentMessage>,
         contexts: SummaryContexts<'_>,
@@ -436,6 +814,61 @@ impl CompactionController {
     }
 }
 
+impl CompactionController {
+    /// The lossless step every compaction starts with when a judge is set.
+    /// The summary is about to rebuild the cache prefix anyway, so the prune
+    /// is free now: ask the judge about everything still undecided (a resumed
+    /// session has never been asked), apply, and if the cut alone brings the
+    /// context back under the threshold, report that and skip the summary.
+    async fn prune_before_summary(
+        &mut self,
+        messages: &mut Vec<AgentMessage>,
+        request_overhead_tokens: usize,
+        cancel: CancellationToken,
+    ) -> Option<CompactionStats> {
+        let judge = self.judge.clone()?;
+        let ledger = self.ledger.clone();
+        let mut ledger = ledger.lock().await;
+        notify_compaction_phase(&self.observer, CompactionPhase::Pruning);
+        let before_tokens = total_tokens(messages);
+        let before_messages = messages.len();
+        if let Err(error) = ledger
+            .decide(messages, judge.as_ref(), &self.prune_options, cancel)
+            .await
+        {
+            tracing::warn!(error = %error, "judge prune before compaction: decide failed");
+        }
+        if ledger.pending_count() == 0 {
+            return None;
+        }
+        let now = crate::context::now_ms();
+        let report = self.apply_with(&mut ledger, messages, ApplyTrigger::BeforeCompaction, now);
+        drop(ledger);
+        if report.removed + report.truncated == 0 {
+            return None;
+        }
+        let after_tokens = total_tokens(messages);
+        let fits =
+            after_tokens.saturating_add(request_overhead_tokens) <= self.config.trigger_threshold();
+        if !fits {
+            return None;
+        }
+        notify_compaction_phase(&self.observer, CompactionPhase::Complete);
+        Some(CompactionStats {
+            summary: None,
+            before_message_count: before_messages,
+            after_message_count: messages.len(),
+            before_tokens,
+            after_tokens,
+            messages_evicted: before_messages.saturating_sub(messages.len()),
+            current_run_reclaimed: 0,
+            method: Some(CompactionMethod::Prune),
+            fallback_reason: None,
+            remote_blob_bytes: None,
+        })
+    }
+}
+
 fn is_exact_user_text(message: &AgentMessage, expected: &str) -> bool {
     let AgentMessage::Llm(crate::types::Message::User { content, .. }) = message else {
         return false;
@@ -460,13 +893,16 @@ pub struct CompactionResponse {
     pub stats: Option<CompactionStats>,
     pub reason: Option<CompactReason>,
     pub context_tokens: Option<usize>,
-    /// Set when overflow recovery was already attempted this turn and the
-    /// context still overflows. The loop should surface this to the user.
+    /// Set when a compact-and-retry was already attempted this turn and the
+    /// same failure recurred (overflow, or refusal when `reason` is
+    /// `Refusal`). The loop should surface this to the user.
     pub overflow_exhausted: bool,
-    /// Set when an overflow demanded a compact-and-retry but compaction could
-    /// not run (nothing to evict). The loop should surface this to the user
-    /// instead of failing silently.
+    /// Set when an overflow or refusal demanded a compact-and-retry but
+    /// compaction could not run (nothing to evict). The loop should surface
+    /// this to the user instead of failing silently.
     pub overflow_recovery_failed: bool,
+    /// What the mid-run prune branch did on this response, if anything.
+    pub pruned: Option<PruneOutcome>,
 }
 
 impl CompactionResponse {
@@ -478,6 +914,7 @@ impl CompactionResponse {
             context_tokens: None,
             overflow_exhausted: false,
             overflow_recovery_failed: false,
+            pruned: None,
         }
     }
 }

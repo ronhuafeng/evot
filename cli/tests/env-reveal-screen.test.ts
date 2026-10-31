@@ -13,7 +13,8 @@
  * scrollback — erased on screen in principle, still there when you scroll up.
  */
 import { describe, expect, test } from 'bun:test'
-import { TermRenderer, CURSOR_MARKER } from '../src/term/renderer.js'
+import { TermRenderer } from '../src/term/renderer.js'
+import { CURSOR_MARKER } from '../src/term/render-frame.js'
 import { ScreenHarness } from './helpers/screen.js'
 
 const SECRET = 'K=supersecretvalue'
@@ -83,12 +84,15 @@ describe('a revealed secret leaves the screen', () => {
     await screen.settle()
     expect(screen.rowOf(SECRET)).toBe(-1)
 
+    // The committer flags the in-place edit; streaming changes above the
+    // viewport are otherwise left in scrollback untouched.
     revealLine = `  ${MASKED}`
+    renderer.invalidateScrollback()
     await renderFrame(renderer)
     await screen.settle()
 
-    // A change above the viewport forces a full redraw that also clears
-    // scrollback, so scrolling up cannot recover the value.
+    // The flagged change above the viewport forces a full redraw that also
+    // clears scrollback, so scrolling up cannot recover the value.
     const all = scrollback(screen)
     expect(all).not.toContain(SECRET)
     expect(all).toContain('su******ue')

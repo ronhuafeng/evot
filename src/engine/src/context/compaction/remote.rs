@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::summarizer::mode::SummarizerContext;
 use crate::context::sanitize::sanitize_tool_pairs;
-use crate::provider::stream_http;
+use crate::provider::stream::http;
 use crate::provider::StreamConfig;
 use crate::types::AgentMessage;
 use crate::types::Content;
@@ -39,7 +39,7 @@ pub fn with_previous_local_summary(
 ) -> Vec<AgentMessage> {
     let mut input = Vec::with_capacity(evicted.len().saturating_add(1));
     if let Some(summary) = previous_summary.filter(|summary| !summary.trim().is_empty()) {
-        input.push(AgentMessage::Llm(Message::User {
+        input.push(AgentMessage::Llm(Message::User { provenance: None,
             content: vec![Content::Text {
                 text: format!(
                     "The conversation history before this point was compacted into the following summary:\n\n{summary}"
@@ -209,6 +209,7 @@ pub async fn compact(
         model_config: ctx.model_config.clone(),
         cache_config: ctx.cache_config.clone(),
         prompt_cache_key: ctx.prompt_cache_key.clone(),
+        client: None,
     };
     let mut body = crate::provider::openai_responses::request::build_request_body(&config);
     if let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) {
@@ -255,10 +256,10 @@ pub async fn compact(
     }
 
     let send = async {
-        let response = stream_http::send_stream_request(builder.json(&body))
+        let response = http::send_stream_request(builder.json(&body))
             .await
             .map_err(|e| RemoteError::Failed(e.to_string()))?;
-        let response = stream_http::check_error_status(response)
+        let response = http::check_error_status(response)
             .await
             .map_err(|e| RemoteError::Failed(e.to_string()))?;
         response

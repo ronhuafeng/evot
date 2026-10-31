@@ -1,21 +1,25 @@
 import { join } from 'path'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
+import { mkdir, rename, writeFile } from 'fs/promises'
 
-import { discardCheckout, fetchRepo, type Checkout, type FetchFn, type ProgressFn } from './fetch.js'
+import { discardCheckout, fetchHeadCommit, fetchRepo, type Checkout, type FetchFn, type HeadFn, type ProgressFn } from './fetch.js'
 import { installUnit, readSourceRecord, removeDirs } from './install.js'
 import { skillsRoot } from './paths.js'
 import { missingRequirements } from './requires.js'
 import type { SkillOutcome, UnitNote, UnitResult } from './render.js'
 import { isValidSkillName, scanSkillDir, subdirs } from './scan.js'
-import { isOfficialRepo, resolveSource, type Source, type SourceRecord } from './source.js'
+import { isOfficialRepo, OFFICIAL_PREFIX, resolveSource, type Source, type SourceRecord } from './source.js'
 import { enumerateUnits, supersededDirs, type Unit } from './units.js'
 
 export interface ManageOptions {
   root?: string
   fetch?: FetchFn
+  /** Remote head lookup for the cheap "anything new?" check. */
+  head?: HeadFn
   progress?: ProgressFn
   env?: NodeJS.ProcessEnv
   variablesFile?: string
+  now?: () => number
 }
 
 export interface OfficialSyncResult {
@@ -23,24 +27,75 @@ export interface OfficialSyncResult {
   updated: string[]
   unchanged: string[]
   skipped: string[]
+  removed: string[]
+}
+
+/** What one periodic maintenance pass did. */
+export type OfficialMaintenance =
+  /** Checked within the interval; nothing was asked of the network. */
+  | { kind: 'fresh' }
+  /** The catalog head is what we already have; only the stamp was touched. */
+  | { kind: 'current'; commit: string }
+  /** The head moved (or nothing was ever installed): a full reconcile ran. */
+  | { kind: 'synced'; commit: string; result: OfficialSyncResult }
+
+/** How often a long-running REPL asks whether the official catalog moved.
+ *  Each ask is one small request; a download happens only when it did. */
+export const OFFICIAL_SYNC_INTERVAL_MS = 30 * 60 * 1000
+
+/** Persisted beside the managed skills: when the catalog was last checked and
+ *  which commit it was at. A missing or unreadable stamp means "never". */
+export const SYNC_STAMP_FILE = '.official-sync.json'
+
+export interface SyncStamp {
+  version: 1
+  checked_at: number
+  commit: string
+  /** Official units the catalog held at `commit`, so a cheap check can tell
+   *  a unit removed by hand from a catalog that has not moved. */
+  units: string[]
 }
 
 interface Context {
   root: string
   fetch: FetchFn
+  head: HeadFn
   progress?: ProgressFn
   env: NodeJS.ProcessEnv
   variablesFile?: string
+  now: () => number
 }
 
 function context(options: ManageOptions): Context {
   return {
     root: options.root ?? skillsRoot(),
     fetch: options.fetch ?? fetchRepo,
+    head: options.head ?? fetchHeadCommit,
     progress: options.progress,
     env: options.env ?? process.env,
     variablesFile: options.variablesFile,
+    now: options.now ?? Date.now,
   }
+}
+
+export function readSyncStamp(root: string): SyncStamp | null {
+  try {
+    const stamp = JSON.parse(readFileSync(join(root, SYNC_STAMP_FILE), 'utf8')) as Partial<SyncStamp>
+    if (stamp.version !== 1 || typeof stamp.checked_at !== 'number' || typeof stamp.commit !== 'string') return null
+    const units = Array.isArray(stamp.units) ? stamp.units.filter((name): name is string => typeof name === 'string') : []
+    return { version: 1, checked_at: stamp.checked_at, commit: stamp.commit, units }
+  } catch {
+    return null
+  }
+}
+
+/** Same-directory temp file and rename: a crash mid-write leaves the old stamp. */
+async function writeSyncStamp(root: string, stamp: SyncStamp): Promise<void> {
+  await mkdir(root, { recursive: true })
+  const target = join(root, SYNC_STAMP_FILE)
+  const temp = `${target}.${process.pid}.tmp`
+  await writeFile(temp, `${JSON.stringify(stamp, null, 2)}\n`, { flush: true })
+  await rename(temp, target)
 }
 
 function record(source: Source, unit: Unit, commit: string): SourceRecord {
@@ -120,7 +175,14 @@ export async function skillInstall(arg?: string, options: ManageOptions = {}): P
   }
 }
 
-let officialSyncInFlight: Promise<OfficialSyncResult> | null = null
+function withdrawnUnits(ctx: Context, present: Set<string>): Installed[] {
+  return installedUnits(ctx.root).filter((unit) => {
+    const tracked = unit.record
+    if (!tracked || !isOfficialRepo(tracked.repo, ctx.env)) return false
+    if (!tracked.path.startsWith(`${OFFICIAL_PREFIX}/`)) return false
+    return !present.has(unit.name)
+  })
+}
 
 /**
  * Reconcile the managed root with the complete official catalog.
@@ -135,7 +197,13 @@ export async function syncOfficialSkills(
   const ctx = context(options)
   const source = resolveSource(undefined, ctx.env)
   const checkout = await ctx.fetch(source, ctx.progress)
-  const result: OfficialSyncResult = { installed: [], updated: [], unchanged: [], skipped: [] }
+  const result: OfficialSyncResult = {
+    installed: [],
+    updated: [],
+    unchanged: [],
+    skipped: [],
+    removed: [],
+  }
 
   try {
     const units = enumerateUnits(checkout.dir, source)
@@ -157,20 +225,74 @@ export async function syncOfficialSkills(
       if (previous) result.updated.push(unit.name)
       else result.installed.push(unit.name)
     }
+
+    const withdrawn = withdrawnUnits(ctx, new Set(units.map((unit) => unit.name)))
+    if (withdrawn.length) {
+      removeDirs(withdrawn.map((unit) => unit.dir))
+      result.removed.push(...withdrawn.map((unit) => unit.name))
+    }
     return result
   } finally {
     await discardCheckout(checkout)
   }
 }
 
-/** Share one background reconciliation when startup paths overlap. */
-export function startOfficialSkillSync(options: ManageOptions = {}): Promise<OfficialSyncResult> {
-  if (!officialSyncInFlight) {
-    officialSyncInFlight = syncOfficialSkills(options).finally(() => {
-      officialSyncInFlight = null
+/** Current means: every unit the catalog held at `commit` is either installed
+ *  from that commit or is a user-owned directory the sync would skip anyway.
+ *  A unit deleted by hand, or a stamp from before units were recorded, needs
+ *  the full pass even when the remote head has not moved. */
+function officialUnitsAt(ctx: Context, stamp: SyncStamp): boolean {
+  if (stamp.units.length === 0) return false
+  return stamp.units.every(name => {
+    const record = existsSync(join(ctx.root, name)) ? readSourceRecord(join(ctx.root, name)) : null
+    if (record === null) return existsSync(join(ctx.root, name))
+    if (!isOfficialRepo(record.repo, ctx.env)) return true
+    return stamp.commit.startsWith(record.commit)
+  })
+}
+
+/**
+ * Keep the official catalog current without being asked.
+ *
+ * Within `intervalMs` of the last check nothing happens. Past it, one small
+ * request resolves the catalog head; if it is the commit already installed the
+ * stamp is refreshed and that is all. Only a moved head downloads the tarball
+ * and reconciles, so a REPL left open for a week costs a handful of requests.
+ */
+export async function maintainOfficialSkills(
+  options: ManageOptions = {},
+  intervalMs = OFFICIAL_SYNC_INTERVAL_MS,
+): Promise<OfficialMaintenance> {
+  const ctx = context(options)
+  const now = ctx.now()
+  const stamp = readSyncStamp(ctx.root)
+  if (stamp && now - stamp.checked_at < intervalMs && now >= stamp.checked_at) return { kind: 'fresh' }
+  const source = resolveSource(undefined, ctx.env)
+  const head = await ctx.head(source)
+  if (stamp && head === stamp.commit && officialUnitsAt(ctx, stamp)) {
+    await writeSyncStamp(ctx.root, { ...stamp, checked_at: now })
+    return { kind: 'current', commit: head }
+  }
+  const result = await syncOfficialSkills(options)
+  const units = [...result.installed, ...result.updated, ...result.unchanged, ...result.skipped].sort()
+  await writeSyncStamp(ctx.root, { version: 1, checked_at: ctx.now(), commit: head, units })
+  return { kind: 'synced', commit: head, result }
+}
+
+let maintenanceInFlight: Promise<OfficialMaintenance> | null = null
+
+/** Share one maintenance pass when callers overlap (startup and the REPL's
+ *  periodic job, or two REPL ticks around a slow network). */
+export function startOfficialSkillMaintenance(
+  options: ManageOptions = {},
+  intervalMs = OFFICIAL_SYNC_INTERVAL_MS,
+): Promise<OfficialMaintenance> {
+  if (!maintenanceInFlight) {
+    maintenanceInFlight = maintainOfficialSkills(options, intervalMs).finally(() => {
+      maintenanceInFlight = null
     })
   }
-  return officialSyncInFlight
+  return maintenanceInFlight
 }
 
 interface Installed {
@@ -209,6 +331,15 @@ function groupBySource(
   return [...groups.values()]
 }
 
+function catalogIsIntact(checkout: Checkout, source: Source): boolean {
+  if (!source.official) return false
+  try {
+    return enumerateUnits(checkout.dir, { ...source, path: undefined }).length > 0
+  } catch {
+    return false
+  }
+}
+
 async function updateOne(
   ctx: Context,
   source: Source,
@@ -221,6 +352,16 @@ async function updateOne(
   try {
     unit = enumerateUnits(checkout.dir, unitSource)[0]!
   } catch (error) {
+    if (catalogIsIntact(checkout, source)) {
+      removeDirs([installed.dir])
+      return {
+        name: installed.name,
+        skills: 1,
+        outcome: 'removed',
+        detail: 'withdrawn from catalog',
+        notes: [],
+      }
+    }
     return {
       name: installed.name,
       skills: 1,

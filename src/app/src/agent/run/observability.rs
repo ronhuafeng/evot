@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 
-use crate::types::CompactRecord;
-use crate::types::CompactionResult;
-use crate::types::LlmCallMetrics;
-use crate::types::RunSummaryData;
-use crate::types::ToolAggStats;
+use crate::observability::CompactRecord;
+use crate::observability::CompactionResult;
+use crate::observability::LlmCallMetrics;
+use crate::observability::RunSummaryData;
+use crate::observability::ToolAggStats;
+use crate::observability::TranscriptStats;
+use crate::observability::UsageSummary;
 use crate::types::TranscriptItem;
-use crate::types::TranscriptStats;
-use crate::types::UsageSummary;
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -106,6 +106,9 @@ impl StatsAggregator {
                     self.compact_history.push(record);
                 }
             }
+            // Applied prunes reach the compact history through their own
+            // CompactionCompleted record; the decide rounds are evaluation data.
+            TranscriptStats::ContextPruned(_) => {}
             TranscriptStats::RunFinished(s) => {
                 self.run_duration_ms = Some(s.duration_ms);
                 self.run_usage = Some(s.usage.clone());

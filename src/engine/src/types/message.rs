@@ -37,9 +37,21 @@ pub enum ImageSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThinkingMetadata {
-    Anthropic { signature: String },
-    OpenAiResponses { item: serde_json::Value },
-    OpenAiCompletions { field: ReasoningField },
+    Anthropic {
+        signature: String,
+    },
+    OpenAiResponses {
+        item: serde_json::Value,
+    },
+    OpenAiCompletions {
+        field: ReasoningField,
+        /// Opaque `reasoning_details` entries (OpenRouter wire shape) that the
+        /// endpoint needs replayed verbatim to continue its reasoning state,
+        /// e.g. `reasoning.encrypted` payloads. Absent for endpoints that only
+        /// stream reasoning text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Vec<serde_json::Value>>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,6 +69,27 @@ pub enum ReasoningField {
 }
 
 impl ThinkingMetadata {
+    /// Reasoning text that only came from a plain reasoning field, without
+    /// any opaque replay payload attached.
+    pub fn completions_text_only(field: ReasoningField) -> Self {
+        Self::OpenAiCompletions {
+            field,
+            details: None,
+        }
+    }
+
+    /// Whether this metadata carries opaque provider state that must be
+    /// replayed even when the visible thinking text is empty.
+    pub fn has_replay_payload(&self) -> bool {
+        match self {
+            Self::Anthropic { signature } => !signature.is_empty(),
+            Self::OpenAiResponses { .. } => true,
+            Self::OpenAiCompletions { details, .. } => {
+                details.as_ref().is_some_and(|items| !items.is_empty())
+            }
+        }
+    }
+
     pub fn supports_api(&self, api: crate::provider::ApiProtocol) -> bool {
         matches!(
             (self, api),
@@ -117,17 +150,27 @@ impl Content {
     /// Resolve image data: load from disk if path-based, then resize to fit
     /// within 2000×2000 and 5MB limits before sending to the provider.
     /// Returns `(base64_data, mime_type)` or `None` if resolution fails.
+    ///
+    /// The media type sent is what the bytes are, whatever the block
+    /// declared: images arrive from the read tool, chat channels and user
+    /// attachments, each naming a type from a file name or a sender's
+    /// header, and Anthropic rejects the whole request when that disagrees
+    /// with the data. This is the one place every image passes through on
+    /// its way to a provider, so it is where the declaration is settled.
     pub fn resolve_image_data(&self) -> Option<(String, String)> {
+        use base64::Engine;
         let raw = match self {
             Content::Image { mime_type, source } => match source {
                 ImageSource::Base64 { data } if !data.is_empty() => {
-                    Some((data.clone(), mime_type.clone()))
+                    let mime = sniffed_mime_type_from_base64(data).unwrap_or(mime_type.as_str());
+                    Some((data.clone(), mime.to_string()))
                 }
                 ImageSource::Path { path } => match std::fs::read(path) {
                     Ok(bytes) => {
-                        use base64::Engine;
+                        let mime = crate::context::detect_image_mime_type(&bytes)
+                            .unwrap_or(mime_type.as_str());
                         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        Some((b64, mime_type.clone()))
+                        Some((b64, mime.to_string()))
                     }
                     Err(_) => None,
                 },
@@ -144,6 +187,19 @@ impl Content {
     }
 }
 
+/// Media type of base64 image data, read from the decoded header only.
+fn sniffed_mime_type_from_base64(data: &str) -> Option<&'static str> {
+    use base64::Engine;
+    // 4 base64 chars per 3 bytes; take whole quads so the prefix decodes.
+    let prefix_len = (crate::context::IMAGE_SNIFF_BYTES / 3 + 1) * 4;
+    let prefix = &data[..data.len().min(prefix_len)];
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(prefix)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(prefix))
+        .ok()?;
+    crate::context::detect_image_mime_type(&decoded)
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -155,6 +211,8 @@ pub enum Message {
     User {
         content: Vec<Content>,
         timestamp: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<super::InputProvenance>,
     },
     #[serde(rename = "assistant")]
     Assistant {
@@ -191,6 +249,19 @@ impl Message {
         Self::User {
             content: vec![Content::Text { text: text.into() }],
             timestamp: now_ms(),
+            provenance: Some(super::InputProvenance::new(vec![super::InputSource::User])),
+        }
+    }
+
+    pub fn runtime_user(
+        text: impl Into<String>,
+        kind: impl Into<String>,
+        display: Option<String>,
+    ) -> Self {
+        Self::User {
+            content: vec![Content::Text { text: text.into() }],
+            timestamp: now_ms(),
+            provenance: Some(super::InputProvenance::runtime(1, kind, display)),
         }
     }
 

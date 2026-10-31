@@ -23,6 +23,10 @@ pub enum ProviderError {
     ProtocolIncomplete(String),
     #[error("Auth error: {0}")]
     Auth(String),
+    #[error("Model not found: {0}")]
+    ModelNotFound(String),
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
     #[error("{}", display_rate_limited(.message))]
     RateLimited { message: String },
     /// A provider quota window is exhausted. Unlike short-lived rate limiting,
@@ -51,17 +55,21 @@ impl ProviderError {
     /// Classify an HTTP error response into the appropriate variant.
     ///
     /// The status code is the primary signal: 5xx (and 408/425) are server-side
-    /// failures that are safe to retry regardless of body wording, while the
-    /// remaining 4xx are client errors that cannot succeed on retry. Message
-    /// text refines the decision only for stable semantics (context overflow,
-    /// quota exhaustion, overload).
+    /// failures that are safe to retry, while the remaining 4xx are client
+    /// errors that cannot succeed on retry. Message text refines the decision
+    /// only for stable semantics (context overflow, quota exhaustion,
+    /// overload, proxy configuration gaps).
     pub fn classify(status: u16, message: &str) -> Self {
         Self::classify_with_display(status, message, message)
     }
 
     fn classify_with_display(status: u16, evidence: &str, display: &str) -> Self {
         let display = display.to_string();
-        if is_context_overflow(status, evidence) {
+        if status == 401 || status == 403 {
+            Self::Auth(display)
+        } else if super::error_semantics::model_not_found(evidence, None) {
+            Self::ModelNotFound(display)
+        } else if is_context_overflow(status, evidence) {
             Self::ContextOverflow { message: display }
         } else if is_fatal_quota_exhaustion(evidence) {
             Self::Other(display)
@@ -71,8 +79,6 @@ impl ProviderError {
             Self::RateLimited { message: display }
         } else if status == 529 || is_overloaded_message(evidence) {
             Self::Overloaded(display)
-        } else if status == 401 || status == 403 {
-            Self::Auth(display)
         } else if status == 408 || status == 425 || (500..600).contains(&status) {
             Self::Transient { message: display }
         } else if (400..500).contains(&status) {
@@ -112,6 +118,35 @@ impl ProviderError {
         classified
     }
 
+    /// Classify native JSON error fields without relying on gateway wording.
+    pub(crate) fn from_http_payload(
+        status: u16,
+        value: Option<&serde_json::Value>,
+        evidence: &str,
+        display: &str,
+        should_retry: Option<bool>,
+    ) -> Self {
+        // Checked before the permanent types: Azure reports prompt filtering
+        // as `invalid_request_error` with code `content_filter`, and it must
+        // reach refusal recovery rather than fail as an invalid request.
+        if !matches!(status, 401 | 403 | 429)
+            && value.is_some_and(super::error_semantics::content_filter)
+        {
+            return Self::Other(content_filter_message(display));
+        }
+        if !matches!(status, 401 | 403 | 429)
+            && value.is_some_and(super::error_semantics::permanent_type)
+            && !is_context_overflow_message(evidence)
+        {
+            return if super::error_semantics::model_not_found(evidence, value) {
+                Self::ModelNotFound(display.to_string())
+            } else {
+                Self::InvalidRequest(display.to_string())
+            };
+        }
+        Self::classify_with_hints_and_display(status, evidence, display, should_retry)
+    }
+
     pub fn is_context_overflow(&self) -> bool {
         matches!(self, Self::ContextOverflow { .. })
     }
@@ -145,28 +180,50 @@ pub(crate) fn classify_stream_error(
     message: &str,
     value: Option<&serde_json::Value>,
 ) -> ProviderError {
-    if is_context_overflow_message(message) {
+    if value
+        .and_then(provider_error_type)
+        .is_some_and(is_auth_error_type)
+    {
+        return ProviderError::Auth(message.to_string());
+    }
+    if value.is_some_and(super::error_semantics::content_filter) {
+        return ProviderError::Other(content_filter_message(message));
+    }
+    let evidence = value.map(serde_json::Value::to_string);
+    let evidence = evidence.as_deref().unwrap_or(message);
+    if super::error_semantics::model_not_found(evidence, value) {
+        return ProviderError::ModelNotFound(message.to_string());
+    }
+    if is_context_overflow_message(evidence) {
         return ProviderError::ContextOverflow {
             message: message.to_string(),
         };
     }
-    if is_overloaded_message(message) {
-        return ProviderError::Overloaded(message.to_string());
+    if value.is_some_and(super::error_semantics::permanent_type) {
+        return ProviderError::InvalidRequest(message.to_string());
     }
-    if is_fatal_quota_exhaustion(message) {
+    if is_fatal_quota_exhaustion(evidence) {
         return ProviderError::Other(message.to_string());
     }
-    if is_waitable_quota_limit(message) {
+    if is_waitable_quota_limit(evidence) {
         return ProviderError::QuotaLimited {
             message: message.to_string(),
         };
+    }
+    if value.and_then(provider_error_type) == Some("rate_limit_error") {
+        return ProviderError::RateLimited {
+            message: message.to_string(),
+        };
+    }
+    if is_overloaded_message(evidence) {
+        return ProviderError::Overloaded(message.to_string());
     }
     match value.and_then(provider_error_type) {
         Some(error_type) if is_auth_error_type(error_type) => {
             ProviderError::Auth(message.to_string())
         }
         Some(error_type) if is_fatal_error_type(error_type) => {
-            ProviderError::Api(message.to_string())
+            ProviderError::InvalidRequest(message.to_string())
         }
         Some("rate_limit_error") => ProviderError::RateLimited {
             message: message.to_string(),
@@ -180,14 +237,11 @@ pub(crate) fn classify_stream_error(
 /// Extract the provider's semantic error type from common JSON envelopes.
 /// Nested `error.type` takes precedence over the outer event type (`"error"`).
 pub(crate) fn provider_error_type(value: &serde_json::Value) -> Option<&str> {
-    value
-        .pointer("/error/type")
+    let error = super::error_semantics::error_node(value);
+    error
+        .get("type")
         .and_then(serde_json::Value::as_str)
-        .or_else(|| {
-            value
-                .pointer("/error/code")
-                .and_then(serde_json::Value::as_str)
-        })
+        .or_else(|| error.get("code").and_then(serde_json::Value::as_str))
         .or_else(|| value.get("code").and_then(serde_json::Value::as_str))
         .or_else(|| value.get("type").and_then(serde_json::Value::as_str))
         .filter(|kind| *kind != "error")
@@ -291,6 +345,48 @@ fn is_context_overflow(status: u16, message: &str) -> bool {
     is_context_overflow_message(message)
 }
 
+// ---------------------------------------------------------------------------
+// Safety refusal detection
+// ---------------------------------------------------------------------------
+
+/// Stable marker carried by every provider-terminal safety refusal. The SSE and
+/// JSON decode paths build their message through [`refusal_message`], and the
+/// compaction trigger recognizes it through [`is_refusal_message`], so the two
+/// sides cannot drift apart.
+const REFUSAL_MARKER: &str = "(safety filter / refusal)";
+
+/// User-visible error text for a provider stop reason that is a safety refusal.
+pub fn refusal_message(stop_reason: &str) -> String {
+    format!("Provider ended the response with stop reason '{stop_reason}' {REFUSAL_MARKER}")
+}
+
+/// Whether an error message is a provider safety refusal.
+pub fn is_refusal_message(message: &str) -> bool {
+    message.contains(REFUSAL_MARKER)
+}
+
+/// Error text for a request rejected by the provider's content filter (for
+/// example an Azure OpenAI prompt filter), before or while generating.
+pub fn content_filter_message(detail: &str) -> String {
+    format!("Provider content filter rejected the request {REFUSAL_MARKER}: {detail}")
+}
+
+/// Error text for a response that ended incomplete. A `content_filter` reason
+/// is a safety refusal; every other reason keeps the plain incomplete wording.
+pub(crate) fn incomplete_message(reason: &str) -> String {
+    if is_content_filter_reason(reason) {
+        refusal_message(reason)
+    } else {
+        format!("response incomplete: {reason}")
+    }
+}
+
+/// Whether an OpenAI `finish_reason` / `incomplete_details.reason` means the
+/// output was stopped by the content filter.
+pub(crate) fn is_content_filter_reason(reason: &str) -> bool {
+    reason == "content_filter"
+}
+
 pub(crate) fn is_overloaded_message(message: &str) -> bool {
     message.to_lowercase().contains("overloaded")
 }
@@ -374,13 +470,34 @@ static SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock
 /// machine sleeps or loses network: the stalled read fails with a timeout,
 /// which `stream_http` maps to [`ProviderError::Network`] and the retry policy
 /// then reconnects. Without it a half-open socket can hang for the OS TCP
-/// timeout (~2 h on macOS), leaving the UI stuck on "thinking".
-const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(300);
+/// timeout (~2 h on macOS), leaving the UI stuck on "thinking". Keep this
+/// bounded to one minute so a dead in-flight request cannot delay recovery by
+/// another five minutes after connectivity returns. The SSE reader also guards
+/// its reads explicitly, including transports not created by this client.
+pub(crate) const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Deadline for the whole send phase: connect, upload the request body, and
+/// receive response headers.
+///
+/// `read_timeout` above only arms while the client is *reading*, so it cannot
+/// see a request that stalls while writing its body. A large context (hundreds
+/// of thousands of tokens) is a multi-megabyte upload; if the network drops
+/// mid-upload the socket retransmits for the OS TCP budget (many minutes on
+/// macOS) with no timeout pending, and the only thing the user sees is a
+/// spinner. Bounding the send phase turns that into a retryable
+/// [`crate::provider::ProviderError::Network`] so the loop reconnects on its
+/// short network cadence. The response body is deliberately excluded: SSE
+/// streams are legitimately long and are guarded per-read instead.
+pub const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Timeout for the connect phase only (TCP + TLS handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn build_client() -> Result<reqwest::Client, ProviderError> {
+/// The shared transport policy, before creating a connection pool.
+///
+/// Callers that must reject redirects can specialize this builder without
+/// duplicating the versioned User-Agent, timeouts, pool limits or TCP keepalive.
+pub fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -393,13 +510,24 @@ fn build_client() -> Result<reqwest::Client, ProviderError> {
         .tcp_keepalive(Duration::from_secs(60))
         .tcp_keepalive_interval(Duration::from_secs(15))
         .tcp_keepalive_retries(3)
-        .build()
-        .map_err(|e| {
-            ProviderError::Other(format!(
-                "Failed to build HTTP client: {}",
-                format_transport_detail(&e, None)
-            ))
-        })
+}
+
+fn build_client() -> Result<reqwest::Client, ProviderError> {
+    client_builder().build().map_err(|e| {
+        ProviderError::Other(format!(
+            "Failed to build HTTP client: {}",
+            format_transport_detail(&e, None)
+        ))
+    })
+}
+
+/// A client with the shared transport policy but its own connection pool.
+///
+/// Tests that talk to many short-lived origins need this: the shared pool keys
+/// connections by origin, and an origin that has been recycled onto the same
+/// port can hand a stale keep-alive connection to a different server.
+pub fn dedicated_client() -> Result<reqwest::Client, ProviderError> {
+    build_client()
 }
 
 pub fn new_client() -> Result<reqwest::Client, ProviderError> {

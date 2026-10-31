@@ -4,11 +4,12 @@ import stringWidth from 'string-width'
 import stripAnsi from 'strip-ansi'
 import { getTheme, resetThemeCache } from '../src/render/theme/index.js'
 import { visibleWidth } from '../src/render/wrap.js'
-import { CURSOR_MARKER } from '../src/term/renderer.js'
+import { CURSOR_MARKER } from '../src/term/render-frame.js'
 import { blocksToLines } from '../src/term/viewmodel/types.js'
 import { joinLeftRight, spansWidth } from '../src/term/viewmodel/width.js'
 import { buildPromptBlocks, type PromptVMInput } from '../src/term/viewmodel/prompt.js'
 import { buildPromptFooterBlocks } from '../src/term/viewmodel/prompt-footer.js'
+import { getTheme } from '../src/render/theme/index.js'
 
 beforeAll(() => { chalk.level = 3 })
 
@@ -18,7 +19,6 @@ function defaultInput(overrides: Partial<PromptVMInput> = {}): PromptVMInput {
     cursorLine: 0,
     cursorCol: 0,
     active: true,
-    caretVisible: true,
     completion: null,
     ghostHint: '',
     columns: 80,
@@ -27,7 +27,6 @@ function defaultInput(overrides: Partial<PromptVMInput> = {}): PromptVMInput {
     model: 'claude-sonnet',
     provider: '',
     thinkingLevel: '',
-    planning: false,
     logMode: false,
     dashboardUrl: null,
     exitHint: false,
@@ -53,10 +52,22 @@ function renderLines(input: PromptVMInput): string[] {
   return blocksToLines(buildPromptBlocks(input))
 }
 
-/** Rows that belong to the input frame (borders and railed content). */
+const isRule = (row: string) => /^─/.test(stripAnsi(row))
+
+/** Rows that belong to the input frame: both rules and everything between. */
 function frameLines(input: PromptVMInput): string[] {
-  return renderLines(input).filter(row => /^[│╭╰─]/.test(stripAnsi(row)))
+  const rows = renderLines(input)
+  const first = rows.findIndex(isRule)
+  const last = rows.findLastIndex(isRule)
+  return first < 0 ? [] : rows.slice(first, last + 1)
 }
+
+/** Content rows between the rules, rules excluded. */
+function interiorRows(input: PromptVMInput): string[] {
+  return frameLines(input).filter(row => !isRule(row))
+}
+
+const isBlankRow = (row: string) => stripAnsi(row).trim() === ''
 
 function menuOf(count: number, selectedIndex: number) {
   return {
@@ -89,29 +100,27 @@ function completion(labels: string[], selectedIndex = 0) {
 }
 
 describe('prompt editor', () => {
-  test('renders border, caret and placeholder', () => {
+  test('renders rules, caret and placeholder', () => {
     const ansi = render(defaultInput())
     const plain = stripAnsi(ansi).replaceAll(CURSOR_MARKER, '')
-    expect(plain).toContain(`╭${'─'.repeat(78)}╮`)
-    expect(plain).toContain(`╰${'─'.repeat(78)}╯`)
-    expect(plain).toContain('▍')
-    expect(plain).toContain('Enter a coding task or / for commands')
-    // The end-of-line caret carries the cursor hue, not inverse video.
-    expect(ansi).toContain(chalk.bold(chalk.hex('#9ae65c')('▍')))
+    expect(plain.split('\n').filter(row => row === '─'.repeat(80))).toHaveLength(2)
+    expect(plain).not.toContain('▍')
+    expect(plain).toContain('❭ Enter a coding task or / for commands')
+    expect(ansi).toContain(CURSOR_MARKER)
   })
 
-  test('uses the theme-aware EVOT brand color for both input borders', () => {
+  test('rules take the subtle structural tone; only the caret carries the brand colour', () => {
     const previousTheme = process.env.EVOT_THEME
     try {
-      for (const [scheme, hex] of [['dark', '#b5bcf9'], ['light', '#5769f7']] as const) {
+      for (const [scheme, brand, subtle] of [['dark', '#b5bcf9', '#4a4a4a'], ['light', '#5769f7', '#b8b8b8']] as const) {
         process.env.EVOT_THEME = scheme
         resetThemeCache()
         const lines = render(defaultInput()).split('\n')
-        for (const border of [`╭${'─'.repeat(78)}╮`, `╰${'─'.repeat(78)}╯`]) {
-          expect(lines.filter(line => line === chalk.hex(hex)(border))).toHaveLength(1)
-        }
-        // The side rails carry the same brand hue as the corners.
-        expect(lines.some(line => line.startsWith(chalk.hex(hex)('│')))).toBe(true)
+        // Rules are separators: they recede so the transcript and the draft lead.
+        expect(lines.filter(line => line === chalk.hex(subtle)('─'.repeat(80)))).toHaveLength(2)
+        // The caret is where you type, so it is the one brand-coloured mark.
+        expect(lines.some(line => line.startsWith(chalk.hex(brand)('❭ ')))).toBe(true)
+        expect(lines.some(line => line.includes(chalk.hex(brand)('─'.repeat(80))))).toBe(false)
       }
     } finally {
       if (previousTheme === undefined) delete process.env.EVOT_THEME
@@ -121,12 +130,12 @@ describe('prompt editor', () => {
   })
 
   test('renders input and known command styling', () => {
-    const input = defaultInput({ lines: ['/plan remove unwraps'], cursorCol: 5, placeholder: false })
+    const input = defaultInput({ lines: ['/model sonnet'], cursorCol: 6, placeholder: false })
     // The cursor is mid-line, so the character it sits on becomes a block; the
     // rest of the text is contiguous.
-    expect(renderPlain(input)).toContain('/plan remove unwraps')
+    expect(renderPlain(input)).toContain('/model sonnet')
     // Known commands share the frame's brand hue rather than a fixed ANSI cyan.
-    expect(render(input)).toContain(chalk.bold(chalk.hex('#b5bcf9')('/plan')))
+    expect(render(input)).toContain(chalk.bold(chalk.hex('#b5bcf9')('/model')))
   })
 
   test('does not style unknown slash text as a command', () => {
@@ -145,9 +154,16 @@ describe('prompt editor', () => {
     // At 20 columns the frame degrades, so text gets all 20: a 20-character
     // draft fills the row exactly and the caret has to wrap.
     const ansi = render(defaultInput({ columns: 20, lines: ['a'.repeat(20)], cursorCol: 20, placeholder: false }))
-    const rows = stripAnsi(ansi).replaceAll(CURSOR_MARKER, '').split('\n')
-      .filter(row => /^a+$/.test(row) || row === '▍')
-    expect(rows).toEqual(['a'.repeat(20), '▍'])
+    const rows = stripAnsi(ansi).split('\n')
+    expect(rows).toContain('a'.repeat(20))
+    expect(rows[rows.indexOf('a'.repeat(20)) + 1]).toBe(CURSOR_MARKER)
+  })
+
+  test('keeps the cursor on an empty line after a newline', () => {
+    const rows = interiorRows(defaultInput({ columns: 60, lines: ['first line:', ''], cursorLine: 1, cursorCol: 0, placeholder: false }))
+    const caretRow = rows.findIndex(row => row.includes(CURSOR_MARKER))
+    expect(caretRow).toBeGreaterThan(rows.findIndex(row => stripAnsi(row).includes('first line:')))
+    expect(stripAnsi(rows[caretRow]!)).toBe(`  ${CURSOR_MARKER}`)
   })
 
   test('limits long input to 30 percent of terminal rows and follows the cursor', () => {
@@ -172,60 +188,35 @@ describe('prompt editor', () => {
     expect(plain).not.toContain('row 10')
   })
 
-  test('places the caret before the ghost hint without inserting a blank cell', () => {
-    const input = defaultInput({ lines: ['/mo'], cursorCol: 3, placeholder: false, ghostHint: 'del  [<name>]' })
-    const ansi = render(input)
-    // Cursor is at end of line, so the thin bar precedes the ghost suffix with
-    // no blank cell between them: `/mo▍del  [<name>]`.
-    expect(stripAnsi(ansi).replaceAll(CURSOR_MARKER, '')).toContain('/mo▍del  [<name>]')
-    expect(ansi).toContain(chalk.bold(chalk.hex('#9ae65c')('▍')))
+  test('places the cursor before the ghost without adding a display cell', () => {
+    const ansi = render(defaultInput({ lines: ['/ha'], cursorCol: 3, placeholder: false, ghostHint: 'rden  [plan changes arch <subject>]' }))
+    expect(stripAnsi(ansi)).toContain(`/ha${CURSOR_MARKER}rden`)
+    expect(stripAnsi(ansi).replaceAll(CURSOR_MARKER, '')).toContain('/harden')
+    expect(ansi).not.toContain('▍')
+    expect(ansi).not.toContain('\x1b[48;2;154;230;92m')
   })
 
-  test('renders a caret at end of line without a ghost hint', () => {
-    const ansi = render(defaultInput({ lines: ['/mo'], cursorCol: 3, placeholder: false }))
-    expect(stripAnsi(ansi).replaceAll(CURSOR_MARKER, '')).toContain('/mo▍')
+  test('marks start, middle and end of Unicode input without changing glyph styles', () => {
+    for (const text of ['输入框', 'abc', 'a👩‍💻e\u0301中']) {
+      const boundaries = [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)]
+        .map(segment => segment.index).concat(text.length)
+      for (const cursorCol of boundaries) {
+        const ansi = render(defaultInput({ lines: [text], cursorCol, placeholder: false }))
+        expect(stripAnsi(ansi)).toContain(text.slice(0, cursorCol) + CURSOR_MARKER + text.slice(cursorCol))
+        expect(ansi).not.toContain('\x1b[48;2;154;230;92m')
+        expect(ansi).not.toContain('▍')
+      }
+    }
   })
 
-  test('blanks the end-of-line caret on the dark half of the blink cycle', () => {
-    const input = { lines: ['/mo'], cursorCol: 3, placeholder: false }
-    const off = render(defaultInput({ ...input, caretVisible: false }))
-    const plain = stripAnsi(off).replaceAll(CURSOR_MARKER, '')
-    expect(plain).not.toContain('▍')
-    expect(off).not.toContain(chalk.bold(chalk.hex('#9ae65c')('▍')))
-    // A space still claims the caret column, so the row keeps its width.
-    const onRow = renderPlain(defaultInput({ ...input, caretVisible: true }))
-      .split('\n').find(row => row.includes('▍'))
-    const offRow = plain.split('\n').find(row => row.includes('/mo'))
-    expect(offRow).toBeDefined()
-    expect(offRow?.length).toBe(onRow?.length)
-  })
-
-  test('blanks the placeholder caret while the hint stays put', () => {
-    const hint = 'Enter a coding task or / for commands'
-    const off = renderPlain(defaultInput({ caretVisible: false }))
-    expect(off).not.toContain('▍')
-    const offRow = off.split('\n').find(row => row.includes(hint))
-    const onRow = renderPlain(defaultInput()).split('\n').find(row => row.includes(hint))
-    expect(offRow).toBeDefined()
-    expect(offRow?.indexOf(hint)).toBe(onRow?.indexOf(hint) ?? -1)
-    expect(offRow?.length).toBe(onRow?.length)
-  })
-
-  test('keeps the on-character cursor block solid across the blink cycle', () => {
-    const input = { lines: ['/model '], cursorCol: 6, placeholder: false }
-    const on = render(defaultInput({ ...input, caretVisible: true }))
-    const off = render(defaultInput({ ...input, caretVisible: false }))
-    expect(off).toContain('\x1b[48;2;154;230;92m')
-    expect(off).toBe(on)
-  })
-
-  test('highlights the character under the cursor when it is not at end of line', () => {
+  test('marks the character boundary without highlighting it', () => {
     const input = defaultInput({ lines: ['/model '], cursorCol: 6, placeholder: false, ghostHint: '[<name>]' })
     const ansi = render(input)
     // The cursor sits on the trailing space, which becomes a block; the text
     // stays contiguous rather than being split by an inserted bar.
     expect(stripAnsi(ansi).replaceAll(CURSOR_MARKER, '')).toContain('/model [<name>]')
-    expect(ansi).toContain('\x1b[48;2;154;230;92m')
+    expect(ansi).not.toContain('\x1b[48;2;154;230;92m')
+    expect(stripAnsi(ansi)).toContain(`/model${CURSOR_MARKER} [<name>]`)
   })
 
   test('renders a five-row completion viewport with descriptions and position', () => {
@@ -256,7 +247,7 @@ describe('prompt editor', () => {
 
   test('uses fallback dimensions for non-finite terminal sizes', () => {
     const plain = renderPlain(defaultInput({ columns: Infinity, rows: Infinity }))
-    expect(plain.split('\n')).toContain(`╭${'─'.repeat(78)}╮`)
+    expect(plain.split('\n')).toContain('─'.repeat(80))
   })
 })
 
@@ -277,10 +268,21 @@ describe('prompt frame', () => {
     ['CJK wrap', { placeholder: false, lines: ['帮我把输入框换成圆角盒子并让选中行铺满整行'], cursorCol: 21 }],
   ]
 
-  test.each(states)('pads every framed row to the exact terminal width: %s', (_label, overrides) => {
+  test.each(states)('draws both rules at the exact terminal width: %s', (_label, overrides) => {
     for (const columns of [30, 48, 80, 120]) {
-      for (const row of frameLines(defaultInput({ columns, ...overrides }))) {
-        expect(visibleWidth(row)).toBe(columns)
+      const rules = frameLines(defaultInput({ columns, ...overrides })).filter(isRule)
+      expect(rules).toHaveLength(2)
+      for (const row of rules) expect(visibleWidth(row)).toBe(columns)
+    }
+  })
+
+  test.each(states)('leaves no trailing blanks on unselected rows: %s', (_label, overrides) => {
+    // Terminals copy a mouse selection cell by cell. Padding a plain row out
+    // to the edge would only put whitespace on the clipboard.
+    for (const columns of [30, 48, 80, 120]) {
+      for (const row of interiorRows(defaultInput({ columns, ...overrides }))) {
+        if (row.includes('\x1b[48;2;')) continue
+        expect(stripAnsi(row)).toBe(stripAnsi(row).trimEnd())
       }
     }
   })
@@ -293,60 +295,60 @@ describe('prompt frame', () => {
     }
   })
 
-  test('draws rounded corners and side rails', () => {
+  test('draws plain rules with no vertical rails', () => {
+    // A boxed editor puts `│` at both ends of every line a mouse selection
+    // crosses. Rules sit on their own rows, so copying the draft stays clean.
     const plain = frameLines(defaultInput({ columns: 40 })).map(stripAnsi)
-    expect(plain[0]).toBe(`╭${'─'.repeat(38)}╮`)
-    expect(plain[plain.length - 1]).toBe(`╰${'─'.repeat(38)}╯`)
-    expect(plain[1]!.startsWith('│ ')).toBe(true)
-    expect(plain[1]!.endsWith(' │')).toBe(true)
-  })
-
-  test('widens the gutter as the terminal grows', () => {
-    // Breathing room costs columns, not rows, so it scales with width and
-    // shrinks back before content has to give anything up. Measured on the
-    // caret row: centring puts blank rows above it.
-    const gutterAt = (columns: number) => {
-      const row = frameLines(defaultInput({ columns })).map(stripAnsi).find(line => line.includes('▍'))
-      return /^│( *)/.exec(row!)![1]!.length
+    expect(plain[0]).toBe('─'.repeat(40))
+    expect(plain[plain.length - 1]).toBe('─'.repeat(40))
+    for (const row of plain) {
+      for (const glyph of ['│', '╭', '╮', '╰', '╯']) expect(row).not.toContain(glyph)
     }
-    expect(gutterAt(40)).toBe(1)
-    expect(gutterAt(59)).toBe(1)
-    expect(gutterAt(60)).toBe(2)
-    expect(gutterAt(99)).toBe(2)
-    expect(gutterAt(100)).toBe(3)
-    expect(gutterAt(200)).toBe(3)
   })
 
-  test('mirrors the gutter on both rails', () => {
-    // Trailing blanks are content padding plus gutter, so the two are
-    // indistinguishable until the content fills its width. Overflowing input
-    // gets truncated to exactly `contentWidth`, leaving only the gutter. The
-    // cursor sits at column 0, so the row carries a block rather than a bar.
+  test('leads the first draft row with a caret and indents the rest to match', () => {
+    const rows = interiorRows(defaultInput({
+      columns: 40,
+      placeholder: false,
+      lines: ['first', 'second', 'third', 'fourth'],
+      cursorLine: 3,
+      cursorCol: 6,
+    })).map(row => stripAnsi(row).replaceAll(CURSOR_MARKER, ''))
+    expect(rows[0]).toBe('❭ first')
+    expect(rows.slice(1)).toEqual(['  second', '  third', '  fourth'])
+  })
+
+  test('keeps the caret width constant as the terminal grows', () => {
+    // Text starts at the same column on every width, so a draft copied from
+    // a narrow terminal reads the same as one copied from a wide one.
+    for (const columns of [40, 60, 100, 200]) {
+      const row = interiorRows(defaultInput({ columns })).map(stripAnsi).find(line => line.includes(CURSOR_MARKER))
+      expect(row!.startsWith(`❭ ${CURSOR_MARKER}`)).toBe(true)
+    }
+  })
+
+  test('truncates overflowing input to the width behind the caret', () => {
     for (const columns of [40, 60, 100]) {
-      const row = frameLines(defaultInput({
+      const row = interiorRows(defaultInput({
         columns,
         placeholder: false,
         lines: ['x'.repeat(columns * 2)],
         cursorCol: 0,
-      })).map(stripAnsi).find(line => line.includes('x'))!
-      const left = /^│( *)/.exec(row)![1]!.length
-      const right = /( *)│$/.exec(row)![1]!.length
-      expect(right).toBe(left)
-      expect(left).toBeGreaterThan(0)
+      })).map(row => stripAnsi(row).replaceAll(CURSOR_MARKER, '')).find(line => line.includes('x'))!
+      expect(row).toBe(`❭ ${'x'.repeat(columns - 2)}`)
     }
   })
 
   test('gives the full width back to content once degraded', () => {
-    // No rails below the threshold, so no gutter either: the caret leads.
-    const row = renderPlain(defaultInput({ columns: 29 })).replaceAll(CURSOR_MARKER, '')
-      .split('\n').find(line => line.includes('▍'))
-    expect(row!.startsWith('▍')).toBe(true)
+    // No caret column below the threshold: the cursor leads.
+    const row = stripAnsi(render(defaultInput({ columns: 29 })))
+      .split('\n').find(line => line.includes(CURSOR_MARKER))
+    expect(row!.startsWith(CURSOR_MARKER)).toBe(true)
   })
 
   test('keeps a blank-row floor under a short draft', () => {
-    // Rows between the rails, borders excluded.
-    const railRows = (o: Partial<PromptVMInput>) =>
-      frameLines(defaultInput(o)).filter(row => stripAnsi(row).startsWith('│')).length
+    // Rows between the rules, rules excluded.
+    const railRows = (o: Partial<PromptVMInput>) => interiorRows(defaultInput(o)).length
 
     expect(railRows({})).toBe(3)
     expect(railRows({ lines: ['one line'], cursorCol: 8, placeholder: false })).toBe(3)
@@ -356,13 +358,12 @@ describe('prompt frame', () => {
     expect(railRows({ lines: ['a', 'b', 'c', 'd'], cursorLine: 3, cursorCol: 1, placeholder: false })).toBe(4)
   })
 
-  test('centres a one-line draft between the rails', () => {
-    // Blank rows above and below the draft, borders excluded.
+  test('centres a one-line draft between the rules', () => {
+    // Blank rows above and below the draft, rules excluded.
     const padding = (o: Partial<PromptVMInput>) => {
-      const rail = frameLines(defaultInput(o)).map(stripAnsi).filter(row => row.startsWith('│'))
-      const isBlank = (row: string) => /^│\s*│$/.test(row)
-      const first = rail.findIndex(row => !isBlank(row))
-      const last = rail.findLastIndex(row => !isBlank(row))
+      const rail = interiorRows(defaultInput(o))
+      const first = rail.findIndex(row => !isBlankRow(row))
+      const last = rail.findLastIndex(row => !isBlankRow(row))
       return { above: first, below: rail.length - 1 - last }
     }
     // Equal blanks on both sides. This is what forces an odd interior: a
@@ -375,8 +376,7 @@ describe('prompt frame', () => {
   })
 
   test('drops the floor on terminals too short to spare the rows', () => {
-    const railRows = (rows: number) =>
-      frameLines(defaultInput({ rows })).filter(row => stripAnsi(row).startsWith('│')).length
+    const railRows = (rows: number) => interiorRows(defaultInput({ rows })).length
     expect(railRows(19)).toBe(1)
     expect(railRows(20)).toBe(3)
   })
@@ -397,10 +397,10 @@ describe('prompt frame', () => {
   })
 
   test('adds no bare blank rows when the frame degrades', () => {
-    // The blanks only read as composer space between rails; without them they
+    // The blanks only read as composer space behind a caret; without one they
     // are indistinguishable from stray whitespace.
-    const rows = renderPlain(defaultInput({ columns: 29 })).replaceAll(CURSOR_MARKER, '').split('\n')
-    const caretIndex = rows.findIndex(row => row.includes('▍'))
+    const rows = stripAnsi(render(defaultInput({ columns: 29 }))).split('\n')
+    const caretIndex = rows.findIndex(row => row.includes(CURSOR_MARKER))
     expect(rows[caretIndex + 1]).toBe('─'.repeat(29))
   })
 
@@ -412,11 +412,11 @@ describe('prompt frame', () => {
       cursorLine: 11,
       cursorCol: 7,
     }))
-    expect(plain).toContain('╭─ ↑ 6 lines ─')
-    expect(plain).toContain('╰─ ↓ 8 lines ─')
+    expect(plain).toContain('── ↑ 6 lines ─')
+    expect(plain).toContain('── ↓ 8 lines ─')
   })
 
-  test('truncates a frame label that cannot fit beside the corners', () => {
+  test('truncates a rule label that cannot fit', () => {
     for (const row of frameLines(defaultInput({
       columns: 30,
       rows: 12,
@@ -424,52 +424,44 @@ describe('prompt frame', () => {
       lines: Array.from({ length: 40 }, (_, index) => `line ${index + 1}`),
       cursorLine: 39,
       cursorCol: 7,
-    }))) {
+    })).filter(isRule)) {
       expect(visibleWidth(row)).toBe(30)
     }
   })
 
-  test('degrades to plain rules below the minimum framed width', () => {
+  test('drops the caret column below the minimum framed width', () => {
     const plain = renderPlain(defaultInput({ columns: 29 })).split('\n')
-    expect(plain).toContain('─'.repeat(29))
-    // No corners or rails on the input rows. The footer keeps its own `│`
-    // separator, so only the frame region is inspected here.
-    for (const row of plain.filter(line => /^[│╭╰─]/.test(line))) {
-      expect(row).toBe('─'.repeat(29))
-    }
+    expect(plain.filter(row => row === '─'.repeat(29))).toHaveLength(2)
+    expect(plain.some(row => row.startsWith('❭ '))).toBe(false)
   })
 
-  test('spends no width on rails once degraded', () => {
+  test('spends no width on the caret once degraded', () => {
     // The full 29 columns stay available to content, unlike the framed path
-    // which reserves four for the rails and their padding.
+    // which reserves two for the caret.
     const wide = renderPlain(defaultInput({ columns: 29, placeholder: false, lines: ['a'.repeat(40)], cursorCol: 40 }))
     expect(wide).toContain('a'.repeat(27))
   })
 
-  test('places the cursor marker inside the rails', () => {
+  test('places the cursor marker behind the caret', () => {
     const row = renderLines(defaultInput({ columns: 40 })).find(line => line.includes(CURSOR_MARKER))
     expect(row).toBeDefined()
     // Everything before the marker is measurable, so the renderer can derive
-    // the hardware cursor column. The marker leads the caret, so at 40 columns
-    // only the rail and its one-column gutter sit ahead of it.
+    // the hardware cursor column. Only `❭ ` sits ahead of it.
     const prefix = row!.slice(0, row!.indexOf(CURSOR_MARKER))
     expect(visibleWidth(prefix)).toBe(2)
   })
 
-  test('drops the border entirely on a terminal too short to spare the rows', () => {
-    // At 9 rows the two border rows plus footer would leave the transcript
-    // nothing, so the composer keeps only its caret row.
+  test('drops the rules entirely on a terminal too short to spare the rows', () => {
+    // At 9 rows the two rule rows plus footer would leave the transcript
+    // nothing, so the composer keeps only its cursor row.
     const plain = renderPlain(defaultInput({ rows: 9 })).split('\n')
-    for (const glyph of ['╭', '╮', '╰', '╯', '│']) {
-      expect(plain.filter(row => row.startsWith(glyph))).toEqual([])
-    }
-    expect(plain.some(row => row.includes('▍'))).toBe(true)
+    expect(plain.filter(isRule)).toEqual([])
+    expect(render(defaultInput({ rows: 5 }))).toContain(CURSOR_MARKER)
   })
 
-  test('keeps the border down to the height where it still pays', () => {
-    const plain = renderPlain(defaultInput({ rows: 10 }))
-    expect(plain).toContain('╭')
-    expect(plain).toContain('╰')
+  test('keeps the rules down to the height where it still pays', () => {
+    const plain = renderPlain(defaultInput({ rows: 10 })).split('\n')
+    expect(plain.filter(isRule)).toHaveLength(2)
   })
 
   test('reclaims rows as the terminal shortens rather than crowding out history', () => {
@@ -482,29 +474,27 @@ describe('prompt frame', () => {
     expect(height(9)).toBeLessThan(9 / 2 + 1)
   })
 
-  test('recolours both rails and corners for an active mode', () => {
-    const { accentHex, brandHex } = getTheme()
-    // A border row is painted as one span, so the hue is asserted on the row
-    // rather than on the corner glyph alone.
-    const rowsFor = (input: PromptVMInput) =>
-      renderLines(input).filter(row => /^\x1b\[[\d;]+m[╭╰│]/.test(row))
-    const hueOf = (row: string) => row.slice(0, row.indexOf('m') + 1)
-
-    const planned = rowsFor(defaultInput({ planning: true }))
-    expect(planned.length).toBeGreaterThan(0)
-    for (const row of planned) {
-      expect(hueOf(row)).toBe(chalk.hex(accentHex)('x').slice(0, -'x\x1b[39m'.length))
-    }
-    // The default mode keeps the brand hue.
-    for (const row of rowsFor(defaultInput())) {
-      expect(hueOf(row)).toBe(chalk.hex(brandHex)('x').slice(0, -'x\x1b[39m'.length))
-    }
+  test('an active mode colours its label only; rules and caret keep their tones', () => {
+    const { accentHex, brandHex, subtleHex } = getTheme()
+    const rows = renderLines(defaultInput({ logMode: true }))
+    const top = rows.find(row => stripAnsi(row).includes('(log)'))
+    expect(top).toBeDefined()
+    // The mode word is the one accent-coloured thing on the rule.
+    expect(top).toContain(chalk.hex(accentHex)(' (log) '))
+    expect(top).not.toContain(chalk.hex(accentHex)('──'))
+    // Dashes on either side stay subtle, so the whole frame does not turn yellow
+    // for a fact one word already states.
+    expect(top!.startsWith(chalk.hex(subtleHex)('─').slice(0, -'─\x1b[39m'.length))).toBe(true)
+    // The caret stays brand-coloured in every mode.
+    expect(rows.some(row => row.startsWith(chalk.hex(brandHex)('❭ ')))).toBe(true)
+    expect(rows.some(row => row.startsWith(chalk.hex(accentHex)('❭ ')))).toBe(false)
   })
 
-  test('names the mode in the border label, not just by hue', () => {
+  test('names the mode at the right end of the top rule, not just by hue', () => {
     // Colour alone fails on monochrome terminals and for colour-blind users.
-    expect(renderPlain(defaultInput({ planning: true }))).toContain('╭─ plan ')
-    expect(renderPlain(defaultInput({ logMode: true }))).toContain('╭─ log ')
+    // Right-aligned so it does not compete with the caret for where reading starts.
+    const log = renderPlain(defaultInput({ logMode: true })).split('\n').find(row => row.includes('(log)'))
+    expect(log).toBe('─'.repeat(80 - ' (log) '.length - 1) + ' (log) ─')
   })
 
   test('pushes an unfocused draft into the background', () => {
@@ -535,27 +525,49 @@ describe('prompt frame', () => {
 
   test('hides the caret entirely while unfocused', () => {
     const draft = { lines: ['draft'], cursorCol: 5, placeholder: false }
-    expect(renderPlain(defaultInput({ ...draft, active: true }))).toContain('▍')
-    expect(renderPlain(defaultInput({ ...draft, active: false }))).not.toContain('▍')
+    expect(render(defaultInput({ ...draft, active: true }))).toContain(CURSOR_MARKER)
+    expect(render(defaultInput({ ...draft, active: false }))).not.toContain(CURSOR_MARKER)
   })
 
-  test('shares the label slot between mode and scroll overflow', () => {
+  test('puts scroll overflow at the left of the rule and the mode at the right', () => {
     const plain = renderPlain(defaultInput({
       columns: 60,
       rows: 20,
-      planning: true,
+      logMode: true,
       placeholder: false,
       lines: Array.from({ length: 12 }, (_, index) => `line ${index + 1}`),
       cursorLine: 11,
       cursorCol: 7,
     }))
-    // Mode leads: it says what enter will do, overflow only says where you are.
-    expect(plain).toContain('╭─ plan · ↑ ')
+    const top = plain.split('\n').find(row => row.includes('↑'))
+    expect(top).toMatch(/^── ↑ \d+ lines ─+ \(log\) ─$/)
+    expect(top!.length).toBe(60)
+  })
+
+  test('the placeholder follows state before mode', () => {
+    const hint = (input: Partial<PromptVMInput>) =>
+      interiorRows(defaultInput(input)).map(row => stripAnsi(row).replaceAll(CURSOR_MARKER, '')).find(row => row.startsWith('❭ '))
+    expect(hint({})).toBe('❭ Enter a coding task or / for commands')
+    expect(hint({ logMode: true })).toBe('❭ Ask about these logs · /done to return')
+    // While a turn runs, typing steers it: say so, whatever mode the next turn starts in.
+    expect(hint({ busy: true })).toBe('❭ Guide the agent while it works')
+    expect(hint({ busy: true, logMode: true })).toBe('❭ Guide the agent while it works')
+    expect(hint({ busy: true, queuedCount: 1 })).toBe('❭ 1 message queued · Ctrl+G to manage')
+    expect(hint({ busy: true, queuedCount: 2 })).toBe('❭ 2 messages queued · Ctrl+G to manage')
+    // A queue with nothing running is stale state, not a prompt to manage it.
+    expect(hint({ busy: false, queuedCount: 2 })).toBe('❭ Enter a coding task or / for commands')
+    // A parked loop is still steerable; say how. A running turn wins over it.
+    expect(hint({ loopParked: true })).toBe('❭ Loop waiting · type to act now · /loop 15m to change pace · esc twice to stop')
+    expect(hint({ loopParked: true, busy: true })).toBe('❭ Guide the agent while it works')
+    expect(hint({ columns: 50, loopParked: true })).toBe('❭ Loop waiting · type · /loop 15m · esc twice')
+    // Narrow terminals get the short forms.
+    expect(hint({ columns: 40, busy: true })).toBe('❭ Guide while it works')
+    expect(hint({ columns: 40, busy: true, queuedCount: 1 })).toBe('❭ 1 queued · Ctrl+G')
   })
 })
 
 describe('prompt completion menu', () => {
-  test('fills the selected row to the right rail', () => {
+  test('fills the selected row to the right edge', () => {
     const rows = renderLines(defaultInput({
       columns: 60,
       lines: ['/cm'],
@@ -565,9 +577,11 @@ describe('prompt completion menu', () => {
     }))
     const selected = rows.find(row => stripAnsi(row).includes('/cmd1'))
     expect(selected).toBeDefined()
-    // Only the closing rail may follow the final background reset.
-    const tail = stripAnsi(selected!.slice(selected!.lastIndexOf('\x1b[49m')))
-    expect(tail).toBe('│')
+    // The band spans the whole row, caret indent included: nothing follows
+    // the final background reset and nothing unpainted leads it.
+    expect(stripAnsi(selected!.slice(selected!.lastIndexOf('\x1b[49m')))).toBe('')
+    expect(visibleWidth(selected!)).toBe(60)
+    expect(selected!.indexOf('\x1b[48;2;')).toBe(0)
 
     const unselected = rows.find(row => stripAnsi(row).includes('/cmd2'))
     expect(unselected).not.toContain('\x1b[49m')
@@ -763,13 +777,13 @@ describe('prompt completion menu', () => {
   })
 
   test('separates the input from candidates only while framed', () => {
-    const blankRows = (columns: number) => renderLines(defaultInput({
+    const blankRows = (columns: number) => interiorRows(defaultInput({
       columns,
       lines: ['/cm'],
       cursorCol: 3,
       placeholder: false,
       completion: menuOf(3, 0),
-    })).filter(row => stripAnsi(row).trim() === '│  │'.trim() || /^│\s+│$/.test(stripAnsi(row))).length
+    })).filter(isBlankRow).length
     expect(blankRows(60)).toBe(1)
     expect(blankRows(29)).toBe(0)
   })
@@ -820,39 +834,55 @@ describe('prompt overflow guards', () => {
 describe('prompt footer', () => {
   test('renders repository state and model identity', () => {
     const plain = renderPlain(defaultInput({
-      planning: true,
       logMode: true,
       provider: 'anthropic',
       thinkingLevel: 'xhigh',
       columns: 160,
     }))
-    // The border names the modes, so the footer drops its own prefix rather
+    // The top rule names the modes, so the footer drops its own prefix rather
     // than repeating the same words two rows apart.
-    expect(plain).toContain('╭─ log · plan ')
+    expect(plain).toContain(' (log) ─')
     expect(plain).not.toContain('[log]')
-    expect(plain).not.toContain('[plan]')
     expect(plain).toContain('/Users/test/project (main)')
-    expect(plain).toContain('claude-sonnet@anthropic • xhigh')
+    expect(plain).toContain('claude-sonnet • xhigh')
+    expect(plain).not.toContain('@anthropic')
   })
 
   test('footer keeps the mode prefix when no border carries it', () => {
-    // Below the border threshold nothing above the footer names the mode, so
+    // Below the rule threshold nothing above the footer names the mode, so
     // the footer stays authoritative.
-    const plain = renderPlain(defaultInput({ planning: true, logMode: true, rows: 9, columns: 160 }))
+    const plain = renderPlain(defaultInput({ logMode: true, rows: 9, columns: 160 }))
     expect(plain).not.toContain('╭')
-    expect(plain).toContain('[log] [plan]')
+    expect(plain).toContain('[log]')
   })
 
   test('footer keeps the mode prefix when asked directly, as overlays do', () => {
     // Selector and ask overlays replace the composer but keep the footer, so
     // the default must carry the mode.
-    const footer = blocksToLines(buildPromptFooterBlocks(defaultInput({ planning: true, columns: 160 })))
+    const footer = blocksToLines(buildPromptFooterBlocks(defaultInput({ logMode: true, columns: 160 })))
       .map(stripAnsi)[0]!
-    expect(footer).toContain('[plan]')
+    expect(footer).toContain('[log]')
   })
 
   test('labels disabled thinking', () => {
     expect(renderPlain(defaultInput({ thinkingLevel: 'off' }))).toContain('thinking off')
+  })
+
+  test('with a ladder the footer draws the same gauge as the /model picker', () => {
+    const levels = ['off', 'low', 'medium', 'high']
+    const plain = renderPlain(defaultInput({ thinkingLevel: 'medium', thinkingLevels: levels }))
+    expect(plain).toContain('◼◼◼◼ medium')
+    // `off` is a tier on this ladder, so it lights one cell like any other.
+    expect(renderPlain(defaultInput({ thinkingLevel: 'off', thinkingLevels: levels }))).toContain('◼◼◼◼ off')
+    expect(renderPlain(defaultInput({ thinkingLevel: 'high', thinkingLevels: levels }))).toContain('◼◼◼◼ high')
+    // Lit cells carry ramp colours; the trailing empty cells share one tone.
+    const raw = blocksToLines(buildPromptFooterBlocks(defaultInput({ thinkingLevel: 'medium', thinkingLevels: levels, columns: 160 })))[0]!
+    const { effortRampHex, subtleHex } = getTheme()
+    expect(raw).toContain(chalk.hex(effortRampHex[0]!)('◼'))
+    expect(raw).toContain(chalk.hex(subtleHex)('◼'))
+    // A level outside the ladder is named rather than mis-gauged.
+    expect(renderPlain(defaultInput({ thinkingLevel: 'xhigh', thinkingLevels: levels }))).toContain('• xhigh')
+    expect(renderPlain(defaultInput({ thinkingLevel: 'xhigh', thinkingLevels: levels }))).not.toContain('◼')
   })
 
   test('renders context and dashboard when space allows', () => {
@@ -893,7 +923,37 @@ describe('prompt footer', () => {
       contextWindow: 272000,
     }))).map(stripAnsi)[0]!
 
-    expect(footer).toBe('~/github/evotai/evot (main) │ gpt-5.6-sol@anthropic • high │ context: 38.9% (105.8k/272k)')
+    expect(footer).toBe('~/github/evotai/evot (main) │ gpt-5.6-sol • high │ context: 38.9% (105.8k/272k)')
+  })
+
+  test('never badges the footer for judge pruning: prunes show as transcript cards', () => {
+    const footer = blocksToLines(buildPromptFooterBlocks(defaultInput({
+      columns: 160,
+      contextTokens: 105800,
+      contextWindow: 272000,
+    }))).map(stripAnsi)[0]!
+    expect(footer).toContain('context: 38.9% (105.8k/272k)')
+    expect(footer).not.toContain('jev')
+  })
+
+  test('the background chip takes the brand tone, not cyan', () => {
+    const { brandHex } = getTheme()
+    const chip = blocksToLines(buildPromptFooterBlocks(defaultInput({ columns: 160, backgroundProcessCount: 1 }))).join('\n')
+    expect(chip).toContain(chalk.hex(brandHex)('1 background shell running'))
+    expect(chip).not.toContain('loop')
+  })
+
+  test('the thinking tier word is dim; only the gauge cells carry the ramp', () => {
+    const { effortRampHex } = getTheme()
+    const raw = blocksToLines(buildPromptFooterBlocks(defaultInput({
+      columns: 160,
+      thinkingLevel: 'high',
+      thinkingLevels: ['low', 'medium', 'high'],
+    })))[0]!
+    expect(raw).toContain(chalk.hex(effortRampHex.at(-1)!)('◼'))
+    // The tier word takes the same tone as the model name beside it.
+    expect(raw).toContain(chalk.hex('#777777')(' high'))
+    expect(raw).not.toContain(chalk.hex(effortRampHex.at(-1)!)(' high'))
   })
 
   test('carries no cache segment: per-call cache usage belongs to the spinner', () => {
@@ -911,7 +971,31 @@ describe('prompt footer', () => {
     }
     const wide = footerAt(160)
     expect(wide).toContain('context: 38.9% (105.8k/272k)')
-    expect(wide).toContain('@anthropic')
+    expect(wide).not.toContain('@anthropic')
+  })
+
+  test('the footer hides provider labels even for cloud models while the model picker retains them', () => {
+    const footer = blocksToLines(buildPromptFooterBlocks(defaultInput({
+      columns: 160, model: 'gpt-6-sol', provider: 'Evot Premium', thinkingLevel: 'high',
+    }))).map(stripAnsi)[0]!
+    expect(footer).toContain('gpt-6-sol • high')
+    expect(footer).not.toContain('@Evot Premium')
+  })
+
+  test('compact dashboard port keeps the full clickable URL', () => {
+    const address = 'http://127.0.0.1:8788'
+    const blocks = buildPromptFooterBlocks(defaultInput({
+      columns: 80,
+      model: 'gpt-5.6-sol',
+      thinkingLevel: 'max',
+      dashboardUrl: address,
+      contextTokens: 105800,
+      contextWindow: 272000,
+    }))
+    const links = blocks.flatMap(block => block.lines.flatMap(row => row.spans)).filter(span => span.link)
+    expect(links).toHaveLength(1)
+    expect(links[0]?.text).toBe(':8788')
+    expect(links[0]?.link).toBe(address)
   })
 
   test('degrades footer details in priority order as width narrows', () => {
@@ -925,31 +1009,36 @@ describe('prompt footer', () => {
       contextWindow: 272000,
     }))).map(stripAnsi)[0]!
 
-    const withoutDashboard = footerAt(119)
-    expect(withoutDashboard).not.toContain('dashboard')
-    expect(withoutDashboard).toContain('context: 38.9% (105.8k/272k)')
+    const withDashboard = footerAt(119)
+    expect(withDashboard).toContain('dashboard')
+    expect(withDashboard).toContain('context: 38.9% (105.8k/272k)')
 
-    const compactContext = footerAt(80)
-    expect(compactContext).toContain('gpt-5.6-sol@anthropic • max')
+    const compactDashboard = footerAt(80)
+    expect(compactDashboard).toEndWith('dashboard :8082')
+    expect(compactDashboard).toContain('context: 38.9%')
+    expect(compactDashboard).not.toContain('http://')
+
+    const compactContext = footerAt(70)
+    expect(compactContext).toContain('gpt-5.6-sol • max')
     expect(compactContext).toContain('context: 38.9%')
     expect(compactContext).not.toContain('105.8k')
-
-    const withoutProvider = footerAt(70)
-    expect(withoutProvider).toContain('gpt-5.6-sol • max')
-    expect(withoutProvider).not.toContain('@anthropic')
-    expect(withoutProvider).toContain('(main)')
+    expect(compactContext).not.toContain('(main)')
+    expect(compactContext).toEndWith('dashboard :8082')
 
     const withoutBranch = footerAt(60)
     expect(withoutBranch).not.toContain('(main)')
     expect(withoutBranch).toContain('context: 38.9%')
 
-    const withoutContext = footerAt(50)
+    const withoutContext = footerAt(40)
     expect(withoutContext).toContain('gpt-5.6-sol • max')
     expect(withoutContext).not.toContain('context:')
 
-    for (const columns of [119, 80, 70, 60, 50, 30, 20]) {
+    for (const columns of [119, 80, 70, 60, 50, 40, 30, 20]) {
       expect(stringWidth(footerAt(columns))).toBeLessThanOrEqual(columns)
+      expect(footerAt(columns)).toContain('dashboard')
     }
+    expect(footerAt(10)).not.toContain('dashboard')
+    expect(stringWidth(footerAt(10))).toBeLessThanOrEqual(10)
   })
 
   test('truncates a wide CJK cwd only after optional segments are gone', () => {
@@ -965,6 +1054,23 @@ describe('prompt footer', () => {
     expect(footer).toStartWith('…')
   })
 
+  test('idle background stop hint shares the count row and confirmation takes priority over management', () => {
+    for (const [hint, columns] of [
+      ['esc twice to stop all', 100],
+      ['esc again to stop all 2 tasks', 100],
+      ['esc again to stop all 2 tasks', 40],
+      ['Stopping…', 40],
+    ] as const) {
+      const lines = blocksToLines(buildPromptFooterBlocks(defaultInput({
+        columns, backgroundProcessCount: 2, backgroundPanelDownAvailable: true,
+        backgroundStopHint: hint,
+      }))).map(stripAnsi)
+      expect(lines[0]).toContain(hint)
+      expect(lines[0]).toStartWith('2 ')
+      expect(stringWidth(lines[0]!)).toBeLessThanOrEqual(columns)
+    }
+  })
+
   test('footer chip advertises ↓ while the composer is empty', () => {
     const lines = blocksToLines(buildPromptFooterBlocks(defaultInput({
       columns: 100,
@@ -976,14 +1082,14 @@ describe('prompt footer', () => {
     expect(lines[2]).toBe('')
   })
 
-  test('with text in the composer the chip names Ctrl+T instead', () => {
+  test('with text in the composer the chip stays quiet instead of advertising Ctrl+T', () => {
     // ↓ still moves the caret there, so advertising it would be a lie.
     const lines = blocksToLines(buildPromptFooterBlocks(defaultInput({
       columns: 100,
       backgroundProcessCount: 2,
       backgroundPanelDownAvailable: false,
     }))).map(stripAnsi)
-    expect(lines[0]).toBe('2 background shells running · ctrl+t to manage')
+    expect(lines[0]).toBe('2 background shells running')
   })
 
   test('a single shell reads in the singular', () => {
@@ -1032,7 +1138,8 @@ describe('prompt footer', () => {
   test('footer remains available without the editor', () => {
     const lines = blocksToLines(buildPromptFooterBlocks(defaultInput({ provider: 'openai', model: 'gpt-5.6-sol' }))).map(stripAnsi)
     expect(lines).toHaveLength(2)
-    expect(lines[0]).toContain('gpt-5.6-sol@openai')
+    expect(lines[0]).toContain('gpt-5.6-sol')
+    expect(lines[0]).not.toContain('@openai')
     expect(lines[1]).toBe('')
     expect(lines.join('\n')).not.toContain('Enter a coding task or / for commands')
   })

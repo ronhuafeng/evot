@@ -18,12 +18,12 @@ use super::Section;
 pub enum PromptMode {
     /// REPL with a human at the terminal.
     Interactive,
-    /// Plan mode: no mutations allowed this turn.
-    Planning,
     /// Oneshot / API / channel-driven, no human to converse with.
     Headless,
     /// Forked, read-only conversation.
     Readonly,
+    /// Tool-free conversation: no shell, so sandbox and variable notes are moot.
+    Chat,
 }
 
 /// Runtime inputs that decide which dynamic sections apply this turn.
@@ -33,15 +33,13 @@ pub struct DynamicContext {
     pub variables: Vec<String>,
 }
 
-/// Plan-mode constraints. Active only in [`PromptMode::Planning`].
-const PLANNING_SECTION: &str = include_str!("prompts/plan.md");
-
 /// Response-language guideline. Meaningful only for a human at the terminal,
 /// so it rides on [`PromptMode::Interactive`].
 const LANGUAGE_SECTION: &str = "\
-Respond in the same language the user writes in. If the user switches \
-languages, follow the switch. Technical terms, code, identifiers, file paths, \
-and command names stay in their original form — never translate them.";
+Use the language established by the user's requests and preferences. \
+Runtime notifications and tool output do not change that language. \
+Technical terms, code, identifiers, file paths, and command names stay \
+in their original form — never translate them.";
 
 /// Sandbox constraints. Active only when the agent runs sandboxed.
 const SANDBOX_SECTION: &str = "\
@@ -72,15 +70,13 @@ pub fn dynamic_sections(ctx: &DynamicContext) -> Vec<Section> {
     let mut sections = Vec::new();
 
     match ctx.mode {
-        PromptMode::Planning => sections.push(Section {
-            name: "planning_mode",
-            text: PLANNING_SECTION.to_string(),
-        }),
         PromptMode::Interactive => sections.push(Section {
             name: "language",
             text: LANGUAGE_SECTION.to_string(),
         }),
         PromptMode::Headless | PromptMode::Readonly => {}
+        // Sandbox rules and variable names only matter to a shell.
+        PromptMode::Chat => return sections,
     }
 
     if ctx.sandbox {
@@ -98,4 +94,14 @@ pub fn dynamic_sections(ctx: &DynamicContext) -> Vec<Section> {
     }
 
     sections
+}
+
+pub(crate) fn prompt_mode(mode: crate::agent::tools::ToolMode) -> PromptMode {
+    use crate::agent::tools::ToolMode;
+    match mode {
+        ToolMode::Interactive => PromptMode::Interactive,
+        ToolMode::Headless => PromptMode::Headless,
+        ToolMode::Readonly => PromptMode::Readonly,
+        ToolMode::Chat => PromptMode::Chat,
+    }
 }

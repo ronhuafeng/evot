@@ -9,19 +9,17 @@
  * terminal: the controller in `background-terminals.ts` owns the side effects.
  */
 
+import { wrapTextWithAnsi } from '../../render/wrap.js'
 import stripAnsi from 'strip-ansi'
 import type { KeyEvent } from '../input.js'
 import type { BackgroundProcess } from '../../native/index.js'
-import type { Hint } from './hint.js'
-import { createSelectorState, type SelectorItem, type SelectorState } from '../selector.js'
-import { formatElapsed } from '../../render/format.js'
+import type { Hint } from '../design/key-hints.js'
+import type { SelectorItem, SelectorState } from '../selector.js'
+import { createAppSelectorState } from './selector-identity.js'
+import { clipDisplayText, formatElapsed } from '../../render/format.js'
 
 export const BACKGROUND_PANEL_TITLE = 'Background'
 export const BACKGROUND_OUTPUT_TITLE = 'Background output'
-
-export function isBackgroundOutputTitle(title: string): boolean {
-  return title === BACKGROUND_OUTPUT_TITLE
-}
 
 /**
  * Gesture advertised at the prompt while background work is live.
@@ -51,11 +49,6 @@ export function shouldDownOpenPanel(input: { editorEmpty: boolean; running: numb
   return input.editorEmpty && input.running > 0
 }
 
-/** True when a selector belongs to background terminal management. */
-export function isBackgroundPanelTitle(title: string): boolean {
-  return title === BACKGROUND_PANEL_TITLE || isBackgroundOutputTitle(title)
-}
-
 /** Statuses that are still doing work. */
 export function isLiveStatus(status: BackgroundProcess['status']): boolean {
   return status === 'running' || status === 'running_foreground'
@@ -71,15 +64,11 @@ export function isLiveStatus(status: BackgroundProcess['status']): boolean {
  */
 export { formatElapsed }
 
-/** First non-empty line of a command, with the rest reported as a line count. */
+/** A script label must not imply its first command is the active process. */
 export function formatCommandLabel(command: string, maxChars = 96): string {
-  const lines = command.split('\n')
-  const first = lines.map(line => line.trim()).find(Boolean) ?? '(empty)'
-  const extra = lines.length - 1
-  const suffix = extra > 0 ? ` (+${extra} ${extra === 1 ? 'line' : 'lines'})` : ''
-  const available = Math.max(1, maxChars - suffix.length)
-  if (first.length <= available) return `${first}${suffix}`
-  return `${first.slice(0, Math.max(1, available - 1))}…${suffix}`
+  const text = sanitizeTerminalOutput(command).trim()
+  const lines = text.split('\n')
+  return clipDisplayText(lines.length > 1 ? `script (${lines.length} lines)` : text || '(empty)', maxChars)
 }
 
 /** Parenthesised status shown after a row's command. */
@@ -104,11 +93,11 @@ export function formatStatusDetail(process: BackgroundProcess): string {
   }
 }
 
-/** Body text when nothing has run in this session yet. */
+/** Body text when no task is still running. */
 export const PANEL_EMPTY_MESSAGE = 'No tasks currently running'
 
 /**
- * Count line under the title. Counts live tasks only, finished ones separately.
+ * Count line under the title. Counts live tasks only.
  *
  * "active" is deliberately broader than the footer chip's "background shells
  * running": this counts `running` and `running_foreground` alike, because the
@@ -119,60 +108,28 @@ export const PANEL_EMPTY_MESSAGE = 'No tasks currently running'
  * and repeating it two rows apart reads like two different statements.
  */
 export function formatPanelSubtitle(processes: BackgroundProcess[]): string | undefined {
-  if (processes.length === 0) return undefined
   const live = processes.filter(process => isLiveStatus(process.status)).length
-  const done = processes.length - live
-  const parts: string[] = []
-  if (live > 0) parts.push(`${live} active ${live === 1 ? 'shell' : 'shells'}`)
-  if (done > 0) parts.push(`${done} finished`)
-  return parts.join(' · ')
+  return live > 0 ? `${live} active ${live === 1 ? 'shell' : 'shells'}` : undefined
 }
 
-/** Group labels. Live work sits above finished work, newest task last. */
-export const SHELLS_GROUP = 'Shells'
-export const COMPLETED_GROUP = 'Completed'
-
-/**
- * Selector rows for the panel, live tasks first and finished tasks below.
- *
- * A single group carries no heading: with only running shells on screen the
- * label would state what the panel title already says. The heading appears as
- * soon as the list splits, where it earns its row by separating the two.
- */
+/** Only live tasks occupy the management panel. */
 export function formatPanelItems(processes: BackgroundProcess[]): SelectorItem[] {
   const live = processes.filter(process => isLiveStatus(process.status))
-  const done = processes.filter(process => !isLiveStatus(process.status))
-  const running = live.length
-
-  const row = (process: BackgroundProcess, group: string): SelectorItem => ({
+  return live.map((process): SelectorItem => ({
     label: formatCommandLabel(process.command),
     detail: `(${formatStatusDetail(process)})`,
     id: process.task_id,
-    group,
-    // Hints ride on the row so moving the cursor onto a finished task drops
-    // `x to stop` without any extra bookkeeping.
-    hints: backgroundPanelHints(
-      { id: process.task_id, live: isLiveStatus(process.status) },
-      running,
-    ),
+    hints: backgroundPanelHints({ id: process.task_id, live: true }, live.length),
     // The full command and id stay searchable even though the row is truncated.
     searchText: `${process.command} ${process.task_id}`,
-  })
-
-  const split = live.length > 0 && done.length > 0
-  const header = (label: string, size: number): SelectorItem[] =>
-    split ? [{ label, headerCount: size, header: true, focusable: false, group: label }] : []
-
-  return [
-    ...(live.length > 0 ? [...header(SHELLS_GROUP, live.length), ...live.map(p => row(p, SHELLS_GROUP))] : []),
-    ...(done.length > 0 ? [...header(COMPLETED_GROUP, done.length), ...done.map(p => row(p, COMPLETED_GROUP))] : []),
-  ]
+  }))
 }
 
 /** Open the panel over the current task list. */
 export function createBackgroundPanelState(processes: BackgroundProcess[]): SelectorState {
   return {
-    ...createSelectorState(BACKGROUND_PANEL_TITLE, formatPanelItems(processes)),
+    ...createAppSelectorState('background', BACKGROUND_PANEL_TITLE, formatPanelItems(processes)),
+    presentation: 'background-list',
     subtitle: formatPanelSubtitle(processes),
     noFilter: true,
     emptyMessage: PANEL_EMPTY_MESSAGE,
@@ -184,10 +141,8 @@ export function createBackgroundPanelState(processes: BackgroundProcess[]): Sele
 /**
  * Refresh an open panel in place.
  *
- * Focus follows the task id rather than the row index, so a task finishing or
- * being removed under the cursor cannot silently redirect the next keypress at
- * a different task. A finishing task moves between groups, which shifts every
- * index around it — matching on id is what keeps the cursor on the same shell.
+ * Preserve a surviving task's focus by id; when it finishes, focus the nearest
+ * remaining live row.
  */
 export function refreshBackgroundPanelState(
   state: SelectorState,
@@ -298,20 +253,31 @@ export const OUTPUT_TAIL_LINES = 200
 export function createBackgroundOutputState(
   process: BackgroundProcess,
   output: string,
+  returnToPrompt = false,
 ): SelectorState {
   const safeOutput = sanitizeTerminalOutput(output)
   return {
-    ...createSelectorState(BACKGROUND_OUTPUT_TITLE, [{
+    ...createAppSelectorState('backgroundOutput', BACKGROUND_OUTPUT_TITLE, [{
       id: process.task_id,
       label: formatCommandLabel(process.command),
       detail: formatStatusDetail(process),
       preview: formatLiveOutputView(process, safeOutput),
     }]),
     presentation: 'background-output',
-    subtitle: `${process.task_id.slice(0, 8)} · ${formatStatusDetail(process)}`,
+    subtitle: process.task_id.slice(0, 8),
     noFilter: true,
-    hints: [{ keys: 'escape', action: 'back' }],
+    outputView: { returnToPrompt },
+    hints: backgroundOutputHints(process, returnToPrompt),
   }
+}
+
+/** Hints describe only actions available on this task. */
+export function backgroundOutputHints(process: BackgroundProcess, returnToPrompt = false) : Hint[] {
+  return [
+    { keys: 'escape', action: returnToPrompt ? 'close' : 'back' },
+    ...(isLiveStatus(process.status) ? [{ keys: 'x', action: 'stop' } satisfies Hint] : []),
+    { keys: ['up', 'down'], action: 'scroll' },
+  ]
 }
 
 /** Strip terminal control sequences before command output enters the renderer. */
@@ -328,17 +294,146 @@ export function formatLiveOutputView(process: BackgroundProcess, output: string)
   const all = normalized.length === 0 ? [] : normalized.split('\n')
   const visible = all.slice(-OUTPUT_TAIL_LINES)
   const hidden = all.length - visible.length
-  const body = visible.length === 0 ? ['  (no output yet)'] : visible
+  const body = visible.length === 0 ? ['(no output yet)'] : visible
   return [
-    `  ${formatCommandLabel(process.command)}`,
-    `  ${process.output_path}`,
+    `  ${STATUS_MARK[process.status]} · ${formatStatusDetail(process)}`,
+    `  Output: ${sanitizeTerminalOutput(process.output_path)}`,
     ...(process.output_file_truncated
       ? ['  ⚠ output file was capped; earlier output was dropped']
       : []),
     ...(hidden > 0 ? [`  … ${hidden} earlier ${hidden === 1 ? 'line' : 'lines'}`] : []),
     '',
+    'Command',
+    ...sanitizeTerminalOutput(process.command).split('\n'),
+    '',
+    'Output',
     ...body,
   ]
+}
+
+export function backgroundOutputRows(state: SelectorState, columns: number): string[] {
+  const preview = state.items[0]?.preview ?? ['', '(no output yet)']
+  const split = preview.indexOf('')
+  const body = split < 0 ? preview : preview.slice(split + 1)
+  const width = Number.isFinite(columns) ? Math.max(1, Math.floor(columns)) : 80
+  return body.flatMap(entry => wrapTextWithAnsi(entry, Math.max(1, width - 2)))
+}
+
+/** Pinned lines above the body: title and status, plus the capped-file warning. */
+export function backgroundOutputHeaderLines(state: SelectorState): string[] {
+  const preview = state.items[0]?.preview ?? []
+  const split = preview.indexOf('')
+  return split < 0 ? [] : preview.slice(0, split)
+}
+
+/**
+ * Rows the output overlay may occupy in total, excluding the outer renderer's
+ * leading blank and two borders. Capped so a tall terminal does not turn the
+ * overlay into a second screen; floored so short terminals still show activity.
+ */
+export function backgroundOutputBudget(rows: number): number {
+  return Math.max(4, Math.min(24, Math.floor(rows) - 4))
+}
+
+/** Rows below the body: the position line and the key hints. */
+const OUTPUT_FOOTER_LINES = 2
+
+/** Header rows: title and status, plus one per warning. */
+function outputHeaderHeight(state: SelectorState): number {
+  const warnings = backgroundOutputHeaderLines(state).filter(text => text.includes('output file was capped'))
+  return 2 + warnings.length
+}
+
+export interface BackgroundOutputViewport {
+  /** Every wrapped body row (command, output, markers). */
+  body: string[]
+  /** Rows the body viewport can show at once. */
+  height: number
+  /** First visible body row. */
+  start: number
+  /** One past the last visible body row. */
+  end: number
+  /** True while the view is pinned to the tail. */
+  following: boolean
+}
+
+/**
+ * Body window for the output overlay.
+ *
+ * `outputView.scrollOffset` is the first visible body row; undefined follows
+ * the tail. The window is always `height` rows when the body is that long, and
+ * the whole body otherwise, so scrolling never changes the overlay's height:
+ * the composer and footer below it stay exactly where they are.
+ */
+export function backgroundOutputViewport(
+  state: SelectorState,
+  columns: number,
+  rows: number,
+): BackgroundOutputViewport {
+  const body = backgroundOutputRows(state, columns)
+  const height = Math.max(1, backgroundOutputBudget(rows) - outputHeaderHeight(state) - OUTPUT_FOOTER_LINES)
+  const maxStart = Math.max(0, body.length - height)
+  const offset = state.outputView?.scrollOffset
+  const following = offset === undefined || offset >= maxStart
+  const start = following ? maxStart : Math.max(0, offset)
+  return { body, height, start, end: Math.min(body.length, start + height), following }
+}
+
+export type OutputScrollKey = 'up' | 'down' | 'page-up' | 'page-down' | 'home' | 'end' | 'command'
+
+/**
+ * The scroll offset after one navigation key, or undefined to follow the tail.
+ *
+ * Scrolling is clamped to the body: a body that already fits cannot be scrolled
+ * at all, so ↑ on a short output is inert rather than pausing an empty window.
+ * Reaching the bottom by any route resumes following, so the tail picks up
+ * again without a dedicated key.
+ */
+export function scrollBackgroundOutput(
+  viewport: BackgroundOutputViewport,
+  key: OutputScrollKey,
+): number | undefined {
+  const maxStart = Math.max(0, viewport.body.length - viewport.height)
+  if (maxStart === 0) return undefined
+  const page = Math.max(1, viewport.height - 1)
+  let next: number
+  switch (key) {
+    case 'home':
+    case 'command':
+      next = 0
+      break
+    case 'end':
+      return undefined
+    case 'up':
+      next = viewport.start - 1
+      break
+    case 'down':
+      next = viewport.start + 1
+      break
+    case 'page-up':
+      next = viewport.start - page
+      break
+    case 'page-down':
+      next = viewport.start + page
+      break
+  }
+  const clamped = Math.max(0, Math.min(maxStart, next))
+  return clamped >= maxStart ? undefined : clamped
+}
+
+/**
+ * One line describing where the window sits. Always present (possibly empty)
+ * so the overlay keeps a constant height whether or not the view is paused.
+ */
+export function formatOutputPosition(viewport: BackgroundOutputViewport): string {
+  const total = viewport.body.length
+  if (!viewport.following) {
+    return `Paused · ${viewport.start + 1}–${viewport.end} of ${total} · ↓ or End to follow latest`
+  }
+  if (viewport.start > 0) {
+    return `Following latest · ${viewport.start} earlier ${viewport.start === 1 ? 'line' : 'lines'} · ↑ to scroll back`
+  }
+  return ''
 }
 
 /** Replace status and tail while preserving the open output view. */
@@ -347,8 +442,18 @@ export function refreshBackgroundOutputState(
   process: BackgroundProcess,
   output: string,
 ): SelectorState {
-  const next = createBackgroundOutputState(process, output)
-  return { ...next, query: state.query }
+  const next = createBackgroundOutputState(process, output, state.outputView?.returnToPrompt)
+  // Freeze the captured body while reading older output. A moving file tail
+  // must not move the user's reading position (even when lines repeat).
+  if (state.outputView?.scrollOffset !== undefined) {
+    const previous = state.items[0]?.preview ?? []
+    const preview = next.items[0]?.preview
+    if (preview && previous.includes('')) {
+      const frozenBody = previous.slice(previous.indexOf('') + 1)
+      preview.splice(preview.indexOf('') + 1, Infinity, ...frozenBody)
+    }
+  }
+  return { ...next, query: state.query, outputView: state.outputView }
 }
 
 /** Transcript-compatible formatting shared by the live output renderer. */

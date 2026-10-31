@@ -75,6 +75,33 @@ pub fn resolve_model_config(
     max_tokens: Option<u32>,
     supports_image: Option<bool>,
 ) -> evot_engine::provider::ModelConfig {
+    resolve_model_config_with_capabilities(
+        protocol,
+        provider,
+        model,
+        base_url,
+        compat_caps,
+        route_capabilities,
+        context_window,
+        max_tokens,
+        supports_image,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_model_config_with_capabilities(
+    protocol: Protocol,
+    provider: &str,
+    model: &str,
+    base_url: Option<&str>,
+    compat_caps: CompatCaps,
+    route_capabilities: RouteCapabilityOverrides,
+    context_window: Option<u32>,
+    max_tokens: Option<u32>,
+    supports_image: Option<bool>,
+    capabilities: Option<&CloudModelCapabilities>,
+) -> evot_engine::provider::ModelConfig {
     use evot_engine::provider::default_base_url;
     use evot_engine::provider::ApiProtocol;
     use evot_engine::provider::ModelOverrides;
@@ -101,21 +128,25 @@ pub fn resolve_model_config(
     let route_capabilities =
         RouteCapabilities::for_route(api, provider, &resolved_base, route_capabilities);
 
-    evot_engine::provider::ModelConfig::resolve(ResolveModelRequest {
-        protocol: api,
-        provider: provider.to_string(),
-        model_id: model.to_string(),
-        base_url: resolved_base,
-        headers: Default::default(),
-        compat,
-        route_capabilities,
-        overrides: ModelOverrides {
-            context_window,
-            max_output_tokens: max_tokens,
-            supports_image,
-            reasoning: None,
+    evot_engine::provider::ModelConfig::resolve_with_profile(
+        ResolveModelRequest {
+            protocol: api,
+            provider: provider.to_string(),
+            model_id: model.to_string(),
+            base_url: resolved_base,
+            headers: Default::default(),
+            compat,
+            route_capabilities,
+            overrides: ModelOverrides {
+                context_window,
+                max_output_tokens: max_tokens
+                    .or_else(|| capabilities.and_then(|c| c.max_output_tokens)),
+                supports_image,
+                reasoning: None,
+            },
         },
-    })
+        capabilities.map(|c| c.profile.as_str()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -224,13 +255,52 @@ pub struct Config {
     pub skills_dirs: Vec<PathBuf>,
     /// The env file path actually used during config loading.
     pub env_file_path: PathBuf,
+    /// Revision captured during load/save; not part of any published format.
+    pub(crate) env_revision: Option<super::env_transaction::EnvRevision>,
     /// Server-pushed thinking defaults, keyed by cloud model id.
     pub cloud_thinking_levels: HashMap<String, ThinkingLevel>,
     /// Catalog tier per cloud model id (`base` / `special`).
     pub cloud_model_tiers: HashMap<String, String>,
+    /// Server-pushed context window per cloud model id. A profile's own
+    /// `_CONTEXT_WINDOW` wins over it; the engine's per-model default is the
+    /// fallback when neither is set.
+    pub cloud_context_windows: HashMap<String, u32>,
+    /// Intrinsic alias capabilities, applied only to server-owned providers.
+    pub cloud_model_capabilities: HashMap<String, CloudModelCapabilities>,
     /// Catalog display rank per cloud model id (higher shows earlier).
     pub cloud_model_sorts: HashMap<String, i64>,
+    /// Wire protocol per cloud model id. A cloud group is named by tier and
+    /// may mix Anthropic and OpenAI models, so the protocol is a property of
+    /// the model, not the group. Missing ids fall back to the group protocol.
+    pub cloud_model_protocols: HashMap<String, Protocol>,
+    /// The account's pinned landing model from the server, if it set one and
+    /// the model is currently served by a cloud provider.
+    pub cloud_default_model: Option<String>,
     pub cloud_providers: HashSet<String>,
+    /// The judge model the server published, if any: answers typed questions
+    /// about the conversation and drives lossless context pruning. Never a
+    /// chat provider; never in the picker.
+    pub judge: Option<JudgeEndpoint>,
+}
+
+/// Server-owned alias metadata, separate from user provider overrides.
+#[derive(Debug, Clone, Default)]
+pub struct CloudModelCapabilities {
+    pub profile: String,
+    pub max_output_tokens: Option<u32>,
+}
+
+/// Where a judge model lives. It rides on the cloud gateway like any other
+/// model, so the same key and protocol apply; only its use differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeEndpoint {
+    pub provider: String,
+    pub protocol: Protocol,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    /// Context window the server published for the judge model, if any.
+    pub context_window: Option<u32>,
 }
 
 impl Config {
@@ -245,10 +315,16 @@ impl Config {
             sandbox: SandboxConfig::default(),
             skills_dirs: Vec::new(),
             env_file_path: PathBuf::new(),
+            env_revision: None,
             cloud_thinking_levels: HashMap::new(),
             cloud_model_tiers: HashMap::new(),
+            cloud_context_windows: HashMap::new(),
+            cloud_model_capabilities: HashMap::new(),
             cloud_model_sorts: HashMap::new(),
+            cloud_model_protocols: HashMap::new(),
+            cloud_default_model: None,
             cloud_providers: HashSet::new(),
+            judge: None,
         }
     }
 
@@ -267,6 +343,24 @@ impl Config {
         }
         let profile = self.providers.get(&self.llm.provider)?;
         Some((self.llm.provider.clone(), profile.model().to_string()))
+    }
+
+    /// Find another provider that explicitly lists `model` and can serve it.
+    ///
+    /// Used when a model moved between catalog groups (e.g. a free model
+    /// promoted to a premium tier): the user's pick should follow the model,
+    /// not fall back to the catalog default. Only explicit listings count, so
+    /// a BYOK provider that accepts arbitrary ids is never chosen by accident.
+    pub fn provider_listing_model(&self, model: &str, exclude: &str) -> Option<String> {
+        if model.is_empty() {
+            return None;
+        }
+        self.providers
+            .iter()
+            .filter(|(name, _)| name.as_str() != exclude)
+            .filter(|(_, profile)| !profile.api_key.trim().is_empty())
+            .find(|(_, profile)| profile.models.iter().any(|m| m == model))
+            .map(|(name, _)| name.clone())
     }
 
     /// Whether this config can still serve a given (provider, model) pair.
@@ -318,16 +412,26 @@ impl Config {
             ))
         })?;
         let model = model_override.unwrap_or_else(|| profile.model().to_string());
-        let model_config = resolve_model_config(
-            profile.protocol.clone(),
+        let protocol = self.protocol_for(provider_name, profile, &model);
+        let compat_caps = self.compat_caps_for(provider_name, profile, &protocol);
+        let cloud_capabilities = self
+            .cloud_providers
+            .contains(provider_name)
+            .then(|| self.cloud_model_capabilities.get(&model))
+            .flatten();
+        let model_config = resolve_model_config_with_capabilities(
+            protocol.clone(),
             provider_name,
             &model,
             Some(&profile.base_url),
-            profile.compat_caps,
+            compat_caps,
             profile.route_capabilities,
-            profile.context_window,
+            profile
+                .context_window
+                .or_else(|| self.cloud_context_windows.get(&model).copied()),
             profile.max_tokens,
             profile.supports_image,
+            cloud_capabilities,
         );
         let requested_level = profile
             .thinking_level
@@ -338,13 +442,46 @@ impl Config {
 
         Ok(LlmConfig {
             provider: provider_name.to_string(),
-            protocol: profile.protocol.clone(),
+            protocol,
             api_key: profile.api_key.clone(),
             base_url: profile.base_url.clone(),
             model,
             thinking_level,
             model_config,
         })
+    }
+
+    /// The wire protocol `model` speaks under `provider`.
+    ///
+    /// A cloud group is one tier and may carry both Anthropic and OpenAI
+    /// models, so the catalog's per-model protocol decides. A BYOK profile
+    /// speaks exactly the protocol it was configured with.
+    pub fn protocol_for(&self, provider: &str, profile: &ProviderProfile, model: &str) -> Protocol {
+        if self.cloud_providers.contains(provider) {
+            if let Some(protocol) = self.cloud_model_protocols.get(model) {
+                return protocol.clone();
+            }
+        }
+        profile.protocol.clone()
+    }
+
+    /// Transport quirks for one route.
+    ///
+    /// Cloud groups are named by the server, so they never match the
+    /// first-party `openai` / `grok` transport profiles. The gateway forwards
+    /// `reasoning_effort` for OpenAI-protocol models; without this cap the
+    /// footer and Shift+Tab would treat such a model as having no selectable
+    /// effort.
+    fn compat_caps_for(
+        &self,
+        provider: &str,
+        profile: &ProviderProfile,
+        protocol: &Protocol,
+    ) -> CompatCaps {
+        if self.cloud_providers.contains(provider) && *protocol == Protocol::OpenAi {
+            return profile.compat_caps | CompatCaps::REASONING_EFFORT;
+        }
+        profile.compat_caps
     }
 
     /// Sort key for one cloud model; the highest key is the default.
@@ -365,9 +502,23 @@ impl Config {
     }
 
     /// Landing (provider, model) for a fresh cloud session: the catalog's
-    /// top-ranked model. The server owns the outcome through tier and
-    /// `sort_order`, so there is no separate default model.
+    /// top-ranked model. The account's server-side pin wins when a cloud
+    /// provider still serves it; otherwise the server owns the outcome through
+    /// tier and `sort_order`.
     pub fn preferred_new_session_llm(&self) -> Option<(String, String)> {
+        if let Some(pinned) = self.cloud_default_model.as_deref() {
+            let served = self
+                .providers
+                .iter()
+                .find(|(name, profile)| {
+                    self.cloud_providers.contains(*name)
+                        && profile.models.iter().any(|m| m == pinned)
+                })
+                .map(|(name, _)| (name.clone(), pinned.to_string()));
+            if served.is_some() {
+                return served;
+            }
+        }
         self.providers
             .iter()
             .enumerate()
@@ -394,6 +545,12 @@ impl Config {
     /// - `"deepseek-chat"` — find first provider whose model matches
     /// - `"tencent/hy3:free"` — exact model ids win even when they contain `:`
     /// - `"openrouter:google/gemini-2.5-pro"` — exact provider + model override
+    ///
+    /// A `provider:model` whose provider is no longer configured still resolves
+    /// when exactly that model id is listed elsewhere: the cloud catalog
+    /// regroups its providers under new names between refreshes, and a picker
+    /// opened moments earlier hands back the old spec. A typo in the provider
+    /// of a model nobody lists remains an error.
     pub fn resolve_model_spec(&self, spec: &str) -> Result<(String, Option<String>)> {
         let found = self
             .providers
@@ -411,6 +568,10 @@ impl Config {
                 )));
             }
             if !self.providers.contains_key(provider) {
+                if let Some(listing) = self.provider_listing_model(model, provider) {
+                    tracing::info!(%spec, provider = %listing, "model spec provider regrouped");
+                    return Ok((listing, Some(model.to_string())));
+                }
                 return Err(EvotError::Conf(format!(
                     "provider '{}' not found, available: {}",
                     provider,
@@ -444,6 +605,35 @@ impl Config {
         self.llm.provider = provider;
         self.llm.model_override = model_override;
         Ok(self)
+    }
+
+    /// Apply a `--model` override without letting a stale spec block startup.
+    ///
+    /// A model that was removed from the catalog (or a typo) must not lock the
+    /// user out of the surface where the selection can be repaired (`/login`,
+    /// the model picker). When the spec does not resolve, the configured
+    /// selection is kept and the reason is returned so the caller can surface
+    /// it; the configuration itself is left untouched.
+    pub fn with_model_or_fallback(mut self, model: Option<String>) -> (Self, Option<String>) {
+        let Some(value) = model else {
+            return (self, None);
+        };
+        match self.resolve_model_spec(&value) {
+            Ok((provider, model_override)) => {
+                self.llm.provider = provider;
+                self.llm.model_override = model_override;
+                (self, None)
+            }
+            Err(error) => {
+                let fallback = match self.active_selection() {
+                    Some((_, model)) if !model.is_empty() => format!("'{model}'"),
+                    _ => "the configured model".to_string(),
+                };
+                let warning = format!("--model '{value}' ignored ({error}); using {fallback}");
+                tracing::warn!(spec = %value, %error, "model override ignored");
+                (self, Some(warning))
+            }
+        }
     }
 
     pub fn load() -> Result<Self> {

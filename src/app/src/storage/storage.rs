@@ -2,6 +2,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::search::SessionWithText;
+use crate::types::CloudSync;
 use crate::types::ListSessions;
 use crate::types::ListTranscriptEntries;
 use crate::types::SessionMeta;
@@ -11,9 +12,31 @@ use crate::types::VariableRecord;
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn save_session(&self, session: SessionMeta) -> Result<()>;
+    /// Update only the user-owned name, preserving activity and automatic title.
+    async fn rename_session(&self, session_id: &str, title: &str) -> Result<SessionMeta> {
+        let _ = (session_id, title);
+        Err(crate::error::EvotError::Store(
+            "session rename is not supported by this backend".into(),
+        ))
+    }
+    /// Replace only the cloud sync block, preserving activity and titles.
+    async fn set_session_cloud(
+        &self,
+        session_id: &str,
+        cloud: Option<CloudSync>,
+    ) -> Result<SessionMeta> {
+        let _ = (session_id, cloud);
+        Err(crate::error::EvotError::Store(
+            "cloud sync is not supported by this backend".into(),
+        ))
+    }
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionMeta>>;
     async fn list_sessions(&self, params: ListSessions) -> Result<Vec<SessionMeta>>;
     async fn list_sessions_with_text(&self, limit: usize) -> Result<Vec<SessionWithText>>;
+    /// One session's searchable and displayable text, or `None` when the
+    /// session is gone. The resume pane loads the focused row this way rather
+    /// than paying for every transcript in the catalog.
+    async fn session_with_text(&self, session_id: &str) -> Result<Option<SessionWithText>>;
     /// Whether a session has any persisted transcript activity. Empty drafts
     /// have metadata only and must not consume slots in user-facing listings.
     async fn session_has_entries(&self, session_id: &str) -> Result<bool> {
@@ -77,9 +100,4 @@ pub trait Storage: Send + Sync {
     /// Remove one variable, merging with whatever is on disk. Returns whether
     /// the key existed and the resulting set.
     async fn remove_variable(&self, key: String) -> Result<(bool, Vec<VariableRecord>)>;
-
-    /// Session ids the user pinned as favorites in the dashboard. Stored
-    /// independently of session metadata so toggling never rewrites a session.
-    async fn load_favorites(&self) -> Result<Vec<String>>;
-    async fn save_favorites(&self, ids: Vec<String>) -> Result<()>;
 }

@@ -3,16 +3,16 @@
 
 use std::sync::Arc;
 
-use evot::agent::session::Session;
 use evot::agent::Agent;
 use evot::agent::QueryRequest;
 use evot::agent::RunEventPayload;
-use evot::agent::SelectionReload;
 use evot::agent::SubmitOutcome;
 use evot::conf::Config;
 use evot::conf::Protocol;
 use evot::conf::ProviderProfile;
 use evot::conf::StorageConfig;
+use evot::models::SelectionReload;
+use evot::sessions::Session;
 use evot::storage::open_storage;
 use evot::storage::MemoryStorage;
 use evot_engine::provider::CompatCaps;
@@ -250,6 +250,43 @@ fn model_switch_preserves_or_clamps_thinking_and_fails_fast() -> TestResult {
 }
 
 #[test]
+fn select_by_spec_follows_model_after_provider_regroup() -> TestResult {
+    // A /model picker built against `evot-pro-openai:gpt-6.1-sol` hands that
+    // spec back after the catalog merged the group into `evot-pro`. The exact
+    // model id is what the user chose, so it must land there, while a
+    // qualified spec whose model nobody lists still fails.
+    let dir = TempDir::new()?;
+    let mut config = Config::new(dir.path().to_path_buf());
+    config.providers.insert("evot-pro".into(), ProviderProfile {
+        protocol: Protocol::OpenAi,
+        api_key: "evot.scoped.key".into(),
+        base_url: "https://auto.evot.ai/v1/llm".into(),
+        models: vec!["gpt-6.1-sol".into(), "claude-opus-4-6".into()],
+        compat_caps: CompatCaps::default(),
+        route_capabilities: Default::default(),
+        thinking_level: None,
+        context_window: None,
+        max_tokens: None,
+        supports_image: None,
+    });
+    config.cloud_providers.insert("evot-pro".into());
+    config.llm.provider = "evot-pro".into();
+    config.llm.model_override = Some("claude-opus-4-6".into());
+
+    let agent = Agent::new(&config, "/work")?;
+    assert_eq!(agent.llm().model, "claude-opus-4-6");
+    agent.set_model_by_spec(&config, "evot-pro-openai:gpt-6.1-sol")?;
+    assert_eq!(agent.llm().provider, "evot-pro");
+    assert_eq!(agent.llm().model, "gpt-6.1-sol");
+
+    assert!(agent
+        .set_model_by_spec(&config, "evot-pro-openai:gpt-6.1-nowhere")
+        .is_err());
+    assert_eq!(agent.llm().model, "gpt-6.1-sol");
+    Ok(())
+}
+
+#[test]
 fn cloud_catalog_thinking_level_wins_on_model_switch() -> TestResult {
     let dir = TempDir::new()?;
     let mut config = anthropic_config(&dir);
@@ -462,6 +499,97 @@ fn reload_selection_drops_cloud_models_the_catalog_retired() -> TestResult {
     Ok(())
 }
 
+fn cloud_profile(models: &[&str]) -> ProviderProfile {
+    ProviderProfile {
+        protocol: Protocol::Anthropic,
+        api_key: "evot.scoped.token".into(),
+        base_url: "https://auto.evot.ai/v1/llm".into(),
+        models: models.iter().map(|m| (*m).to_string()).collect(),
+        compat_caps: Default::default(),
+        route_capabilities: Default::default(),
+        thinking_level: None,
+        context_window: None,
+        max_tokens: None,
+        supports_image: None,
+    }
+}
+
+/// The user picks a model id, not a catalog group. When the server moves that
+/// id from the free group to a premium group the account can use, a reload
+/// must follow the id there instead of jumping to the premium default.
+#[test]
+fn reload_selection_follows_model_id_moved_between_cloud_groups() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut config = Config::new(dir.path().to_path_buf());
+    config.providers.insert(
+        "evot-free".into(),
+        cloud_profile(&["stealth/union-alpha", "kimi-k3"]),
+    );
+    config.providers.insert(
+        "evot-pro-anthropic".into(),
+        cloud_profile(&["gpt-5.6-sol", "claude-fable-5.1"]),
+    );
+    config.cloud_providers.insert("evot-free".into());
+    config.cloud_providers.insert("evot-pro-anthropic".into());
+    config.cloud_model_sorts.insert("gpt-5.6-sol".into(), 100);
+    config.llm.provider = "evot-pro-anthropic".into();
+
+    let agent = Agent::new(&config, "/work")?;
+    assert_eq!(agent.llm().model, "gpt-5.6-sol");
+    agent.set_model_by_spec(&config, "kimi-k3")?;
+    agent.set_thinking_level(ThinkingLevel::High);
+    assert_eq!(agent.llm().provider, "evot-free");
+
+    // Catalog sync: kimi-k3 leaves the free group and lands in the premium one.
+    let mut moved = config.clone();
+    if let Some(profile) = moved.providers.get_mut("evot-free") {
+        profile.models = vec!["stealth/union-alpha".into()];
+    }
+    if let Some(profile) = moved.providers.get_mut("evot-pro-anthropic") {
+        profile.models.push("kimi-k3".into());
+    }
+    assert_eq!(agent.reload_selection(&moved), SelectionReload::Followed);
+    assert_eq!(agent.llm().provider, "evot-pro-anthropic");
+    assert_eq!(agent.llm().model, "kimi-k3");
+    assert_eq!(agent.llm().thinking_level, ThinkingLevel::High);
+
+    // The next sync repeats the same catalog: nothing moves again.
+    assert_eq!(agent.reload_selection(&moved), SelectionReload::Kept);
+    assert_eq!(agent.llm().provider, "evot-pro-anthropic");
+
+    // Only a real retirement of the id falls back to the ranked default.
+    let mut retired = moved.clone();
+    if let Some(profile) = retired.providers.get_mut("evot-pro-anthropic") {
+        profile.models.retain(|m| m != "kimi-k3");
+    }
+    assert_eq!(agent.reload_selection(&retired), SelectionReload::Switched);
+    assert_eq!(agent.llm().model, "gpt-5.6-sol");
+    Ok(())
+}
+
+/// A BYOK provider accepts arbitrary model ids, so it must not "capture" a
+/// retired cloud id merely because it is configured with a key.
+#[test]
+fn reload_selection_does_not_follow_into_byok_without_explicit_listing() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut config = anthropic_config(&dir);
+    config
+        .providers
+        .insert("evot-free".into(), cloud_profile(&["kimi-k3"]));
+    config.cloud_providers.insert("evot-free".into());
+    let agent = Agent::new(&config, "/work")?;
+    agent.set_model_by_spec(&config, "kimi-k3")?;
+    assert_eq!(agent.llm().provider, "evot-free");
+
+    let mut retired = config.clone();
+    if let Some(profile) = retired.providers.get_mut("evot-free") {
+        profile.models.clear();
+    }
+    assert_eq!(agent.reload_selection(&retired), SelectionReload::Switched);
+    assert_ne!(agent.llm().model, "kimi-k3");
+    Ok(())
+}
+
 #[test]
 fn explicit_thinking_restore_api_remains_supported() -> TestResult {
     let dir = TempDir::new()?;
@@ -515,11 +643,12 @@ async fn pinned_request_model_survives_live_model_changes() -> TestResult {
         .ok_or("missing anthropic profile")?;
     profile.models = vec!["claude-opus-4-6".into(), "claude-sonnet-4-6".into()];
 
-    let pinned = config.build_llm("anthropic", Some("claude-opus-4-6".into()))?;
-    let live = config.build_llm("anthropic", Some("claude-sonnet-4-6".into()))?;
     let storage = Arc::new(MemoryStorage::new());
     let agent =
         Agent::new_with_provider_for_test(&config, "/work", storage, MockProvider::text("ok"))?;
+    let pinned =
+        agent.select_configured_model(&config, "anthropic", "claude-opus-4-6", Some("max"))?;
+    let live = config.build_llm("anthropic", Some("claude-sonnet-4-6".into()))?;
 
     // Simulate another Chat request changing the live default after this
     // request captured its selection but before submit starts its run.
@@ -542,11 +671,17 @@ async fn pinned_request_model_survives_live_model_changes() -> TestResult {
 
     assert_eq!(started_model.as_deref(), Some("claude-opus-4-6"));
     let meta = agent
-        .find_session(&session_id)
+        .sessions()
+        .find(&session_id)
         .await?
         .ok_or("pinned run did not persist its session")?;
     assert_eq!(meta.provider, "anthropic");
     assert_eq!(meta.model, "claude-opus-4-6");
+    assert_eq!(meta.thinking_level.as_deref(), Some("max"));
+    let transcript = agent.sessions().transcript(&session_id).await?;
+    assert!(transcript.iter().any(|item| matches!(item,
+        evot::types::TranscriptItem::Stats { kind, data }
+            if kind == "llm_call_started" && data["thinking_level"] == "max")));
     // The live selection remains available as the next request's default.
     assert_eq!(agent.llm().model, "claude-sonnet-4-6");
     Ok(())

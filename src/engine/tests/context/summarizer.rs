@@ -1,5 +1,15 @@
 //! Tests for the summarizer subsystem.
 
+#[test]
+fn summary_preserves_background_context_without_attributing_events_to_the_user() {
+    let system = evotengine::context::compaction::summarizer::prompt::SYSTEM_PROMPT;
+    assert!(system.contains("Distinguish user requests from automated <task-notification> events"));
+    assert!(system.contains("both use the user role"));
+    assert!(system.contains("background-task IDs, descriptions, status"));
+    assert!(system.contains("output locations alongside pending work"));
+    assert!(system.contains("Preserve the user's language preferences"));
+}
+
 use std::sync::Arc;
 
 use evotengine::context::compaction::emergency;
@@ -25,6 +35,7 @@ use super::fixtures::recording_provider::Reply;
 
 fn user_msg(text: &str) -> AgentMessage {
     AgentMessage::Llm(Message::User {
+        provenance: None,
         content: vec![Content::Text {
             text: text.to_string(),
         }],
@@ -531,7 +542,7 @@ async fn llm_summarize_initial_uses_initial_prompt() {
     assert!(prompt.contains("<conversation>"));
     assert!(prompt.contains("fix the bug"));
     // Initial prompt asks for the structured checkpoint, not an update.
-    assert!(prompt.contains("structured context"));
+    assert!(prompt.contains("context checkpoint"));
     assert!(!prompt.contains("<previous-summary>"));
 }
 
@@ -695,4 +706,19 @@ async fn llm_summarize_propagates_cancellation() {
     let (result, _captured) =
         summarize_capturing(base_input("[User]: hi"), 4096, vec![Reply::Cancel]).await;
     assert!(matches!(result, Err(SummarizerError::Cancelled)));
+}
+
+#[test]
+fn summary_prompts_ask_for_a_short_merged_handoff() {
+    let initial = prompt::format_initial("[User]: hi", None);
+    let update = prompt::format_update("[User]: more", "## Goal\nOld", None, false);
+    for text in [&initial, &update] {
+        assert!(text.contains("## Goal"));
+        assert!(text.contains("## Next Steps"));
+        assert!(text.contains("under 600 words"));
+        assert!(text.contains("Never narrate turn by turn"));
+        assert!(!text.contains("Play-by-Play"));
+    }
+    assert!(update.contains("merging rather than appending"));
+    assert!(update.contains("must not grow with each update"));
 }

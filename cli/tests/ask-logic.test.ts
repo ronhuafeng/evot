@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll } from 'bun:test'
+import { CURSOR_MARKER } from '../src/term/render-frame.js'
 import {
   createAskState,
   askUp,
@@ -17,8 +18,9 @@ import {
   askPasteText,
   handleAskKeyEvent,
 } from '../src/term/ask.js'
-import { askStateToResponse } from '../src/term/app/ask-user.js'
-import { buildOverlayBlocks, buildAskRegionLines } from '../src/term/viewmodel/overlays.js'
+import { askStateToResponse, prefixedAskLines } from '../src/term/app/ask-user.js'
+import { buildOverlayBlocks } from '../src/term/viewmodel/overlays.js'
+import { buildAskRegionLines } from '../src/term/viewmodel/ask.js'
 import { blocksToLines } from '../src/term/viewmodel/types.js'
 import stripAnsi from 'strip-ansi'
 import chalk from 'chalk'
@@ -35,6 +37,19 @@ const singleQuestion = [
     ],
   },
 ]
+
+test('host setup prompts keep transient ownership through navigation and submission', () => {
+  const initial = { ...createAskState(singleQuestion), transient: true }
+  const moved = handleAskKeyEvent(initial, 'down')
+  expect(moved.action).toBe('update')
+  if (moved.action !== 'update') throw new Error('expected updated state')
+  expect(moved.state.transient).toBe(true)
+  const submitted = handleAskKeyEvent(moved.state, 'enter')
+  expect(submitted.action).toBe('submit')
+  if (submitted.action !== 'submit') throw new Error('expected submitted state')
+  expect(submitted.state.transient).toBe(true)
+  expect(createAskState(singleQuestion).transient).toBeUndefined()
+})
 
 const multiQuestion = [
   {
@@ -58,8 +73,20 @@ const multiQuestion = [
 
 function renderAskVM(state: ReturnType<typeof createAskState>): string {
   const lines = blocksToLines(buildOverlayBlocks({ kind: 'ask-user', state }, 80))
-  return lines.map(l => stripAnsi(l)).join('\n')
+  return lines.map(l => stripAnsi(l).replaceAll(CURSOR_MARKER, '')).join('\n')
 }
+
+describe('question text', () => {
+  test('a pre-painted line (a diff) passes through instead of being re-bolded', () => {
+    const painted = '\x1b[31m-old\x1b[39m'
+    const state = createAskState([{ header: 'Task', question: `Apply?\n${painted}`, options: [{ label: 'Confirm' }] }])
+    const raw = blocksToLines(buildOverlayBlocks({ kind: 'ask-user', state }, 80)).join('\n')
+    expect(raw).toContain(painted)
+    // The plain first line is still bold; the painted one is not wrapped in bold.
+    expect(raw).toMatch(/\x1b\[1m[^\n]*Apply\?/)
+    expect(raw).not.toMatch(/\x1b\[1m[^\n]*-old/)
+  })
+})
 
 describe('createAskState', () => {
   test('creates initial state', () => {
@@ -379,7 +406,7 @@ describe('renderAsk via viewmodel', () => {
 
   test('shows focus indicator', () => {
     const state = createAskState(singleQuestion)
-    expect(renderAskVM(state)).toContain('❯')
+    expect(renderAskVM(state)).toContain('·')
   })
 
   test('multi question shows tab bar', () => {
@@ -414,7 +441,7 @@ describe('renderAsk via viewmodel', () => {
     state = askDown(state)
     state = askDown(state)
     const text = renderAskVM(state)
-    expect(text).toContain('3.  Type something.')
+    expect(text).toContain('3. Type something.')
   })
 
   test('submit review warns when questions are unanswered', () => {
@@ -440,6 +467,24 @@ describe('renderAsk via viewmodel', () => {
     expect(text).not.toContain('• Which style?')
   })
 
+  test('multiline questions use hanging indentation in review and committed history', () => {
+    const question = 'Run “Daily report” now?\nResult: feishu · p2p:*'
+    expect(prefixedAskLines(question, '  • ')).toEqual([
+      '  • Run “Daily report” now?',
+      '    Result: feishu · p2p:*',
+    ])
+
+    let state = createAskState([{
+      header: 'Run task',
+      question,
+      options: [{ label: 'Run now', description: '' }, { label: 'Cancel', description: '' }],
+    }])
+    state = { ...state, onSubmitTab: true, answers: [{ questionIndex: 0, selectedOption: 0, customText: null }] }
+    const lines = blocksToLines(buildOverlayBlocks({ kind: 'ask-user', state }, 80)).map(stripAnsi)
+    expect(lines).toContain('  • Run “Daily report” now?')
+    expect(lines).toContain('    Result: feishu · p2p:*')
+  })
+
   test('renders ask_user as a full-width editor replacement rather than a centered modal', () => {
     const state = createAskState(singleQuestion)
     const lines = buildAskRegionLines(state, 40).map(line => stripAnsi(line))
@@ -458,13 +503,13 @@ describe('renderAsk via viewmodel', () => {
     const blocks = buildOverlayBlocks({ kind: 'ask-user', state }, 80)
     const otherLine = blocks.flatMap(b => b.lines).find(l => l.spans.some(s => s.text.includes('Type something.')))
     const spans = otherLine?.spans ?? []
-    const cursorIndex = spans.findIndex(span => span.text === ' ' && span.inverse === true)
+    const cursorIndex = spans.findIndex(span => span.text === CURSOR_MARKER)
     const placeholderIndex = spans.findIndex(span => span.text === 'Type something.')
 
     expect(cursorIndex).toBeGreaterThan(-1)
     expect(placeholderIndex).toBeGreaterThan(-1)
     expect(cursorIndex).toBeLessThan(placeholderIndex)
-    expect(spans.map(span => span.text).join('')).toContain('3.  Type something.')
+    expect(spans.map(span => span.text).join('')).toContain(`3. ${CURSOR_MARKER}Type something.`)
   })
 
   test('selected other shows label, green checkmark, and custom text', () => {
@@ -495,6 +540,24 @@ describe('renderAsk via viewmodel', () => {
 })
 
 describe('Other field cursor movement', () => {
+  test('native cursor movement and deletion preserve complete Unicode graphemes', () => {
+    for (const grapheme of ['好', '👩🏽‍💻', 'e\u0301']) {
+      let state = askDown(askDown(createAskState(singleQuestion)))
+      state = askTypeChar(state, `a${grapheme}b`)
+      state = askCursorLeft(state)
+      expect(state.uiStates.get(0)?.otherCursor).toBe(1 + grapheme.length)
+      state = askCursorLeft(state)
+      expect(state.uiStates.get(0)?.otherCursor).toBe(1)
+      expect(blocksToLines(buildOverlayBlocks({ kind: 'ask-user', state }, 80)).join(''))
+        .toContain(`a${CURSOR_MARKER}${grapheme}b`)
+      expect(askDelete(state).uiStates.get(0)?.otherText).toBe('ab')
+      state = askCursorRight(state)
+      expect(state.uiStates.get(0)?.otherCursor).toBe(1 + grapheme.length)
+      state = askBackspace(state)
+      expect(state.uiStates.get(0)?.otherText).toBe('ab')
+      expect(state.uiStates.get(0)?.otherCursor).toBe(1)
+    }
+  })
   test('left/right moves cursor within Other text', () => {
     let state = createAskState(singleQuestion)
     // Navigate to Other (last option)
@@ -703,5 +766,61 @@ describe('askStateToResponse', () => {
       { header: 'Language', question: 'Which language?', answer: 'Rust' },
       { header: 'Style', question: 'Which style?', answer: 'Skipped' },
     ])
+  })
+})
+
+describe('free-text question (no options)', () => {
+  const freeText = [
+    { header: 'Instruction', question: 'What should the task do differently?', options: [] },
+  ]
+
+  test('opens directly in text mode and renders a single input row', () => {
+    const state = createAskState(freeText)
+    const text = renderAskVM(state)
+    expect(text).toContain('What should the task do differently?')
+    expect(text).toContain('Type your answer.')
+    expect(text).not.toContain('1.')
+    expect(text).toContain('enter submit · esc cancel')
+    expect(text).not.toContain('↑↓ navigate')
+  })
+
+  test('typed characters go straight into the answer', () => {
+    let state = createAskState(freeText)
+    for (const ch of 'no status') {
+      const r = handleAskKeyEvent(state, 'char', ch)
+      if (r.action === 'update') state = r.state
+    }
+    expect(renderAskVM(state)).toContain('no status')
+    const r = handleAskKeyEvent(state, 'enter')
+    expect(r.action).toBe('submit')
+    if (r.action === 'submit') {
+      expect(askStateToResponse(r.state)).toEqual([
+        { header: 'Instruction', question: 'What should the task do differently?', answer: 'no status' },
+      ])
+    }
+  })
+
+  test('up/down/j/k/page keys stay in text mode and type j/k literally', () => {
+    let state = createAskState(freeText)
+    for (const ev of ['up', 'down', 'page-up', 'page-down'] as const) {
+      const r = handleAskKeyEvent(state, ev)
+      if (r.action === 'update') state = r.state
+    }
+    for (const ch of 'jk') {
+      const r = handleAskKeyEvent(state, 'char', ch)
+      if (r.action === 'update') state = r.state
+    }
+    expect(renderAskVM(state)).toContain('jk')
+  })
+
+  test('enter with empty text does nothing', () => {
+    const state = createAskState(freeText)
+    const r = handleAskKeyEvent(state, 'enter')
+    expect(r.action).toBe('update')
+  })
+
+  test('escape cancels', () => {
+    const state = createAskState(freeText)
+    expect(handleAskKeyEvent(state, 'escape').action).toBe('cancel')
   })
 })

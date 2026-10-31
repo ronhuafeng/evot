@@ -4,191 +4,46 @@
  * parses them into proper TS interfaces.
  */
 
+import { shareCreated, shareList, type ShareNotice } from './contracts/share.js'
+import { cloudPushProgress, cloudPushResult, cloudPullResult, remoteSessions, type CloudPushProgress, type CloudPushResult, type CloudPullResult, type RemoteSession } from './contracts/cloud.js'
+export type { CloudPushProgress, CloudPushResult, CloudPullResult, RemoteSession } from './contracts/cloud.js'
+export type { CloudSync, CloudVisibility } from './contracts/results.js'
+export type { PrivacyAction, PrivacyEvent, PrivacyKind, PrivacyLive, PrivacyLiveNotice, PrivacySettings, PrivacyStatus } from './contracts/privacy.js'
 // @ts-ignore — binding.js is generated
-import { NapiAgent as RawAgent, version as rawVersion, startServer as rawStartServer, startServerBackground as rawStartServerBackground, fastExit as rawFastExit, authBegin as rawAuthBegin, authPoll as rawAuthPoll, authLogout as rawAuthLogout, authSyncModels as rawAuthSyncModels, authSyncNotices as rawAuthSyncNotices, authWhoami as rawAuthWhoami, authRefreshSession as rawAuthRefreshSession, authNotices as rawAuthNotices } from './binding.js'
+import { NapiAgent as RawAgent, version as rawVersion, startServer as rawStartServer, runAcp as rawRunAcp, startServerBackground as rawStartServerBackground, fastExit as rawFastExit, reapExitedChildren as rawReapExitedChildren, authBegin as rawAuthBegin, authPoll as rawAuthPoll, authLogout as rawAuthLogout, authSyncModels as rawAuthSyncModels, authSyncNotices as rawAuthSyncNotices, authWhoami as rawAuthWhoami, authRefreshSession as rawAuthRefreshSession, authNotices as rawAuthNotices, privacyStatus as rawPrivacyStatus, privacySave as rawPrivacySave, privacyLive as rawPrivacyLive, privacySessionTags as rawPrivacySessionTags, taskList as rawTaskList, taskDeliveryDefaults as rawTaskDeliveryDefaults, taskGet as rawTaskGet, taskCreate as rawTaskCreate, taskUpdate as rawTaskUpdate, taskDelete as rawTaskDelete, taskRun as rawTaskRun, taskShare as rawTaskShare, taskShareFetch as rawTaskShareFetch, taskShareId as rawTaskShareId } from './binding.js'
 
-type RawAgentType = any
-type RawRunType = any
-type RawForkedType = any
+import { QueryStream } from './query-stream.js'
+export { QueryStream } from './query-stream.js'
+export type { QueuedPrompt, PromptQueueKind } from './query-stream.js'
+export type { RunEvent, QueryEvent, HostToolEvent } from './contracts/query-event.js'
+import { decodeConfigInfo, type ConfigInfo } from './contracts/config-info.js'
+export type { ConfigInfo, ModelOption, ModelProtocol } from './contracts/config-info.js'
+
+import type { NativeAgent, NativeCompaction, NativeForkedAgent } from './contracts/ports.js'
 
 // ---------------------------------------------------------------------------
 // Event types (mirrors Rust RunEvent / RunEventPayload)
 // ---------------------------------------------------------------------------
 
-export interface RunEvent {
-  event_id: string
-  run_id: string
-  session_id: string
-  turn: number
-  kind: string
-  payload: Record<string, unknown>
-  created_at: string
-}
+import * as results from './contracts/results.js'
+import { decodeResult } from './contracts/results.js'
+import * as privacy from './contracts/privacy.js'
+import type { PrivacyLive, PrivacySettings, PrivacyStatus } from './contracts/privacy.js'
+import type { SessionMeta, SessionWithText, TranscriptItem, VariableInfo, BackgroundProcess, ManualCompactionOutcome, CompactionPhase } from './contracts/results.js'
+export type { SessionMeta, SessionWithText, TranscriptItem, VariableInfo, BackgroundProcess, ManualCompactionOutcome, CompactionPhase } from './contracts/results.js'
 
-export interface SessionMeta {
-  session_id: string
-  title: string
-  model: string
-  /** Provider paired with model; absent on sessions saved before provider-aware selection. */
-  provider?: string
-  thinking_level: string | null
-  cwd: string
-  source: string
-  turns: number
-  created_at: string
-  updated_at: string
-}
+/** Where `reloadSelectionOutcome` left the live model. */
+export type SelectionReloadOutcome = 'kept' | 'followed' | 'switched' | 'unconfigured'
 
-export interface TranscriptItem {
-  [key: string]: unknown
-}
+const SELECTION_RELOAD_OUTCOMES: ReadonlySet<string> = new Set(['kept', 'followed', 'switched', 'unconfigured'])
 
-export interface SessionWithText extends SessionMeta {
-  search_text: string
-  /** Real user turns, oldest first. Compaction boilerplate is excluded. */
-  user_prompts: string[]
-}
-
-export interface VariableInfo {
-  key: string
-  value: string
-  updated_at?: string
-}
-
-export interface BackgroundProcess {
-  task_id: string
-  command: string
-  cwd: string
-  output_path: string
-  /** No `timed_out`: the engine only produces that state where background
-   *  support is absent (headless/readonly), and those runtimes have no process
-   *  manager to list. Everything reaching this type comes from a TUI session,
-   *  where the deadline backgrounds instead of killing. */
-  status: 'running_foreground' | 'running' | 'completed' | 'failed' | 'killed'
-  exit_code: number | null
-  elapsed_ms: number
-  output_file_truncated: boolean
-  stopped_by_user: boolean
+function isSelectionReloadOutcome(value: string): value is SelectionReloadOutcome {
+  return SELECTION_RELOAD_OUTCOMES.has(value)
 }
 
 export type SubmitOutcome =
   | { kind: 'run'; stream: QueryStream }
   | { kind: 'command'; message: string }
-
-export interface QueuedPrompt {
-  id: string
-  version: number
-  message: Record<string, unknown>
-}
-
-export type PromptQueueKind = 'steering' | 'follow_up'
-
-export type ModelProtocol = 'anthropic' | 'openai' | 'openai_responses'
-
-export interface ModelOption {
-  provider: string
-  /** Wire protocol configured for this provider. */
-  protocol?: ModelProtocol
-  model: string
-  /** Provider-qualified value accepted by --model and the model setter. */
-  spec: string
-  /** Heading for this model's group, pushed by the server. Cloud models only. */
-  group_label?: string
-  /** Where this group sits relative to the others. Cloud models only. */
-  group_order?: number
-  /** Catalog rank inside the tier: higher shows earlier. Cloud models only. */
-  sort_order?: number
-  /** Present on evot cloud models; carries server-pushed metadata. */
-  free?: {
-    display_name?: string
-    tagline?: string
-    is_new?: boolean
-    /** `base` (open to everyone) or `special` (granted per account). */
-    tier?: string
-  }
-}
-
-export interface ConfigInfo {
-  provider: string
-  protocol: ModelProtocol
-  envPath: string
-  hasApiKey: boolean
-  baseUrl: string | null
-  availableModels: ModelOption[]
-  thinkingLevel: string
-}
-
-// ---------------------------------------------------------------------------
-// QueryStream — async iterable over RunEvents
-// ---------------------------------------------------------------------------
-
-export class QueryStream {
-  private raw: RawRunType
-
-  constructor(raw: RawRunType) {
-    this.raw = raw
-  }
-
-  get sessionId(): string {
-    return this.raw.sessionId
-  }
-
-  async next(): Promise<RunEvent | null> {
-    const json = await this.raw.next()
-    if (json === null) return null
-    return JSON.parse(json) as RunEvent
-  }
-
-  abort(): void {
-    this.raw.abort()
-  }
-
-  steer(text: string, contentJson?: string): QueuedPrompt {
-    return JSON.parse(this.raw.steer(text, contentJson ?? null)) as QueuedPrompt
-  }
-
-  followUp(text: string, contentJson?: string): QueuedPrompt {
-    return JSON.parse(this.raw.followUp(text, contentJson ?? null)) as QueuedPrompt
-  }
-
-  queuedPrompts(queue: PromptQueueKind): QueuedPrompt[] {
-    return JSON.parse(this.raw.queuedPrompts(queue)) as QueuedPrompt[]
-  }
-
-  updateQueuedPrompt(queue: PromptQueueKind, id: string, version: number, text: string): QueuedPrompt {
-    return JSON.parse(this.raw.updateQueuedPrompt(queue, id, version, text)) as QueuedPrompt
-  }
-
-  removeQueuedPrompt(queue: PromptQueueKind, id: string, version?: number): QueuedPrompt {
-    return JSON.parse(this.raw.removeQueuedPrompt(queue, id, version ?? null)) as QueuedPrompt
-  }
-
-  sendQueuedPromptNow(id: string, version?: number): QueuedPrompt {
-    return JSON.parse(this.raw.sendQueuedPromptNow(id, version ?? null)) as QueuedPrompt
-  }
-
-  moveQueuedPrompt(queue: PromptQueueKind, id: string, version: number, direction: 'up' | 'down'): QueuedPrompt {
-    return JSON.parse(this.raw.moveQueuedPrompt(queue, id, version, direction)) as QueuedPrompt
-  }
-
-  clearQueuedPrompts(queue: PromptQueueKind): void {
-    this.raw.clearQueuedPrompts(queue)
-  }
-
-  /** Respond to a host_tool_call event with a JSON-encoded response.
-   *  Payload shape: { tool_call_id, content, details?, is_error? }. */
-  async respondHostTool(responseJson: string): Promise<void> {
-    await this.raw.respondHostTool(responseJson)
-  }
-
-  /** Async iterator support — `for await (const event of stream)` */
-  async *[Symbol.asyncIterator](): AsyncIterableIterator<RunEvent> {
-    let event: RunEvent | null
-    while ((event = await this.next()) !== null) {
-      yield event
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Content block types for multi-content queries
@@ -215,41 +70,20 @@ export type ContentBlock = TextContentBlock | ImageContentBlock
 // Agent — main entry point
 // ---------------------------------------------------------------------------
 
-export type ManualCompactionOutcome =
-  | {
-      status: 'compacted'
-      summary: string
-      tokens_before: number
-      tokens_after: number
-      messages_before: number
-      messages_after: number
-      context_window: number
-      messages_evicted: number
-      current_run_reclaimed: number
-      compaction_level: number
-      used_fallback: boolean
-      method?: 'remote' | 'local' | 'remote_failed_local'
-      remote_blob_bytes?: number
-      fallback_reason?: string
-    }
-  | { status: 'nothing_to_compact' }
-  | { status: 'cancelled' }
-
-export type CompactionPhase = 'planning' | 'remote' | 'local_fallback' | 'local' | 'complete'
-
 export class CompactionTask {
-  private raw: any
-
-  constructor(raw: any) {
-    this.raw = raw
-  }
+  constructor(private readonly raw: NativeCompaction) {}
 
   get phase(): CompactionPhase {
-    return this.raw.phase as CompactionPhase
+    return results.compactionPhase.read(this.raw.phase, '$.phase')
+  }
+
+  get activity(): results.CompactionActivity | null {
+    const activity = this.raw.activity
+    return activity == null ? null : results.compactionActivity.read(activity, '$.activity')
   }
 
   async result(): Promise<ManualCompactionOutcome> {
-    return JSON.parse(await this.raw.result()) as ManualCompactionOutcome
+    return decodeResult(await this.raw.result(), results.compactionOutcome)
   }
 
   abort(): void {
@@ -257,12 +91,19 @@ export class CompactionTask {
   }
 }
 
-export class Agent {
-  private raw: RawAgentType
-
-  private constructor(raw: RawAgentType) {
-    this.raw = raw
+/**
+ * Decode native progress ticks for a caller's listener. A malformed tick is
+ * dropped: progress is advisory and the final result still arrives.
+ */
+function progressRelay(onProgress?: (progress: CloudPushProgress) => void): ((raw: string) => void) | undefined {
+  if (!onProgress) return undefined
+  return raw => {
+    try { onProgress(decodeResult(raw, cloudPushProgress)) } catch { /* advisory */ }
   }
+}
+
+export class Agent {
+  private constructor(private readonly raw: NativeAgent) {}
 
   static async create(model?: string, envFile?: string): Promise<Agent> {
     const raw = await RawAgent.create(model ?? null, envFile ?? null)
@@ -279,6 +120,11 @@ export class Agent {
 
   get cwd(): string {
     return this.raw.cwd
+  }
+
+  /** Non-fatal startup diagnostic, e.g. a `--model` that no longer resolves. */
+  get startupWarning(): string | null {
+    return this.raw.startupWarning ?? null
   }
 
   async query(prompt: string, sessionId?: string, toolMode?: string, contentJson?: string, hostSpecsJson?: string): Promise<QueryStream> {
@@ -315,32 +161,53 @@ export class Agent {
     return { kind: 'run', stream: new QueryStream(run) }
   }
 
+  /** Best-effort side request: never falls back to this agent's chat model. */
+  suggestNextPrompt(messages: import('./contracts/suggestion.js').SuggestionMessage[], hints?: import('./contracts/suggestion.js').SuggestionHints) {
+    // The bare array is the legacy addon contract; hints need the object shape.
+    const detailed = hints && (hints.explicit || hints.activity || hints.workflow || hints.draft || hints.suffix !== undefined || hints.command || hints.images?.length || hints.rejected?.length)
+    return this.raw.suggestNextPrompt(JSON.stringify(detailed ? { messages, ...hints } : messages))
+  }
+
   async createSession(): Promise<SessionMeta> {
     const json = await this.raw.createSession()
-    return JSON.parse(json) as SessionMeta
+    return decodeResult(json, results.sessionMeta)
   }
 
   async listSessions(limit?: number): Promise<SessionMeta[]> {
     const json = await this.raw.listSessions(limit ?? null)
-    return JSON.parse(json) as SessionMeta[]
+    return decodeResult(json, results.sessions)
+  }
+
+  async renameSession(sessionId: string, title: string): Promise<SessionMeta> {
+    return decodeResult(await this.raw.renameSession(sessionId, title), results.sessionMeta)
   }
 
   async deleteSession(sessionId: string): Promise<boolean> {
     return this.raw.deleteSession(sessionId)
   }
 
+  /** Fork a session into a new persistent one inheriting its context. */
+  async forkSession(sourceId: string, title?: string): Promise<SessionMeta> {
+    return decodeResult(await this.raw.forkSession(sourceId, title ?? null), results.sessionMeta)
+  }
+
+  /** Fork ancestry, root first and `sessionId` last. */
+  async sessionLineage(sessionId: string): Promise<SessionMeta[]> {
+    return decodeResult(await this.raw.sessionLineage(sessionId), results.sessions)
+  }
+
   backgroundProcesses(sessionId: string): BackgroundProcess[] {
-    return JSON.parse(this.raw.backgroundProcesses(sessionId)) as BackgroundProcess[]
+    return decodeResult(this.raw.backgroundProcesses(sessionId), results.backgroundProcesses)
   }
 
   async stopBackgroundProcess(sessionId: string, taskId: string): Promise<BackgroundProcess | null> {
     const json = await this.raw.stopBackgroundProcess(sessionId, taskId)
-    return json ? JSON.parse(json) as BackgroundProcess : null
+    return json ? decodeResult(json, results.backgroundProcess) : null
   }
 
   async stopAllBackgroundProcesses(sessionId: string): Promise<BackgroundProcess[]> {
     const json = await this.raw.stopAllBackgroundProcesses(sessionId)
-    return JSON.parse(json) as BackgroundProcess[]
+    return decodeResult(json, results.backgroundProcesses)
   }
 
   /** Detach every foreground shell so the turn can be reclaimed without
@@ -377,6 +244,10 @@ export class Agent {
     return this.raw.pendingProcessNotifications(sessionId)
   }
 
+  pendingProcessWakeNotifications(sessionId: string): number {
+    return this.raw.pendingProcessWakeNotifications(sessionId)
+  }
+
   /** Kill every background process synchronously. Safe to call before fastExit,
    *  which skips the async teardown that would otherwise stop them. */
   killAllBackgroundProcessesNow(): number {
@@ -385,27 +256,94 @@ export class Agent {
 
   async listSessionsWithText(limit?: number): Promise<SessionWithText[]> {
     const json = await this.raw.listSessionsWithText(limit ?? null)
-    return JSON.parse(json) as SessionWithText[]
+    return decodeResult(json, results.sessionsWithText)
+  }
+
+  /** One session's text, or null when it is gone. */
+  async sessionWithText(sessionId: string): Promise<SessionWithText | null> {
+    const json = await this.raw.sessionWithText(sessionId)
+    return json === null ? null : decodeResult(json, results.sessionWithText)
+  }
+
+  async shareSession(sessionId: string) {
+    return decodeResult(await this.raw.shareSession(sessionId), shareCreated)
+  }
+
+  async listShares() {
+    return decodeResult(await this.raw.listShares(), shareList).shares
+  }
+
+  async deleteShare(id: string): Promise<void> {
+    await this.raw.deleteShare(id)
+  }
+
+  // Cloud session sync: the session itself, kept whole, on the owner's server.
+  /**
+   * `keep` leaves an already-shared session's access unchanged (new ones start
+   * private). `onProgress` fires after each uploaded batch of a long push.
+   */
+  async cloudShareSession(
+    sessionId: string,
+    visibility: 'private' | 'team' | 'public' | 'keep',
+    onProgress?: (progress: CloudPushProgress) => void,
+  ): Promise<CloudPushResult> {
+    const raw = await this.raw.cloudShareSession(sessionId, visibility, progressRelay(onProgress))
+    return decodeResult(raw, cloudPushResult)
+  }
+
+  async cloudPushSession(
+    sessionId: string,
+    force = false,
+    onProgress?: (progress: CloudPushProgress) => void,
+  ): Promise<CloudPushResult> {
+    const raw = await this.raw.cloudPushSession(sessionId, force, progressRelay(onProgress))
+    return decodeResult(raw, cloudPushResult)
+  }
+
+  async cloudUnshareSession(sessionId: string): Promise<void> {
+    await this.raw.cloudUnshareSession(sessionId)
+  }
+
+  /** Empty when signed out; never throws for a missing login. */
+  async cloudListSessions(): Promise<RemoteSession[]> {
+    return decodeResult(await this.raw.cloudListSessions(), remoteSessions)
+  }
+
+  async cloudPullSession(sessionId: string): Promise<CloudPullResult> {
+    return decodeResult(await this.raw.cloudPullSession(sessionId), cloudPullResult)
+  }
+
+  async cloudForkRemoteSession(sessionId: string): Promise<SessionMeta> {
+    return decodeResult(await this.raw.cloudForkRemoteSession(sessionId), results.sessionMeta)
+  }
+
+  /** `/share <url>`: fork a public page's transcript into a new local session. */
+  async importSharedSession(link: string): Promise<SessionMeta> {
+    return decodeResult(await this.raw.importSharedSession(link), results.sessionMeta)
+  }
+
+  async recordShareNotices(sessionId: string, notices: ShareNotice[]): Promise<void> {
+    await this.raw.recordShareNotices(sessionId, JSON.stringify(notices))
   }
 
   async loadTranscript(sessionId: string): Promise<TranscriptItem[]> {
     const json = await this.raw.loadTranscript(sessionId)
-    return JSON.parse(json) as TranscriptItem[]
+    return decodeResult(json, results.transcript)
   }
 
   async loadContextTranscript(sessionId: string): Promise<TranscriptItem[]> {
     const json = await this.raw.loadContextTranscript(sessionId)
-    return JSON.parse(json) as TranscriptItem[]
+    return decodeResult(json, results.transcript)
   }
 
   async loadResumeTranscript(sessionId: string): Promise<TranscriptItem[]> {
     const json = await this.raw.loadResumeTranscript(sessionId)
-    return JSON.parse(json) as TranscriptItem[]
+    return decodeResult(json, results.transcript)
   }
 
   async findSession(sessionId: string): Promise<SessionMeta | null> {
     const json = await this.raw.findSession(sessionId)
-    return json ? JSON.parse(json) as SessionMeta : null
+    return json ? decodeResult(json, results.sessionMeta) : null
   }
 
   fork(systemPrompt: string): ForkedAgent {
@@ -414,7 +352,7 @@ export class Agent {
   }
 
   listVariables(): VariableInfo[] {
-    return JSON.parse(this.raw.listVariables()) as VariableInfo[]
+    return decodeResult(this.raw.listVariables(), results.variables)
   }
 
   async setVariable(key: string, value: string): Promise<void> {
@@ -426,7 +364,7 @@ export class Agent {
   }
 
   configInfo(): ConfigInfo {
-    return JSON.parse(this.raw.configInfo()) as ConfigInfo
+    return decodeConfigInfo(this.raw.configInfo())
   }
 
   availableModels(): string[] {
@@ -445,6 +383,16 @@ export class Agent {
    */
   reloadSelection(): boolean {
     return this.raw.reloadSelection()
+  }
+
+  /**
+   * Same reload, reporting where the selection landed: `kept`, `followed`
+   * (the model id moved to another provider and was followed), `switched`
+   * (a different model took over) or `unconfigured`.
+   */
+  reloadSelectionOutcome(): SelectionReloadOutcome {
+    const raw = this.raw.reloadSelectionOutcome()
+    return isSelectionReloadOutcome(raw) ? raw : 'switched'
   }
 
   /**
@@ -468,6 +416,25 @@ export class Agent {
   /** Apply an explicit live thinking level when supported by the active model. */
   restoreThinkingLevel(level: string): void {
     this.raw.restoreThinkingLevel(level)
+  }
+
+  /**
+   * Apply a named thinking level and persist it as the default. Returns the new
+   * display label, or null when the active model does not offer that tier — the
+   * live selection is then left untouched rather than clamped to a neighbour.
+   */
+  setThinkingLevel(level: string): string | null {
+    return this.raw.setThinkingLevel(level)
+  }
+
+  /**
+   * Make a cloud model the account's default for future sessions (on every
+   * machine) without switching the live selection. Resolves to the pinned
+   * model id, or null when the model is BYOK / not logged in — local config
+   * already remembers those. Rejects when the server refuses the pin.
+   */
+  pinDefaultModel(provider: string, model: string): Promise<string | null> {
+    return this.raw.pinDefaultModel(provider, model)
   }
 
   setLimits(maxTurns?: number, maxTokens?: number, maxDurationSecs?: number): void {
@@ -518,11 +485,7 @@ export class Agent {
 // ---------------------------------------------------------------------------
 
 export class ForkedAgent {
-  private raw: RawForkedType
-
-  constructor(raw: RawForkedType) {
-    this.raw = raw
-  }
+  constructor(private readonly raw: NativeForkedAgent) {}
 
   async query(prompt: string): Promise<QueryStream> {
     const raw = await this.raw.query(prompt)
@@ -542,17 +505,21 @@ export async function startServer(port?: number, model?: string, envFile?: strin
   return rawStartServer(port ?? null, model ?? null, envFile ?? null)
 }
 
-export interface ServerInfo {
-  port: number
-  address: string
-  channels: string[]
-  channelCount: number
+export type AcpTools = 'full' | 'readonly' | 'none'
+export type AcpPermission = 'ask' | 'allow'
+
+/** Serve ACP v1 on stdin/stdout until stdin closes. Stdout carries protocol frames only. */
+export async function runAcp(opts: { model?: string; envFile?: string; tools: AcpTools; permission: AcpPermission; ephemeral: boolean }): Promise<void> {
+  return rawRunAcp(opts.model ?? null, opts.envFile ?? null, opts.tools, opts.permission, opts.ephemeral)
 }
+
+import type { ServerInfo, LoginCodeResponse, AuthPollResult, CloudUser, AuthRefreshResult, CloudNotice } from './contracts/results.js'
+export type { ServerInfo, LoginCodeResponse, AuthPollResult, CloudUser, AuthRefreshStatus, AuthRefreshResult, CloudNotice } from './contracts/results.js'
 
 export async function startServerBackground(port?: number, model?: string, envFile?: string): Promise<ServerInfo | null> {
   const json = await rawStartServerBackground(port ?? null, model ?? null, envFile ?? null)
   if (json === null) return null
-  return JSON.parse(json) as ServerInfo
+  return decodeResult(json, results.serverInfo)
 }
 
 /**
@@ -568,21 +535,24 @@ export function fastExit(code = 0): never {
   throw new Error('unreachable')
 }
 
+/**
+ * Reap every exited child of this process, waiting at most `timeoutMs` for
+ * stragglers. Call right before `execve`: the new image keeps the pid but never
+ * waits on children it did not spawn, so each one left behind becomes a zombie
+ * until evot exits. Returns the number of children reaped.
+ */
+export function reapExitedChildren(timeoutMs: number): number {
+  try {
+    return rawReapExitedChildren(Math.max(0, Math.floor(timeoutMs)))
+  } catch {
+    // Reaping is best effort; an execve must never be blocked by it.
+    return 0
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Cloud auth (evot login)
 // ---------------------------------------------------------------------------
-
-export interface LoginCodeResponse {
-  code: string
-  login_url: string
-  expires_at: number
-  expires_in_ms: number
-  interval_ms: number
-}
-
-export type AuthPollResult =
-  | { status: 'pending' | 'expired' | 'denied' }
-  | { status: 'success'; state: { user: { id: string; name: string; email: string } }; sync_error?: string }
 
 function parseJsonOrThrow(raw: unknown, context: string): unknown {
   if (typeof raw !== 'string') return raw
@@ -590,16 +560,16 @@ function parseJsonOrThrow(raw: unknown, context: string): unknown {
     return JSON.parse(raw)
   } catch {
     // The addon surfaces Rust errors as plain text — rethrow with context.
-    throw new Error(raw.startsWith('Error') ? `${context}: ${raw.replace(/^Error:\s*/, '')}` : `${context}: ${raw}`)
+    throw new Error(`${context}: invalid native result at $`)
   }
 }
 
 export async function authBegin(serverUrl: string, fingerprintId: string): Promise<LoginCodeResponse> {
-  return parseJsonOrThrow(await rawAuthBegin(serverUrl, fingerprintId), 'login failed') as LoginCodeResponse
+  return results.loginCode.read(parseJsonOrThrow(await rawAuthBegin(serverUrl, fingerprintId), 'login failed'), '$')
 }
 
 export async function authPoll(serverUrl: string, code: string, expiresAt: number): Promise<AuthPollResult> {
-  return parseJsonOrThrow(await rawAuthPoll(serverUrl, code, expiresAt), 'login polling failed') as AuthPollResult
+  return results.authPoll.read(parseJsonOrThrow(await rawAuthPoll(serverUrl, code, expiresAt), 'login polling failed'), '$')
 }
 
 export async function authSyncModels(): Promise<void> {
@@ -607,66 +577,68 @@ export async function authSyncModels(): Promise<void> {
 }
 
 export async function authSyncNotices(): Promise<CloudNotice[]> {
-  return parseJsonOrThrow(await rawAuthSyncNotices(), 'notice sync failed') as CloudNotice[]
+  return results.cloudNotices.read(parseJsonOrThrow(await rawAuthSyncNotices(), 'notice sync failed'), '$')
 }
 
 export async function authLogout(): Promise<void> {
   await rawAuthLogout()
 }
 
-export async function authWhoami(): Promise<{ id: string; name: string; email: string } | null> {
+export async function authWhoami(): Promise<CloudUser | null> {
   const raw = await rawAuthWhoami()
   if (!raw) return null
   try {
-    return JSON.parse(raw)
+    return decodeResult(raw, results.cloudUser)
   } catch {
     return null
   }
 }
 
-export interface CloudUser {
-  id: string
-  name: string
-  email: string
-}
-
-/**
- * Outcome of repairing a cloud session the gateway rejected.
- * - `recovered`: a fresh scoped key was cached; retry the request.
- * - `login_required`: the CLI token was refused and has been cleared.
- * - `unavailable`: server unreachable; nothing was cleared.
- */
-export type AuthRefreshStatus = 'recovered' | 'login_required' | 'unavailable'
-
-export interface AuthRefreshResult {
-  status: AuthRefreshStatus
-  /** Null only when a new login is required. */
-  user: CloudUser | null
-  /** Why the server could not be reached, when status is `unavailable`. */
-  error?: string | null
-  /** Set when clearing a refused credential failed. */
-  cleanup_error?: string | null
-}
-
 /** Re-mint the scoped LLM key after the gateway reported `session_revoked`. */
 export async function authRefreshSession(): Promise<AuthRefreshResult> {
-  return parseJsonOrThrow(await rawAuthRefreshSession(), 'session refresh failed') as AuthRefreshResult
-}
-
-export interface CloudNotice {
-  id: string
-  kind: 'notice' | 'ad'
-  priority?: number
-  title: string
-  body_md?: string
+  return results.authRefresh.read(parseJsonOrThrow(await rawAuthRefreshSession(), 'session refresh failed'), '$')
 }
 
 export function authNotices(): CloudNotice[] {
   const raw = rawAuthNotices()
   if (!raw) return []
   try {
-    return JSON.parse(raw) as CloudNotice[]
+    return decodeResult(raw, results.cloudNotices)
   } catch {
     return []
   }
 }
+
+/** Privacy settings and what masking recorded over the last `days` days. */
+export async function privacyStatus(days: number): Promise<PrivacyStatus> {
+  return decodeResult(await rawPrivacyStatus(days), privacy.privacyStatus)
+}
+
+/** Validate and save privacy settings; returns them as saved. */
+export async function privacySave(settings: PrivacySettings): Promise<PrivacySettings> {
+  return decodeResult(await rawPrivacySave(JSON.stringify(settings)), privacy.privacySettings)
+}
+
+/** Records this process made after `after` (0 for all kept), oldest first; in-memory, no disk read. */
+export function privacyLive(after: number): PrivacyLive {
+  return decodeResult(rawPrivacyLive(after), privacy.privacyLive)
+}
+
+/** Placeholder tags already recorded for `session` in the last `days` days.
+ * Older addons have no such call; a resumed session then reports its history
+ * as new once, as before. */
+export async function privacySessionTags(session: string, days = 30): Promise<string[]> {
+  if (typeof rawPrivacySessionTags !== 'function') return []
+  return decodeResult(await rawPrivacySessionTags(session, days), privacy.privacyTags)
+}
+
+export const taskList = rawTaskList
+export const taskDeliveryDefaults = rawTaskDeliveryDefaults
+export const taskGet = rawTaskGet
+export const taskCreate = rawTaskCreate
+export const taskUpdate = rawTaskUpdate
+export const taskDelete = rawTaskDelete
+export const taskRun = rawTaskRun
+export const taskShare = rawTaskShare
+export const taskShareFetch = rawTaskShareFetch
+export const taskShareId = rawTaskShareId

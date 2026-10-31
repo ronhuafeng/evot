@@ -5,11 +5,30 @@
  * redraws changed lines. Uses synchronized output (DEC mode 2026) to eliminate
  * flicker.
  *
- * The cursor/viewport state machine intentionally follows pi-tui's renderer.
- * Keep terminal behavior changes synchronized with:
- *   ~/github/pi/packages/tui/src/tui.ts
+ * The cursor/viewport state machine follows pi-tui's renderer
+ * (~/github/pi/packages/tui/src/tui.ts) with one deliberate divergence:
+ *
+ * Scrollback is append-only for in-place edits. pi clears the screen and
+ * replays the whole frame whenever a row above the viewport changes, which yanks
+ * a reader who scrolled up back to the bottom and destroys native scrollback and
+ * any selection. Here an edit that leaves every row at its own index is left
+ * stale instead, reported through the trace and diagnostics hooks.
+ *
+ * Hidden live rows may stay stale while streaming; replaying the transcript
+ * per delta is worse than provisional history. Repair them at the next durable
+ * commit, or when the user explicitly invalidates history. Geometry is
+ * separate: a shrink that moves the caret above the physical viewport redraws
+ * only the visible tail instead of replaying history to recover the editor.
+ *
+ * Resizing can retain native scrollback only when the terminal's physical rows
+ * stay aligned with the producer frame (for example, widening short plain-text
+ * lines). Once wrapping, full-width backgrounds, or viewport height can change
+ * that alignment, the renderer rebuilds it with a full repaint. Repainting a
+ * new logical tail over terminal-reflowed history corrupts both coordinates and
+ * backgrounds, and subsequent differential frames cannot repair the result.
  */
 
+import { CURSOR_MARKER, type RenderFrame, type RenderOverlay } from './render-frame.js'
 import { performance } from 'node:perf_hooks'
 import stringWidth from 'string-width'
 import stripAnsi from 'strip-ansi'
@@ -31,52 +50,6 @@ const NOWRAP = '\x1b[?7l'   // Disable auto-wrap (DECAWM off)
 const WRAP = '\x1b[?7h'     // Re-enable auto-wrap
 
 // --- Types ---
-
-export interface RenderOverlay {
-  lines: string[]
-}
-
-export interface RenderFrame {
-  lines: string[]
-  /**
-   * Let a frame that fills the viewport keep its trailing edge on the bottom
-   * row, even after the frame shrinks.
-   *
-   * This is not an initial bottom pin: content decides where the composer sits
-   * until the frame first reaches the bottom. After that point, shrinkage gets
-   * leading physical space so the trailing edge stays on the row it already
-   * reached instead of jumping back to the logical frame's natural position.
-   */
-  bottomAnchor?: boolean
-  /**
-   * Start of the repaintable tail that should retain its screen position after
-   * a naturally laid-out frame first reaches the viewport bottom. Shrinkage is
-   * absorbed here, between committed content and the live region, rather than
-   * above the whole frame. Ignored until the frame has actually reached bottom.
-   */
-  bottomAnchorStart?: number
-  /**
-   * Rows in this frame that belong to a transient surface: a command window,
-   * selector, or ask prompt mounted between the transcript and the composer.
-   * They may push the frame past the viewport bottom, but they never establish
-   * the bottom anchor. When they close, the composer follows the durable rows
-   * back up instead of holding a blank hole open where the surface used to be.
-   */
-  transientRows?: number
-  /**
-   * Keep an already anchored, same-height viewport in place when only the
-   * logical rows above it also changed. The terminal cannot rewrite scrollback,
-   * so those rows remain stale until this transient frame closes; visible rows
-   * are still patched normally. Reserved for stable command-window swaps —
-   * streaming/history frames must preserve the default full-redraw behavior.
-   */
-  stableViewport?: boolean
-  /** Screen-relative modal content composited over the visible viewport. */
-  overlay?: RenderOverlay
-}
-
-/** Zero-width marker embedded in rendered output to indicate cursor position for IME. */
-export const CURSOR_MARKER = '\x1b_pi:c\x07'
 
 export interface RendererTraceEntry {
   schemaVersion: 1
@@ -108,15 +81,68 @@ export interface RendererTraceEntry {
     maxVisibleWidth: number
     osc133Markers: number
     overwideLines: Array<{ row: number; width: number }>
+    /** Changed rows above the viewport left unpainted in scrollback this frame. */
+    staleScrollbackRows?: number
   }
   viewportTail?: string[]
   viewportPatch?: { start: number; lines: string[] }
   ansiWrites: string[]
 }
 
+/**
+ * Always-on, cheap render events for post-hoc debugging. Destructive history
+ * replays and viewport-only resize repaints are reported separately so a jump
+ * can be attributed without a full trace.
+ */
+export type RendererDiagnostic =
+  | {
+    /** The screen and scrollback were cleared and the whole frame replayed. */
+    kind: 'full_redraw'
+    frame: number
+    branch: string
+    previousLines: number
+    newLines: number
+    viewportTop: number
+    firstChanged: number | null
+    columns: number
+    rows: number
+  }
+  | {
+    /** Only the visible viewport was repainted; native scrollback is retained. */
+    kind: 'viewport_redraw'
+    frame: number
+    branch: string
+    previousLines: number
+    newLines: number
+    viewportTop: number
+    firstChanged: null
+    columns: number
+    rows: number
+  }
+  | {
+    kind: 'stale_scrollback'
+    frame: number
+    staleRows: number
+    firstChanged: number
+    viewportTop: number
+    previousLines: number
+    newLines: number
+  }
+  | {
+    /** Rows above the viewport shifted index; repainted rather than corrupted. */
+    kind: 'scrollback_shift'
+    frame: number
+    shiftedFrom: number
+    delta: number
+    viewportTop: number
+    previousLines: number
+    newLines: number
+  }
+
 export interface TermRendererOptions {
   stdout?: NodeJS.WriteStream
   trace?: (entry: RendererTraceEntry) => void
+  onDiagnostic?: (diagnostic: RendererDiagnostic) => void
 }
 
 // --- Renderer ---
@@ -124,10 +150,21 @@ export interface TermRendererOptions {
 export class TermRenderer {
   private stdout: NodeJS.WriteStream
   private trace: ((entry: RendererTraceEntry) => void) | null
+  private onDiagnostic: ((diagnostic: RendererDiagnostic) => void) | null
   private traceWrites: string[] | null = null
   private pendingTraceWrites: string[] = []
   private frameNumber = 0
   private previousLines: string[] = []
+  /**
+   * Producer lines of the painted frame, parallel to `previousLines`. A
+   * committed row whose producer string is the very same object as last frame
+   * reuses its finalized text: history is append-only by contract, so the
+   * transcript prefix costs nothing per frame instead of a marker scan, a tab
+   * normalization and a fresh string per row.
+   */
+  private previousSourceLines: string[] = []
+  /** Producer lines of the frame being finalized, adopted with `previousLines`. */
+  private pendingSourceLines: string[] = []
   private previousWidth = 0
   private previousHeight = 0
   private hardwareCursorRow = 0
@@ -135,7 +172,15 @@ export class TermRenderer {
   private previousViewportTop = 0
   /** Logical frame length retained after a bottom-anchored tail first reaches the viewport end. */
   private trailingEdgeAnchorLength = 0
+  /** `committedRows` of the frame currently painted. */
+  private previousCommittedRows = Number.POSITIVE_INFINITY
   private invalidatedRows = new Set<number>()
+  private scrollbackInvalidated = false
+  /** Lowest logical row this renderer left unpainted in scrollback, if any. */
+  private scrollbackStaleFrom: number | null = null
+  /** Hidden live rows are repaired once on the next durable commit. */
+  private liveScrollbackStaleFrom: number | null = null
+  private forcedRepaint = false
 
   // Render scheduling
   private renderCallback: (() => RenderFrame | string[]) | null = null
@@ -149,6 +194,7 @@ export class TermRenderer {
   constructor(opts?: TermRendererOptions) {
     this.stdout = opts?.stdout ?? process.stdout
     this.trace = opts?.trace ?? null
+    this.onDiagnostic = opts?.onDiagnostic ?? null
   }
 
   // --- Accessors ---
@@ -170,6 +216,9 @@ export class TermRenderer {
   }
 
   destroy(): void {
+    if (this.destroyed) return
+    this.renderRequested = false
+    this.renderCallback = null
     if (this.renderTimer) {
       clearTimeout(this.renderTimer)
       this.renderTimer = undefined
@@ -213,10 +262,27 @@ export class TermRenderer {
     this.requestRender()
   }
 
+  /**
+   * Declare that committed rows above the viewport changed on purpose, so the
+   * next frame may clear and replay history to make scrollback match.
+   *
+   * This is the only way a differential frame ever repaints scrollback. It is
+   * for explicit actions whose whole point is to alter committed content — a
+   * Ctrl+O expand toggle, or erasing a revealed secret in place — where a
+   * stale copy in scrollback would defeat the action. Streaming layout changes
+   * never call this; they leave scrollback alone (see the header comment).
+   */
+  invalidateScrollback(): void {
+    if (this.destroyed) return
+    this.scrollbackInvalidated = true
+    this.requestRender()
+  }
+
   requestRender(force = false): void {
     if (this.destroyed) return
     if (force) {
       this.previousLines = []
+      this.previousSourceLines = []
       this.previousWidth = -1
       this.previousHeight = -1
       this.hardwareCursorRow = 0
@@ -224,6 +290,14 @@ export class TermRenderer {
       this.previousViewportTop = 0
       this.trailingEdgeAnchorLength = 0
       this.invalidatedRows.clear()
+      this.scrollbackInvalidated = false
+      this.scrollbackStaleFrom = null
+      this.liveScrollbackStaleFrom = null
+      this.previousCommittedRows = Number.POSITIVE_INFINITY
+      // Reported as its own branch: a forced repaint reaches the same code path
+      // as a resize, and a log that called it `width_change` would send the
+      // next person debugging a jump after the wrong cause.
+      this.forcedRepaint = true
       if (this.renderTimer) {
         clearTimeout(this.renderTimer)
         this.renderTimer = undefined
@@ -248,11 +322,16 @@ export class TermRenderer {
   clearScreen(): void {
     this.write(SYNC_START + CLEAR_SCREEN_AND_SCROLLBACK + SYNC_END)
     this.previousLines = []
+    this.previousSourceLines = []
     this.hardwareCursorRow = 0
     this.maxLinesRendered = 0
     this.previousViewportTop = 0
     this.trailingEdgeAnchorLength = 0
     this.invalidatedRows.clear()
+    this.scrollbackInvalidated = false
+    this.scrollbackStaleFrom = null
+    this.liveScrollbackStaleFrom = null
+    this.previousCommittedRows = Number.POSITIVE_INFINITY
     this.previousWidth = this.termCols
     this.previousHeight = this.termRows
   }
@@ -274,10 +353,42 @@ export class TermRenderer {
   }
 
   private onResize = (): void => {
-    // Match pi: resize only schedules a normal frame. doRender compares the
-    // actual dimensions and decides whether a full redraw is necessary. Some
-    // terminals emit redundant resize events on focus/layout changes.
+    // Compare actual dimensions in doRender. A drag can emit many events, and
+    // terminals also emit redundant events on focus/layout changes.
     this.requestRender()
+  }
+
+  /**
+   * A viewport-only resize is safe only while physical row i still represents
+   * logical row i. Native reflow is not observable through stdout, so anything
+   * that could change the row mapping must establish a fresh full-render base.
+   */
+  private canPreserveScrollbackOnResize(
+    newLines: string[],
+    width: number,
+    height: number,
+    widthChanged: boolean,
+    heightChanged: boolean,
+  ): boolean {
+    // With a scrollback buffer, height changes alter the terminal's physical
+    // viewport origin independently of our logical `lines.length - height`.
+    // If both frames fit on screen there is no off-screen history to misalign.
+    if (heightChanged && (this.previousLines.length > this.previousHeight || newLines.length > height)) {
+      return false
+    }
+    if (!widthChanged) return true
+
+    // Rewrapped text and resized background padding must replace the old
+    // physical rows, not coexist with terminal-reflowed copies of them.
+    if (newLines.length !== this.previousLines.length) return false
+    for (let row = 0; row < newLines.length; row++) {
+      if (newLines[row] !== this.previousLines[row]) return false
+      // On shrink, xterm and compatible terminals reflow rows whose content
+      // exceeds the new width. On grow, our full-render/differential invariant
+      // guarantees there are no native wrapped rows to join.
+      if (width < this.previousWidth && visibleWidth(this.previousLines[row]!) > width) return false
+    }
+    return true
   }
 
   // --- Private: core render ---
@@ -294,6 +405,8 @@ export class TermRenderer {
       this.pendingTraceWrites = []
     }
     const frame = ++this.frameNumber
+    const forced = this.forcedRepaint
+    this.forcedRepaint = false
     const previousLineCount = this.previousLines.length
     const maxLinesRenderedBefore = this.maxLinesRendered
     const previousViewportTopBefore = this.previousViewportTop
@@ -302,7 +415,17 @@ export class TermRenderer {
     // Get new frame from callback
     const raw = this.renderCallback()
     const rendered = Array.isArray(raw) ? { lines: raw } : raw
+    // Read after the callback: layout may only discover mid-build that its
+    // committed prefix reshaped, and that must apply to this frame.
+    const repaintHistory = this.scrollbackInvalidated
+    this.scrollbackInvalidated = false
     let baseLines = rendered.lines
+    // Absent means the producer only appends, so the whole frame qualifies.
+    const committedRows = rendered.committedRows === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(0, Math.trunc(rendered.committedRows))
+    const previousCommittedRows = this.previousCommittedRows
+    this.previousCommittedRows = committedRows
     const anchorStart = rendered.bottomAnchorStart
     const hasTailAnchor = rendered.bottomAnchor
       && anchorStart !== undefined
@@ -336,11 +459,20 @@ export class TermRenderer {
     }
     // Before the first natural bottom contact, short frames retain their normal
     // flow position. Screen overlays still do their own temporary composition.
-    let newLines = rendered.overlay
-      ? this.compositeOverlay(baseLines, rendered.overlay, width, height)
-      : baseLines
-    const cursorPos = this.extractCursorPosition(newLines, height)
-    newLines = this.applyLineResets(newLines)
+    // Rows committed in both frames may reuse last frame's finalized text.
+    // Nothing is reusable under an overlay: composition rewrites the viewport.
+    const reusableRows = rendered.overlay
+      ? 0
+      : Math.min(committedRows, previousCommittedRows, baseLines.length, this.previousLines.length)
+    const finalized = rendered.overlay
+      ? this.finalizeLines(
+          this.compositeOverlay(baseLines.map(line => line.replaceAll(CURSOR_MARKER, '')), rendered.overlay, width, height),
+          0,
+          height,
+        )
+      : this.finalizeLines(baseLines, reusableRows, height)
+    const newLines = finalized.lines
+    const cursorPos = finalized.cursor
 
     // Soft overwide-line guard: DECAWM is off, so overflows are silent. When
     // tracing or EVOT_DEBUG=1, surface them so layout bugs are not invisible.
@@ -355,6 +487,7 @@ export class TermRenderer {
       }
     }
 
+    let staleScrollbackRows = 0
     const traceFrame = (
       branch: string,
       firstChanged: number | null = null,
@@ -413,6 +546,7 @@ export class TermRenderer {
           maxVisibleWidth,
           osc133Markers,
           overwideLines,
+          staleScrollbackRows,
         },
         ...(differential
           ? { viewportPatch: { start: patchStart, lines: newLines.slice(patchStart, patchEnd) } }
@@ -428,24 +562,66 @@ export class TermRenderer {
     }
 
     // --- Full render helper (kept in lockstep with pi-tui) ---
-    const fullRender = (clear: boolean, branch: string): void => {
-      let buffer = SYNC_START
+    const fullRender = (clear: boolean, branch: string, firstChanged: number | null = null): void => {
+      if (clear) this.diagnose({
+        kind: 'full_redraw',
+        frame,
+        branch,
+        previousLines: previousLineCount,
+        newLines: newLines.length,
+        viewportTop: previousViewportTopBefore,
+        firstChanged,
+        columns: width,
+        rows: height,
+      })
+      let buffer = SYNC_START + HIDE_CURSOR
       if (clear) buffer += CLEAR_SCREEN_AND_SCROLLBACK
       for (let i = 0; i < newLines.length; i++) {
         if (i > 0) buffer += '\r\n'
         buffer += newLines[i]
       }
-      buffer += SYNC_END
-      this.write(buffer)
       this.hardwareCursorRow = Math.max(0, newLines.length - 1)
       this.maxLinesRendered = clear ? newLines.length : Math.max(this.maxLinesRendered, newLines.length)
       const bufferLength = Math.max(height, newLines.length)
       this.previousViewportTop = Math.max(0, bufferLength - height)
-      this.previousLines = newLines
+      this.adoptFrame(newLines)
       this.previousWidth = width
       this.previousHeight = height
-      this.positionHardwareCursor(cursorPos, newLines.length)
+      this.scrollbackStaleFrom = null
+      this.liveScrollbackStaleFrom = null
+      buffer += this.hardwareCursorSequence(cursorPos, newLines.length) + SYNC_END
+      this.write(buffer)
       traceFrame(branch)
+    }
+
+    const viewportRender = (branch: string, firstChanged: number | null = null): void => {
+      this.diagnose({
+        kind: 'viewport_redraw', frame, branch, previousLines: previousLineCount,
+        newLines: newLines.length, viewportTop: previousViewportTopBefore,
+        firstChanged: null, columns: width, rows: height,
+      })
+      const viewportTop = Math.max(0, newLines.length - height)
+      // ED 2 can promote the old visible screen into tmux history. Repaint
+      // addressable rows in place instead: CSI B clamps rather than scrolling,
+      // and EL removes old tails without touching native history.
+      let buffer = SYNC_START + HIDE_CURSOR + '\x1b[H'
+      for (let row = 0; row < height; row++) {
+        if (row > 0) buffer += '\x1b[1B'
+        buffer += `\r${CLEAR_LINE}${newLines[viewportTop + row] ?? ''}`
+      }
+      const trailingRows = height - Math.max(1, Math.min(newLines.length, height))
+      if (trailingRows > 0) buffer += `\x1b[${trailingRows}A`
+      this.hardwareCursorRow = Math.max(0, newLines.length - 1)
+      this.maxLinesRendered = newLines.length
+      this.previousViewportTop = viewportTop
+      this.previousWidth = width
+      this.previousHeight = height
+      this.adoptFrame(newLines)
+      this.invalidatedRows.clear()
+      // Repainting the visible screen does not repair retained history.
+      buffer += this.hardwareCursorSequence(cursorPos, newLines.length) + SYNC_END
+      this.write(buffer)
+      traceFrame(branch, firstChanged)
     }
 
     // First render
@@ -454,16 +630,29 @@ export class TermRenderer {
       return
     }
 
-    // Width changed — wrapping changes, must full redraw
-    if (widthChanged) {
-      fullRender(true, 'width_change')
+    if (forced) {
+      fullRender(true, 'forced_repaint')
       return
     }
 
-    // Height changed. Match pi's Termux exception: the software keyboard
-    // changes terminal height and replaying history on every toggle is worse.
-    if (heightChanged && !isTermuxSession()) {
-      fullRender(true, 'height_change')
+    // Geometry changes may invalidate physical cursor coordinates as well as
+    // the row mapping in native scrollback. Preserve the viewport-only path
+    // only when that mapping is provably unchanged; otherwise rebuild a clean
+    // physical base before resuming differential rendering.
+    // Termux retains its differential height-only path for keyboard toggles.
+    if (widthChanged || (heightChanged && !isTermuxSession())) {
+      // An explicit history edit (for example erasing a revealed secret)
+      // must still reach off-screen rows when it coincides with a resize.
+      if (repaintHistory) {
+        fullRender(true, 'history_invalidated')
+        return
+      }
+      const branch = widthChanged ? 'width_change' : 'height_change'
+      if (!this.canPreserveScrollbackOnResize(newLines, width, height, widthChanged, heightChanged)) {
+        fullRender(true, branch)
+        return
+      }
+      viewportRender(branch)
       return
     }
 
@@ -475,21 +664,9 @@ export class TermRenderer {
     let viewportTop = prevViewportTop
     let hardwareCursorRow = this.hardwareCursorRow
 
-    // Re-anchor a shrunk frame. Differential shrink clears the vacated rows but
-    // leaves the viewport where the taller frame put it, so the trailing edge
-    // stops short of the bottom row by exactly the number of rows lost — an
-    // interrupt that discards N rows of thinking lifts the composer N rows.
-    // Restoring the invariant used everywhere else (trailing edge on the bottom
-    // row) needs the window moved up over the buffer, which cannot be expressed
-    // as an in-place patch; the other shrink escape hatches below repaint too.
-    if (
-      rendered.bottomAnchor
-      && newLines.length >= height
-      && newLines.length - height < prevViewportTop
-    ) {
-      fullRender(true, 'bottom_anchor_reanchor')
-      return
-    }
+    // A visible shrink may lift the composer. Preserve physical scrollback
+    // rather than clearing/replaying history just to put the footer at bottom.
+    // The off-viewport/deletion guards below still handle unaddressable edits.
 
     const computeLineDiff = (targetRow: number): number => {
       const currentScreenRow = hardwareCursorRow - prevViewportTop
@@ -502,19 +679,107 @@ export class TermRenderer {
     // native terminal selection covering the active input row).
     const invalidatedRows = this.invalidatedRows
 
-    // Find first and last changed lines
+    // Find first and last changed lines, tracking the addressable subrange in
+    // the same pass. Rows above the viewport sit in terminal scrollback and
+    // cannot be addressed, so their changes are counted but never painted.
     let firstChanged = -1
     let lastChanged = -1
+    let firstVisibleChanged = -1
+    let lastVisibleChanged = -1
+    /** First unaddressable changed row in the live region, which may have shifted. */
+    let firstShiftedChanged = -1
+    // Safe only if the row was committed in both frames: history appending moves
+    // the boundary down, and the new frame alone would call such a row safe.
+    const committedBoundary = Math.min(committedRows, previousCommittedRows)
     const maxLines = Math.max(newLines.length, this.previousLines.length)
     for (let i = 0; i < maxLines; i++) {
       const oldLine = i < this.previousLines.length ? this.previousLines[i] : ''
       const newLine = i < newLines.length ? newLines[i] : ''
-      if (oldLine !== newLine || invalidatedRows.has(i)) {
-        if (firstChanged === -1) firstChanged = i
-        lastChanged = i
+      const changed = oldLine !== newLine
+      if (!changed && !invalidatedRows.has(i)) continue
+      if (firstChanged === -1) firstChanged = i
+      lastChanged = i
+      if (i < prevViewportTop) {
+        staleScrollbackRows++
+        // An invalidation repaints identical bytes; only a real diff can shift.
+        if (changed && i >= committedBoundary && firstShiftedChanged === -1) firstShiftedChanged = i
+        continue
       }
+      if (firstVisibleChanged === -1) firstVisibleChanged = i
+      lastVisibleChanged = i
     }
     invalidatedRows.clear()
+
+    // Treat scrollback as append-only: leave unaddressable rows with their last
+    // painted content and patch only the addressable ones. A streaming table
+    // widening a column, or a finished thinking header, must never scroll a
+    // reader back to the bottom or clear the terminal's history.
+    //
+    // An explicit invalidation is the exception. It must also repair rows this
+    // renderer knowingly left behind on earlier frames: those rows have already
+    // been adopted into previousLines, so they no longer show up as a diff and
+    // would otherwise stay wrong for the rest of the session.
+    if (repaintHistory && (staleScrollbackRows > 0 || this.scrollbackStaleFrom !== null)) {
+      fullRender(true, 'history_invalidated', Math.min(
+        firstChanged === -1 ? maxLines : firstChanged,
+        this.scrollbackStaleFrom ?? maxLines,
+      ))
+      return
+    }
+    // Streaming changes are provisional. Rebuild on the next durable commit,
+    // including hidden changes adopted as stale earlier or removed by a shrink.
+    // Otherwise one reflow/animation can replay the transcript at 10Hz.
+    const newlyCommittedChange = firstShiftedChanged !== -1 && committedRows > previousCommittedRows
+      && firstShiftedChanged < committedRows
+    // A collapse can put the removed rows beyond the new committed boundary.
+    // The next commit must repair those too, even if it never crosses their index.
+    const committedStaleChange = this.liveScrollbackStaleFrom !== null && committedRows > previousCommittedRows
+    if (newlyCommittedChange || committedStaleChange) {
+      const shiftedFrom = Math.min(
+        firstShiftedChanged === -1 ? maxLines : firstShiftedChanged,
+        this.liveScrollbackStaleFrom ?? maxLines,
+      )
+      this.diagnose({
+        kind: 'scrollback_shift',
+        frame,
+        shiftedFrom,
+        delta: newLines.length - this.previousLines.length,
+        viewportTop: prevViewportTop,
+        previousLines: this.previousLines.length,
+        newLines: newLines.length,
+      })
+      fullRender(true, 'scrollback_shift', shiftedFrom)
+      return
+    }
+    if (firstShiftedChanged !== -1) {
+      this.liveScrollbackStaleFrom = Math.min(this.liveScrollbackStaleFrom ?? firstShiftedChanged, firstShiftedChanged)
+    }
+    if (staleScrollbackRows > 0) {
+      this.scrollbackStaleFrom = Math.min(this.scrollbackStaleFrom ?? firstChanged, firstChanged)
+      this.diagnose({
+        kind: 'stale_scrollback',
+        frame,
+        staleRows: staleScrollbackRows,
+        firstChanged,
+        viewportTop: prevViewportTop,
+        previousLines: this.previousLines.length,
+        newLines: newLines.length,
+      })
+      firstChanged = firstVisibleChanged
+      lastChanged = lastVisibleChanged
+    }
+
+    // Relative cursor-up clamps at the terminal top if a transient window
+    // collapses past the caret. Recover the visible tail before adopting such
+    // coordinates, independently from repairing off-screen history.
+    if (cursorPos && cursorPos.row < prevViewportTop) {
+      viewportRender('cursor_recovery', firstChanged === -1 ? null : firstChanged)
+      return
+    }
+    if (Math.max(0, newLines.length - 1) < prevViewportTop) {
+      viewportRender('deleted_lines_above_viewport', firstChanged === -1 ? null : firstChanged)
+      return
+    }
 
     const appendedLines = newLines.length > this.previousLines.length
     if (appendedLines) {
@@ -523,9 +788,13 @@ export class TermRenderer {
     }
     const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0
 
-    // No changes
+    // No addressable changes. Adopt the new logical frame even when only
+    // scrollback rows differ, so later diffs compare against what layout
+    // currently produces rather than re-reporting the same stale rows.
     if (firstChanged === -1) {
       this.positionHardwareCursor(cursorPos, newLines.length)
+      this.adoptFrame(newLines)
+      this.previousWidth = width
       this.previousViewportTop = prevViewportTop
       this.previousHeight = height
       traceFrame('no_change')
@@ -535,11 +804,11 @@ export class TermRenderer {
     // All changes are in deleted lines (content shrunk)
     if (firstChanged >= newLines.length) {
       if (this.previousLines.length > newLines.length) {
-        let buffer = SYNC_START
+        let buffer = SYNC_START + HIDE_CURSOR
         // Move to end of new content (clamp to 0 for empty content)
         const targetRow = Math.max(0, newLines.length - 1)
         if (targetRow < prevViewportTop) {
-          fullRender(true, 'deleted_lines_above_viewport')
+          viewportRender('deleted_lines_above_viewport', firstChanged)
           return
         }
         const lineDiff = computeLineDiff(targetRow)
@@ -549,7 +818,7 @@ export class TermRenderer {
         // Clear extra lines without scrolling
         const extraLines = this.previousLines.length - newLines.length
         if (extraLines > height) {
-          fullRender(true, 'deleted_lines_exceed_height')
+          viewportRender('deleted_lines_exceed_height', firstChanged)
           return
         }
         const clearStartOffset = newLines.length === 0 ? 0 : 1
@@ -560,12 +829,11 @@ export class TermRenderer {
         }
         const moveBack = Math.max(0, extraLines - 1 + clearStartOffset)
         if (moveBack > 0) buffer += `\x1b[${moveBack}A`
-        buffer += SYNC_END
-        this.write(buffer)
         this.hardwareCursorRow = targetRow
+        buffer += this.hardwareCursorSequence(cursorPos, newLines.length) + SYNC_END
+        this.write(buffer)
       }
-      this.positionHardwareCursor(cursorPos, newLines.length)
-      this.previousLines = newLines
+      this.adoptFrame(newLines)
       this.previousWidth = width
       this.previousHeight = height
       this.previousViewportTop = prevViewportTop
@@ -573,42 +841,8 @@ export class TermRenderer {
       return
     }
 
-    // Differential rendering normally cannot touch rows that were visible only
-    // in scrollback, so pi redraws the whole frame. A stable transient viewport
-    // is the narrow exception: its logical height and bottom anchor are fixed,
-    // and the off-screen rows are deliberately frozen for the lifetime of the
-    // surface. Recompute the diff over addressable rows and patch only those.
-    if (firstChanged < prevViewportTop) {
-      if (
-        rendered.stableViewport
-        && rendered.bottomAnchor
-        && newLines.length === this.previousLines.length
-      ) {
-        firstChanged = -1
-        lastChanged = -1
-        for (let i = prevViewportTop; i < newLines.length; i++) {
-          if (this.previousLines[i] !== newLines[i]) {
-            if (firstChanged === -1) firstChanged = i
-            lastChanged = i
-          }
-        }
-        if (firstChanged === -1) {
-          this.positionHardwareCursor(cursorPos, newLines.length)
-          this.previousLines = newLines
-          this.previousWidth = width
-          this.previousHeight = height
-          this.previousViewportTop = prevViewportTop
-          traceFrame('no_change')
-          return
-        }
-      } else {
-        fullRender(true, 'off_viewport_redraw')
-        return
-      }
-    }
-
     // --- Build differential update buffer ---
-    let buffer = SYNC_START
+    let buffer = SYNC_START + HIDE_CURSOR
     const prevViewportBottom = prevViewportTop + height - 1
     const moveTargetRow = appendStart ? firstChanged - 1 : firstChanged
 
@@ -654,23 +888,28 @@ export class TermRenderer {
         finalCursorRow = newLines.length - 1
       }
       const extraLines = this.previousLines.length - newLines.length
-      for (let i = newLines.length; i < this.previousLines.length; i++) {
-        buffer += `\r\n${CLEAR_LINE}`
+      // These rows were already addressable in the previous frame. Moving
+      // down clears them in place; CRLF at its last row would scroll history
+      // unnecessarily and shift the reading position even without a full clear.
+      const clearStartOffset = newLines.length === 0 ? 0 : 1
+      if (clearStartOffset > 0) buffer += '\x1b[1B'
+      for (let i = 0; i < extraLines; i++) {
+        buffer += `\r${CLEAR_LINE}`
+        if (i < extraLines - 1) buffer += '\x1b[1B'
       }
-      buffer += `\x1b[${extraLines}A`
+      const moveBack = extraLines - 1 + clearStartOffset
+      if (moveBack > 0) buffer += `\x1b[${moveBack}A`
     }
 
-    buffer += SYNC_END
-    this.write(buffer)
-
-    // Update state
+    // Update state before encoding the final cursor move into the same frame.
     this.hardwareCursorRow = finalCursorRow
     this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length)
     this.previousViewportTop = Math.max(prevViewportTop, finalCursorRow - height + 1)
-    this.previousLines = newLines
+    this.adoptFrame(newLines)
     this.previousWidth = width
     this.previousHeight = height
-    this.positionHardwareCursor(cursorPos, newLines.length)
+    buffer += this.hardwareCursorSequence(cursorPos, newLines.length) + SYNC_END
+    this.write(buffer)
     traceFrame('differential_update', firstChanged, lastChanged)
   }
 
@@ -713,35 +952,61 @@ export class TermRenderer {
     return result
   }
 
-  private applyLineResets(lines: string[]): string[] {
-    return lines.map(line => normalizeTerminalOutput(line) + SEGMENT_RESET)
-  }
-
-  private extractCursorPosition(lines: string[], height: number): { row: number; col: number } | null {
-    const viewportTop = Math.max(0, lines.length - height)
-    for (let row = lines.length - 1; row >= viewportTop; row--) {
-      const line = lines[row]
-      const markerIndex = line.indexOf(CURSOR_MARKER)
-      if (markerIndex !== -1) {
-        const beforeMarker = line.slice(0, markerIndex)
-        const col = stringWidth(stripAnsi(beforeMarker))
-        lines[row] = line.slice(0, markerIndex) + line.slice(markerIndex + CURSOR_MARKER.length)
-        return { row, col }
-      }
-    }
-    return null
+  /** Record the painted frame together with the producer lines it came from. */
+  private adoptFrame(newLines: string[]): void {
+    this.previousLines = newLines
+    this.previousSourceLines = this.pendingSourceLines
   }
 
   /**
-   * Park the terminal's own cursor on the caret cell but keep it hidden: input
-   * methods anchor their preedit window to the reported position, while the
-   * prompt paints the visible caret itself.
+   * Turn producer lines into terminal rows: take the cursor position from the
+   * last visible marker, strip every marker, normalize tabs and close each row
+   * with a reset. Rows below `reusableRows` whose producer string is the same
+   * object as in the painted frame keep their finalized text.
    */
-  private positionHardwareCursor(cursorPos: { row: number; col: number } | null, totalLines: number): void {
-    if (!cursorPos || totalLines <= 0) {
-      this.write(HIDE_CURSOR)
-      return
+  private finalizeLines(
+    source: string[],
+    reusableRows: number,
+    height: number,
+  ): { lines: string[]; cursor: { row: number; col: number } | null } {
+    const lines = new Array<string>(source.length)
+    const viewportTop = Math.max(0, source.length - height)
+    let cursor: { row: number; col: number } | null = null
+    for (let row = source.length - 1; row >= 0; row--) {
+      const line = source[row]!
+      if (row < reusableRows && line === this.previousSourceLines[row]) {
+        lines[row] = this.previousLines[row]!
+        continue
+      }
+      let text = line
+      const markerIndex = text.indexOf(CURSOR_MARKER)
+      if (markerIndex !== -1) {
+        if (!cursor && row >= viewportTop) {
+          const col = stringWidth(stripAnsi(text.slice(0, markerIndex)))
+          // Do not let CHA clamp an off-row marker onto unrelated text at the
+          // terminal edge. Layout must provide an addressable cursor cell.
+          if (col < this.termCols) cursor = { row, col }
+        }
+        // Internal hints must never escape, including hidden history markers
+        // or multiple markers left by a composite frame. Last visible owner wins.
+        text = text.replaceAll(CURSOR_MARKER, '')
+      }
+      lines[row] = normalizeTerminalOutput(text) + SEGMENT_RESET
     }
+    // A copy: producers may edit their array in place between frames, and an
+    // aliased reference would then agree with itself and hide the change.
+    this.pendingSourceLines = source.slice()
+    return { lines, cursor }
+  }
+
+  /** Position the terminal-owned cursor, also anchoring IME composition. */
+  private positionHardwareCursor(cursorPos: { row: number; col: number } | null, totalLines: number): void {
+    this.write(this.hardwareCursorSequence(cursorPos, totalLines))
+  }
+
+  /** Encode cursor placement inside the frame, before synchronized output ends. */
+  private hardwareCursorSequence(cursorPos: { row: number; col: number } | null, totalLines: number): string {
+    if (!cursorPos || totalLines <= 0) return HIDE_CURSOR
     const targetRow = Math.max(0, Math.min(cursorPos.row, totalLines - 1))
     const targetCol = Math.max(0, cursorPos.col)
     const rowDelta = targetRow - this.hardwareCursorRow
@@ -749,12 +1014,21 @@ export class TermRenderer {
     if (rowDelta > 0) buffer += `\x1b[${rowDelta}B`
     else if (rowDelta < 0) buffer += `\x1b[${-rowDelta}A`
     buffer += `\x1b[${targetCol + 1}G`
-    buffer += HIDE_CURSOR
-    this.write(buffer)
+    buffer += SHOW_CURSOR
     this.hardwareCursorRow = targetRow
+    return buffer
   }
 
   // --- Private: output ---
+
+  private diagnose(diagnostic: RendererDiagnostic): void {
+    if (!this.onDiagnostic) return
+    try {
+      this.onDiagnostic(diagnostic)
+    } catch {
+      // Diagnostics must never break rendering.
+    }
+  }
 
   private write(data: string): void {
     if (this.destroyed) return

@@ -1,3 +1,5 @@
+import { nextGraphemeBoundary, previousGraphemeBoundary } from './input/grapheme.js'
+
 export interface AskOption {
   label: string
   description?: string
@@ -24,6 +26,9 @@ export interface QuestionUIState {
 }
 
 export interface AskState {
+  /** Host setup prompts are transient UI, not conversation turns. */
+  transient?: boolean
+  owner?: symbol
   questions: AskQuestion[]
   currentTab: number
   focusIndex: number
@@ -37,15 +42,24 @@ export interface AskState {
   submitted: boolean
 }
 
+/** A question with no options is a free-text prompt: the only row is the input. */
+export function isFreeText(question: AskQuestion): boolean {
+  return question.options.length === 0
+}
+
+function initialUIState(state: AskState, tab: number): QuestionUIState {
+  const question = state.questions[tab]
+  const freeText = question !== undefined && isFreeText(question)
+  return {
+    focusIndex: 0,
+    inOtherMode: freeText,
+    otherText: '',
+    otherCursor: 0,
+  }
+}
+
 function getUIState(state: AskState, tab: number): QuestionUIState {
-  return (
-    state.uiStates.get(tab) ?? {
-      focusIndex: 0,
-      inOtherMode: false,
-      otherText: '',
-      otherCursor: 0,
-    }
-  )
+  return state.uiStates.get(tab) ?? initialUIState(state, tab)
 }
 
 function setUIState(
@@ -96,11 +110,6 @@ function inOther(state: AskState): boolean {
   return getUIState(state, state.currentTab).inOtherMode
 }
 
-/** Current tab's otherText */
-function otherText(state: AskState): string {
-  return getUIState(state, state.currentTab).otherText
-}
-
 /** Whether the current tab already has a submitted answer */
 function hasAnswer(state: AskState): boolean {
   const answer = state.answers[state.currentTab]
@@ -123,6 +132,7 @@ function focusOption(state: AskState, index: number): AskState {
 export function askUp(state: AskState): AskState {
   const tab = state.currentTab
   const ui = getUIState(state, tab)
+  if (isFreeText(state.questions[tab]!)) return state
   if (ui.inOtherMode) {
     return setUIState(state, tab, {
       inOtherMode: false,
@@ -136,6 +146,7 @@ export function askUp(state: AskState): AskState {
 export function askDown(state: AskState): AskState {
   const tab = state.currentTab
   const ui = getUIState(state, tab)
+  if (isFreeText(state.questions[tab]!)) return state
   const max = optionCount(state) - 1
   if (ui.focusIndex >= max) {
     return setUIState(state, tab, { inOtherMode: true, focusIndex: max, otherCursor: ui.otherText.length })
@@ -232,11 +243,12 @@ export function askBackspace(state: AskState): AskState {
   const tab = state.currentTab
   const ui = getUIState(state, tab)
   if (ui.otherCursor <= 0) return state
-  const before = ui.otherText.slice(0, ui.otherCursor - 1)
+  const start = previousGraphemeBoundary(ui.otherText, ui.otherCursor)
+  const before = ui.otherText.slice(0, start)
   const after = ui.otherText.slice(ui.otherCursor)
   return setUIState(state, tab, {
     otherText: before + after,
-    otherCursor: ui.otherCursor - 1,
+    otherCursor: start,
   })
 }
 
@@ -249,7 +261,7 @@ export function askCursorLeft(state: AskState): AskState {
   const tab = state.currentTab
   const ui = getUIState(state, tab)
   if (ui.otherCursor <= 0) return state
-  return setUIState(state, tab, { otherCursor: ui.otherCursor - 1 })
+  return setUIState(state, tab, { otherCursor: previousGraphemeBoundary(ui.otherText, ui.otherCursor) })
 }
 
 export function askCursorRight(state: AskState): AskState {
@@ -257,7 +269,7 @@ export function askCursorRight(state: AskState): AskState {
   const tab = state.currentTab
   const ui = getUIState(state, tab)
   if (ui.otherCursor >= ui.otherText.length) return state
-  return setUIState(state, tab, { otherCursor: ui.otherCursor + 1 })
+  return setUIState(state, tab, { otherCursor: nextGraphemeBoundary(ui.otherText, ui.otherCursor) })
 }
 
 export function askCursorHome(state: AskState): AskState {
@@ -278,7 +290,7 @@ export function askDelete(state: AskState): AskState {
   const ui = getUIState(state, tab)
   if (ui.otherCursor >= ui.otherText.length) return state
   const before = ui.otherText.slice(0, ui.otherCursor)
-  const after = ui.otherText.slice(ui.otherCursor + 1)
+  const after = ui.otherText.slice(nextGraphemeBoundary(ui.otherText, ui.otherCursor))
   return setUIState(state, tab, { otherText: before + after })
 }
 
@@ -347,8 +359,10 @@ export function handleAskKeyEvent(
     case 'j':
       return { action: 'update', state: askDown(state) }
     case 'page-up':
+      if (inOther(state)) return { action: 'update', state }
       return { action: 'update', state: focusOption(state, state.focusIndex - 5) }
     case 'page-down':
+      if (inOther(state)) return { action: 'update', state }
       return { action: 'update', state: focusOption(state, state.focusIndex + 5) }
     case 'shift-tab':
       return { action: 'update', state: askPrevTab(state) }

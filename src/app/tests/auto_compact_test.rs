@@ -6,10 +6,10 @@ use evot::agent::RunEventPayload;
 use evot::conf::Config;
 use evot::conf::Protocol;
 use evot::conf::ProviderProfile;
+use evot::observability::UsageSummary;
 use evot::storage::MemoryStorage;
 use evot::types::AssistantBlock;
 use evot::types::TranscriptItem;
-use evot::types::UsageSummary;
 use evot_engine::provider::MockProvider;
 use evot_engine::provider::MockResponse;
 use evot_engine::Usage;
@@ -108,6 +108,27 @@ async fn auto_compaction_persists_structured_compact_item() -> TestResult {
     assert!(saw_compaction, "expected auto compaction event");
 
     let raw = loaded.load_all_entries().await?;
+    let compact_index = raw
+        .iter()
+        .position(|entry| matches!(entry.item, TranscriptItem::Compact { .. }))
+        .ok_or_else(|| std::io::Error::other("missing compact boundary"))?;
+    let prompt_indices: Vec<_> = raw
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            matches!(&entry.item, TranscriptItem::User { text, .. } if text == "new request")
+                .then_some(index)
+        })
+        .collect();
+    assert_eq!(
+        prompt_indices.len(),
+        1,
+        "initial prompt must be persisted exactly once"
+    );
+    assert!(
+        prompt_indices[0] > compact_index,
+        "pre-prompt compaction must precede admission of the new prompt"
+    );
     let compact = raw
         .iter()
         .find_map(|entry| match &entry.item {
@@ -172,6 +193,7 @@ async fn auto_compaction_persists_structured_compact_item() -> TestResult {
 
 fn user(text: &str) -> TranscriptItem {
     TranscriptItem::User {
+        provenance: None,
         text: text.into(),
         content: vec![],
     }

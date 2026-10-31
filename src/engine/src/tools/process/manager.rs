@@ -12,7 +12,6 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use std::time::Instant;
 
-use command_group::AsyncCommandGroup;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use tokio::io::AsyncRead;
@@ -22,11 +21,15 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::spawn::kill_process_group;
+use super::spawn::SpawnedChild;
 use super::types::BackgroundReason;
 use super::types::ProcessSnapshot;
 use super::types::ProcessStatus;
 use super::types::ProcessSummary;
 use super::types::StartProcess;
+use super::types::SUMMARY_OUTPUT_BYTES;
+use super::types::SUMMARY_OUTPUT_LINES;
 use crate::types::ToolError;
 
 const IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -91,6 +94,7 @@ struct ProcessTombstone {
 struct ProcessNotification {
     task_id: String,
     text: String,
+    wakes_agent: bool,
 }
 
 /// Who asked for a stop. Only the attribution differs; the kill path is shared.
@@ -117,6 +121,7 @@ struct ProcessTask {
     id: String,
     tool_call_id: String,
     command: String,
+    description: Option<String>,
     cwd: PathBuf,
     output_path: PathBuf,
     started_at: Instant,
@@ -140,6 +145,9 @@ struct ProcessState {
     /// When the task reached a terminal status. Elapsed time freezes here so a
     /// finished task does not keep ticking in `/ps`.
     finished_at: Option<Instant>,
+    /// Blocking waits that gave up on this task because it looked stalled.
+    /// See `ProcessSnapshot::stall_wakes`.
+    stall_wakes: u32,
     global_permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -151,6 +159,8 @@ struct ProcessOutput {
     tail_bytes: usize,
     newlines: usize,
     open_line: bool,
+    /// Last time any byte arrived; the task's start until then.
+    last_activity: Instant,
 }
 
 impl ProcessOutput {
@@ -163,6 +173,7 @@ impl ProcessOutput {
             tail_bytes: tail_bytes.max(4096),
             newlines: 0,
             open_line: false,
+            last_activity: Instant::now(),
         }
     }
 
@@ -170,6 +181,7 @@ impl ProcessOutput {
         if bytes.is_empty() {
             return;
         }
+        self.last_activity = Instant::now();
         self.newlines += bytes.iter().filter(|byte| **byte == b'\n').count();
         self.open_line = bytes.last() != Some(&b'\n');
         if let Some(file) = self.file.as_mut() {
@@ -214,6 +226,26 @@ impl ProcessOutput {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.tail).to_string()
+    }
+
+    /// Trailing lines for a listing: scans only the last
+    /// `SUMMARY_OUTPUT_BYTES` of the tail, so cost does not grow with output.
+    fn recent_lines(&self) -> Vec<String> {
+        let start = self.tail.len().saturating_sub(SUMMARY_OUTPUT_BYTES);
+        let window = String::from_utf8_lossy(&self.tail[start..]);
+        let mut lines = window
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // The first line of a mid-buffer window is usually cut; drop it.
+        if start > 0 && lines.len() > 1 {
+            lines.remove(0);
+        }
+        let keep = lines.len().saturating_sub(SUMMARY_OUTPUT_LINES);
+        lines.drain(..keep);
+        lines
     }
 
     fn total_lines(&self) -> usize {
@@ -302,7 +334,7 @@ impl ProcessManager {
         request.command.stdin(std::process::Stdio::null());
         request.command.stdout(std::process::Stdio::piped());
         request.command.stderr(std::process::Stdio::piped());
-        let mut child = match request.command.group_spawn() {
+        let mut child = match SpawnedChild::spawn(&mut request.command) {
             Ok(child) => child,
             Err(error) => {
                 if let Err(remove_error) = std::fs::remove_file(&output_path) {
@@ -313,16 +345,20 @@ impl ProcessManager {
                 return Err(ToolError::Failed(format!("Failed to execute: {error}")));
             }
         };
-        let stdout = child.inner().stdout.take();
-        let stderr = child.inner().stderr.take();
-        // `group_spawn` puts the child in its own process group whose id equals
-        // the leader pid, so this is also the pgid to signal on exit paths.
-        let pgid = child.id();
+        let stdout = child.stdout();
+        let stderr = child.stderr();
+        // A spawned child leads its own session, so the leader pid is also the
+        // pgid to signal on exit paths.
+        let pgid = child.pgid();
 
         let task = Arc::new(ProcessTask {
             id: task_id.clone(),
             tool_call_id: request.tool_call_id,
             command: request.command_text,
+            description: request.description.and_then(|description| {
+                let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+                (!description.is_empty()).then_some(description)
+            }),
             cwd: request.cwd,
             output_path,
             started_at: Instant::now(),
@@ -339,6 +375,7 @@ impl ProcessManager {
                 notification_claimed: false,
                 stopped_by_user: false,
                 finished_at: None,
+                stall_wakes: 0,
                 global_permit: Some(global_permit),
             }),
             cancel: CancellationToken::new(),
@@ -418,11 +455,13 @@ impl ProcessManager {
             {
                 let mut state = task.state.lock();
                 state.exit_code = Some(exit_code);
-                state.status = forced_status.unwrap_or(if exit_code == 0 {
-                    ProcessStatus::Completed
-                } else {
-                    ProcessStatus::Failed
-                });
+                state.status = forced_status
+                    .or_else(|| state.requested_status.clone())
+                    .unwrap_or(if exit_code == 0 {
+                        ProcessStatus::Completed
+                    } else {
+                        ProcessStatus::Failed
+                    });
                 state.finished_at = Some(Instant::now());
                 state.global_permit.take();
             }
@@ -435,6 +474,7 @@ impl ProcessManager {
                     notifications.push(ProcessNotification {
                         task_id: task.id.clone(),
                         text: format_notification(&snapshot),
+                        wakes_agent: !state.stopped_by_user,
                     });
                 }
             }
@@ -527,6 +567,17 @@ impl ProcessManager {
             .read()
             .get(task_id)
             .map(|task| task.snapshot())
+    }
+
+    /// Record that a blocking wait ended because the task looked stalled.
+    /// Returns the new count, which the next wait uses to back off.
+    pub(super) fn record_stall_wake(&self, task_id: &str) -> u32 {
+        let Some(task) = self.inner.tasks.read().get(task_id).cloned() else {
+            return 0;
+        };
+        let mut state = task.state.lock();
+        state.stall_wakes = state.stall_wakes.saturating_add(1);
+        state.stall_wakes
     }
 
     /// Listing view of one task. Unlike `snapshot`, this skips the captured
@@ -635,6 +686,9 @@ impl ProcessManager {
             .collect::<Vec<_>>();
         for task in &tasks {
             let mut state = task.state.lock();
+            if state.status.is_terminal() {
+                continue;
+            }
             state.requested_status = Some(ProcessStatus::Killed);
             state.stopped_by_user = true;
             task.cancel.cancel();
@@ -862,6 +916,15 @@ impl ProcessManager {
         self.inner.notifications.lock().len()
     }
 
+    pub fn pending_wake_notifications(&self) -> usize {
+        self.inner
+            .notifications
+            .lock()
+            .iter()
+            .filter(|notification| notification.wakes_agent)
+            .count()
+    }
+
     pub async fn terminate_all_and_wait(&self, timeout: Duration) {
         self.terminate_all();
         let started = Instant::now();
@@ -917,10 +980,14 @@ impl ProcessTask {
 
     fn summary(&self) -> ProcessSummary {
         let state = self.state.lock();
-        let output_file_truncated = self.output.lock().file_truncated;
+        let output = self.output.lock();
+        let output_file_truncated = output.file_truncated;
         ProcessSummary {
             task_id: self.id.clone(),
             command: self.command.clone(),
+            description: self.description.clone(),
+            recent_output: output.recent_lines(),
+            quiet_for: self.quiet_for(&state, &output),
             cwd: self.cwd.clone(),
             output_path: self.output_path.clone(),
             status: state.status.clone(),
@@ -931,13 +998,23 @@ impl ProcessTask {
         }
     }
 
+    /// Time since the last output byte, frozen with `elapsed` once terminal.
+    fn quiet_for(&self, state: &ProcessState, output: &ProcessOutput) -> Duration {
+        match state.finished_at {
+            Some(finished_at) => finished_at.saturating_duration_since(output.last_activity),
+            None => output.last_activity.elapsed(),
+        }
+    }
+
     fn snapshot(&self) -> ProcessSnapshot {
         let state = self.state.lock();
         let output = self.output.lock();
+        let quiet_for = self.quiet_for(&state, &output);
         ProcessSnapshot {
             task_id: self.id.clone(),
             tool_call_id: self.tool_call_id.clone(),
             command: self.command.clone(),
+            description: self.description.clone(),
             cwd: self.cwd.clone(),
             output_path: self.output_path.clone(),
             output: output.text(),
@@ -947,6 +1024,8 @@ impl ProcessTask {
             status: state.status.clone(),
             exit_code: state.exit_code,
             elapsed: self.elapsed(&state),
+            quiet_for,
+            stall_wakes: state.stall_wakes,
             stopped_by_user: state.stopped_by_user,
         }
     }
@@ -975,25 +1054,6 @@ fn remove_output_file(path: &std::path::Path) {
     }
 }
 
-/// Send `SIGKILL` to a whole process group, synchronously.
-///
-/// Returns whether the signal was delivered. A group that has already exited
-/// reports `false`, which is expected and not an error.
-#[cfg(unix)]
-fn kill_process_group(pgid: u32) -> bool {
-    let Ok(pgid) = i32::try_from(pgid) else {
-        return false;
-    };
-    // SAFETY: `killpg` takes a process-group id and a signal number, and has no
-    // memory-safety contract. An invalid or already-reaped group returns -1.
-    unsafe { libc::killpg(pgid, libc::SIGKILL) == 0 }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_pgid: u32) -> bool {
-    false
-}
-
 fn format_notification(snapshot: &ProcessSnapshot) -> String {
     format!(
         "<task-notification>\n<task-id>{}</task-id>\n<status>{}</status>\n{}{}<summary>{}</summary>\n<output-file>{}</output-file>\n</task-notification>",
@@ -1013,9 +1073,23 @@ fn format_notification(snapshot: &ProcessSnapshot) -> String {
     )
 }
 
+/// Longest command echoed back into a notification summary.
+///
+/// The summary is a user-turn message the model reads, and the model then
+/// re-emits whatever it decides to run next as a tool-call argument. A full
+/// heredoc script echoed here (quotes, braces, `$` expansions) is exactly the
+/// text the model is most likely to copy into its next `bash.command`, and
+/// one provider (Gemini via Devin, 2026-10-15) produced a malformed function
+/// call for that turn 19 times in a row until the script was removed from the
+/// notification. The output file still holds everything; the summary only
+/// needs to identify the task.
+const NOTIFICATION_COMMAND_CHARS: usize = 160;
+
 fn notification_summary(snapshot: &ProcessSnapshot) -> String {
-    let command = snapshot.command.replace(['<', '>'], "");
-    match snapshot.status {
+    // Keep the published single-line envelope intact, even for multiline scripts
+    // and descriptions containing XML-like text.
+    let command = notification_command(&snapshot.command);
+    let outcome = match snapshot.status {
         ProcessStatus::Completed => format!("Command \"{}\" completed", command),
         ProcessStatus::Failed => format!("Command \"{}\" failed", command),
         // Unreachable in practice: notifications are only armed when a task is
@@ -1034,5 +1108,29 @@ fn notification_summary(snapshot: &ProcessSnapshot) -> String {
         ),
         ProcessStatus::Killed => format!("Command \"{}\" was stopped", command),
         _ => format!("Command \"{}\" changed state", command),
+    };
+    match snapshot.description.as_deref() {
+        Some(description) => format!("Task \"{}\": {outcome}", notification_text(description)),
+        None => outcome,
     }
+}
+
+fn notification_text(text: &str) -> String {
+    text.replace(['<', '>'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The command as the summary quotes it: single-line, bounded to
+/// [`NOTIFICATION_COMMAND_CHARS`], cut at a character boundary with a marker so
+/// the model knows the text is a preview and not something it can re-run.
+fn notification_command(command: &str) -> String {
+    let text = notification_text(command);
+    if text.chars().count() <= NOTIFICATION_COMMAND_CHARS {
+        return text;
+    }
+    let mut preview: String = text.chars().take(NOTIFICATION_COMMAND_CHARS).collect();
+    preview.truncate(preview.trim_end().len());
+    format!("{preview}…")
 }

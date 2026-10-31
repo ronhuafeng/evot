@@ -1,12 +1,14 @@
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use evotengine::tools::task_label;
 use evotengine::tools::BackgroundReason;
 use evotengine::tools::BashTool;
 use evotengine::tools::ProcessManager;
 use evotengine::tools::ProcessStatus;
+use evotengine::tools::StallPolicy;
 use evotengine::tools::TaskOutputTool;
 use evotengine::tools::TaskStopTool;
 use evotengine::types::AgentTool;
@@ -14,7 +16,7 @@ use evotengine::types::Content;
 use evotengine::types::ToolContext;
 use tokio_util::sync::CancellationToken;
 
-fn context(name: &str, output_dir: &std::path::Path) -> ToolContext {
+pub fn context(name: &str, output_dir: &std::path::Path) -> ToolContext {
     ToolContext {
         tool_call_id: format!("{}-call", name),
         tool_name: name.to_string(),
@@ -30,13 +32,13 @@ fn context(name: &str, output_dir: &std::path::Path) -> ToolContext {
     }
 }
 
-fn task_id(result: &evotengine::ToolResult) -> Result<&str, Box<dyn Error>> {
+pub fn task_id(result: &evotengine::ToolResult) -> Result<&str, Box<dyn Error>> {
     result.details["task_id"]
         .as_str()
         .ok_or_else(|| "missing task_id".into())
 }
 
-fn text(result: &evotengine::ToolResult) -> String {
+pub fn text(result: &evotengine::ToolResult) -> String {
     result
         .content
         .iter()
@@ -46,6 +48,207 @@ fn text(result: &evotengine::ToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Contract used by historical CLI readers: field order and a one-line summary
+/// remain unchanged. Only the summary's free-form text gains the task purpose.
+fn strict_legacy_notification(text: &str) -> Result<&str, Box<dyn Error>> {
+    let lines: Vec<_> = text.trim_end().lines().collect();
+    assert_eq!(lines.len(), 7, "{text}");
+    assert_eq!(lines[0], "<task-notification>");
+    assert!(lines[1].starts_with("<task-id>") && lines[1].ends_with("</task-id>"));
+    assert_eq!(lines[2], "<status>completed</status>");
+    assert_eq!(lines[3], "<exit-code>0</exit-code>");
+    assert!(lines[5].starts_with("<output-file>") && lines[5].ends_with("</output-file>"));
+    assert_eq!(lines[6], "</task-notification>");
+    let summary = lines[4]
+        .strip_prefix("<summary>")
+        .and_then(|text| text.strip_suffix("</summary>"))
+        .ok_or("invalid summary")?;
+    assert!(!summary.contains(['<', '>']));
+    Ok(summary)
+}
+
+#[test]
+fn historical_completion_notice_keeps_its_contract() -> Result<(), Box<dyn Error>> {
+    let historical = include_str!("../fixtures/background_notifications/legacy.txt");
+    assert_eq!(
+        strict_legacy_notification(historical)?,
+        "Command \"printf done\" completed"
+    );
+    Ok(())
+}
+
+#[test]
+fn background_description_is_optional_and_notifications_are_not_user_requests() {
+    let bash = BashTool::new().with_process_manager(Arc::new(ProcessManager::new()));
+    let schema = bash.parameters_schema();
+    assert_eq!(schema["properties"]["description"]["type"], "string");
+    assert_eq!(schema["required"], serde_json::json!(["command"]));
+    let guidance = bash.prompt_guidelines().join("\n");
+    assert!(guidance.contains("events report results, not new user requests"));
+    assert!(guidance.contains("task ID and description"));
+    assert!(guidance.contains("respecting the user's current request"));
+    // A notification-only turn must resume the task, not be acknowledged and
+    // dropped: that is the "replies 收到, then stops" failure users reported.
+    assert!(guidance.contains("is the original task resuming, not a prompt to acknowledge"));
+    assert!(guidance.contains("never end the turn with a bare acknowledgement while work remains"));
+}
+
+#[test]
+fn bash_description_is_optional_in_both_runtime_schemas() -> Result<(), Box<dyn Error>> {
+    use evotengine::tools::validation::validate_and_coerce;
+
+    for bash in [
+        BashTool::new(),
+        BashTool::new().with_process_manager(Arc::new(ProcessManager::new())),
+    ] {
+        let schema = bash.parameters_schema();
+        for input in [
+            serde_json::json!({"command": "printf done"}),
+            serde_json::json!({"command": "printf done", "description": "Legacy description"}),
+            serde_json::json!({"command": "printf done", "description": ""}),
+        ] {
+            assert_eq!(validate_and_coerce("bash", &schema, &input)?, input);
+        }
+        assert!(validate_and_coerce("bash", &schema, &serde_json::json!({})).is_err());
+        assert!(validate_and_coerce(
+            "bash",
+            &schema,
+            &serde_json::json!({"command": "printf done", "description": {}}),
+        )
+        .is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn foreground_command_without_description_executes() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let bash = BashTool::new();
+    let params = evotengine::tools::validation::validate_and_coerce(
+        "bash",
+        &bash.parameters_schema(),
+        &serde_json::json!({"command": "printf done"}),
+    )?;
+    let result = bash.execute(params, context("bash", dir.path())).await?;
+    assert_eq!(text(&result), "done");
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_command_without_description_keeps_legacy_notification_contract(
+) -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let params = evotengine::tools::validation::validate_and_coerce(
+        "bash",
+        &bash.parameters_schema(),
+        &serde_json::json!({
+            "command": "sleep 0.05;\nprintf done",
+            "run_in_background": true,
+        }),
+    )?;
+    let result = bash.execute(params, context("bash", dir.path())).await?;
+    let completed = manager
+        .wait(task_id(&result)?, Duration::from_secs(3))
+        .await
+        .ok_or("missing task")?;
+    assert_eq!(completed.status.as_str(), "completed");
+    assert_eq!(completed.output, "done");
+    assert!(completed.description.is_none());
+    let notices = manager.take_notifications();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        strict_legacy_notification(&notices[0])?,
+        "Command \"sleep 0.05; printf done\" completed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_descriptions_survive_detach_and_distinguish_completion_notices(
+) -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_millis(1));
+    let mut tasks = Vec::new();
+    // Launch in the foreground and detach: descriptions must not be limited to
+    // explicitly backgrounded commands. Two jobs coexist in the same manager.
+    for description in [
+        "R0022: Q83/Q57 16-pair retest",
+        "performance list: export latest medians",
+    ] {
+        let running = bash
+            .execute(
+                serde_json::json!({
+                    "command": "sleep 0.2;\nprintf done",
+                    "description": format!("  {description}\n<context>  "),
+                }),
+                context("bash", dir.path()),
+            )
+            .await?;
+        let id = task_id(&running)?.to_string();
+        let purpose = format!("{description} <context>");
+        assert!(text(&running).contains(&format!("Task: {purpose}")));
+        assert_eq!(
+            manager
+                .snapshot(&id)
+                .ok_or("missing snapshot")?
+                .description
+                .as_deref(),
+            Some(purpose.as_str())
+        );
+        let summary = manager.summary(&id).ok_or("missing listing")?;
+        assert_eq!(summary.description.as_deref(), Some(purpose.as_str()));
+        assert!(summary.quiet_for <= summary.elapsed);
+        tasks.push((id, description));
+    }
+    for (id, _) in &tasks {
+        let completed = manager
+            .wait(id, Duration::from_secs(3))
+            .await
+            .ok_or("missing task")?;
+        assert_eq!(completed.status.as_str(), "completed");
+    }
+    let notices = manager.take_notifications();
+    assert_eq!(notices.len(), 2);
+    for (id, description) in tasks {
+        let notice = notices
+            .iter()
+            .find(|text| text.contains(&id))
+            .ok_or("missing notice")?;
+        let summary = strict_legacy_notification(notice)?;
+        assert!(summary.contains(description));
+        assert!(summary.contains("sleep 0.2; printf done"));
+    }
+    assert!(manager.take_notifications().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn blank_description_does_not_block_execution() -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let result = bash
+        .execute(
+            serde_json::json!({
+                "command": "printf done", "description": "  \n\t", "run_in_background": true,
+            }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let completed = manager
+        .wait(task_id(&result)?, Duration::from_secs(3))
+        .await
+        .ok_or("missing task")?;
+    assert_eq!(completed.status.as_str(), "completed");
+    assert_eq!(completed.output, "done");
+    Ok(())
 }
 
 #[test]
@@ -200,6 +403,54 @@ async fn explicit_background_returns_task_and_persists_output() -> Result<(), Bo
         tokio::fs::read_to_string(snapshot.output_path).await?,
         "first\nlast\n"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn summary_recent_output_is_a_bounded_tail_and_empty_while_silent(
+) -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+
+    // Silent task: a listing shows no lines; that is not a stall signal.
+    let silent = bash
+        .execute(
+            serde_json::json!({ "command": "sleep 5", "run_in_background": true }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let silent_id = task_id(&silent)?;
+    let listing = manager.summary(silent_id).ok_or("missing listing")?;
+    assert!(listing.recent_output.is_empty());
+    manager.stop(silent_id).await;
+
+    // Chatty task: only the last few lines survive, each trimmed, blanks dropped.
+    let chatty = bash
+        .execute(
+            serde_json::json!({
+                "command": "for i in $(seq 1 500); do echo \"step $i  \"; echo; done",
+                "run_in_background": true
+            }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let chatty_id = task_id(&chatty)?;
+    manager
+        .wait(chatty_id, Duration::from_secs(10))
+        .await
+        .ok_or("task disappeared")?;
+    let listing = manager.summary(chatty_id).ok_or("missing listing")?;
+    assert_eq!(listing.recent_output.len(), 8);
+    assert_eq!(
+        listing.recent_output.last().map(String::as_str),
+        Some("step 500")
+    );
+    assert!(listing
+        .recent_output
+        .iter()
+        .all(|line| line.starts_with("step ")));
+    assert!(listing.recent_output.iter().map(String::len).sum::<usize>() <= 800);
     Ok(())
 }
 
@@ -1098,6 +1349,55 @@ async fn the_notification_summary_names_the_outcome_per_status() -> Result<(), B
 }
 
 #[tokio::test]
+async fn a_long_script_is_previewed_not_echoed_in_the_notification() -> Result<(), Box<dyn Error>> {
+    // The summary is a user turn the model reads before choosing its next tool
+    // call. A whole heredoc script echoed there is the text a model copies
+    // back into `bash.command`, and a long one with quotes and braces is where
+    // Gemini (via Devin, 2026-10-15) kept producing malformed function calls.
+    // The output file keeps the full record; the summary only identifies the task.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let script = format!(
+        "cat << 'PY' | python3 -\nimport json\nrows = [{{'k': i, 'v': \"x\" * i}} for i in range(3)]\n{}\nprint(json.dumps(rows))\nPY",
+        "# padding line to push the script well past the preview\n".repeat(8)
+    );
+    assert!(script.chars().count() > 400);
+
+    let started = bash
+        .execute(
+            serde_json::json!({"command": script, "run_in_background": true}),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let id = task_id(&started)?;
+    manager
+        .wait(id, Duration::from_secs(5))
+        .await
+        .ok_or("task disappeared")?;
+
+    let notifications = manager.take_notifications();
+    assert_eq!(notifications.len(), 1);
+    let notification = &notifications[0];
+    let summary = notification
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("<summary>")
+                .and_then(|l| l.strip_suffix("</summary>"))
+        })
+        .ok_or("no summary line")?;
+    // `<`/`>` are already stripped by the anti-forgery rule, hence `cat 'PY'`.
+    assert!(
+        summary.starts_with("Command \"cat 'PY' | python3 - import json"),
+        "{summary}"
+    );
+    assert!(summary.contains("…\" completed"), "{summary}");
+    assert!(!summary.contains("print(json.dumps(rows))"), "{summary}");
+    assert!(summary.chars().count() < 220, "{summary}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_command_containing_angle_brackets_cannot_forge_notification_tags(
 ) -> Result<(), Box<dyn Error>> {
     // The summary embeds the command inside XML the model parses. An unescaped
@@ -1143,9 +1443,10 @@ async fn task_tools_preview_the_command_they_act_on() -> Result<(), Box<dyn Erro
     let output = TaskOutputTool::new(manager.clone());
     let stop = TaskStopTool::new(manager.clone());
 
+    let command = format!("sleep 5 # {}", "full command preview ".repeat(10));
     let started = bash
         .execute(
-            serde_json::json!({"command": "sleep 5 # marker", "run_in_background": true}),
+            serde_json::json!({"command": command, "run_in_background": true}),
             context("bash", dir.path()),
         )
         .await?;
@@ -1156,11 +1457,11 @@ async fn task_tools_preview_the_command_they_act_on() -> Result<(), Box<dyn Erro
     let params = serde_json::json!({"task_id": id});
     assert_eq!(
         output.preview_command(&params).as_deref(),
-        Some("sleep 5 # marker")
+        Some(command.as_str())
     );
     assert_eq!(
         stop.preview_command(&params).as_deref(),
-        Some("sleep 5 # marker")
+        Some(command.as_str())
     );
 
     // Reap before returning. `Drop` only cancels tokens without awaiting the
@@ -1446,7 +1747,8 @@ async fn a_user_stop_notifies_the_model_and_names_the_user() -> Result<(), Box<d
     assert_eq!(stopped.status.as_str(), "killed");
     assert!(stopped.stopped_by_user);
 
-    // The notification must survive: swallowing it is what hid the stop.
+    assert_eq!(manager.pending_notifications(), 1);
+    assert_eq!(manager.pending_wake_notifications(), 0);
     let notifications = manager.take_notifications();
     assert_eq!(notifications.len(), 1);
     let notification = &notifications[0];
@@ -1461,6 +1763,50 @@ async fn a_user_stop_notifies_the_model_and_names_the_user() -> Result<(), Box<d
         notification.contains("only re-run it if the user explicitly asks"),
         "got: {notification}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn wake_notifications_exclude_cancellations_without_dropping_mixed_results(
+) -> Result<(), Box<dyn Error>> {
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let cancelled = bash
+        .execute(
+            serde_json::json!({"command": "sleep 30", "run_in_background": true}),
+            context("bash", dir.path()),
+        )
+        .await?;
+    manager
+        .stop_by_user(task_id(&cancelled)?)
+        .await
+        .ok_or("task disappeared")?;
+    assert_eq!(manager.pending_notifications(), 1);
+    assert_eq!(manager.pending_wake_notifications(), 0);
+
+    for command in ["exit 0", "exit 7"] {
+        let result = bash
+            .execute(
+                serde_json::json!({"command": command, "run_in_background": true}),
+                context("bash", dir.path()),
+            )
+            .await?;
+        let id = task_id(&result)?;
+        manager
+            .wait(id, Duration::from_secs(3))
+            .await
+            .ok_or("task disappeared")?;
+    }
+    assert_eq!(manager.pending_notifications(), 3);
+    assert_eq!(manager.pending_wake_notifications(), 2);
+    let notices = manager.take_notifications();
+    assert_eq!(notices.len(), 3);
+    assert!(notices
+        .iter()
+        .any(|text| text.contains("cancelled by the user")));
+    assert_eq!(manager.pending_notifications(), 0);
+    assert_eq!(manager.pending_wake_notifications(), 0);
     Ok(())
 }
 
@@ -1521,6 +1867,8 @@ async fn stop_all_attributes_every_task_to_the_user() -> Result<(), Box<dyn Erro
         );
     }
 
+    assert_eq!(manager.pending_notifications(), 3);
+    assert_eq!(manager.pending_wake_notifications(), 0);
     // One notification per task, each naming the user. Previously all three
     // were suppressed, so the model saw nothing at all.
     let notifications = manager.take_notifications();
@@ -2544,6 +2892,40 @@ async fn a_non_blocking_poll_is_never_counted_as_waiting() -> Result<(), Box<dyn
 // writes them into tool-result details and `output.ts` switches on the strings.
 // ---------------------------------------------------------------------------
 
+#[tokio::test]
+async fn foreground_countdown_precedes_yield_and_keeps_the_task_alive() -> Result<(), Box<dyn Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new()
+        .with_process_manager(manager.clone())
+        .with_foreground_wait(Duration::from_secs(1));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut ctx = context("bash", dir.path());
+    ctx.on_progress = Some(Arc::new(move |text| {
+        let _ = tx.send(text);
+    }));
+    let run = bash.execute(serde_json::json!({"command": "sleep 30"}), ctx);
+    tokio::pin!(run);
+    // Observe the notice while execute is still waiting, not after it yields.
+    let notice = tokio::select! {
+        result = &mut run => return Err(format!("yielded before countdown: {result:?}").into()),
+        notice = rx.recv() => notice.ok_or("progress channel closed")?,
+    };
+    assert_eq!(notice, "Moves to background in 1s; command keeps running.");
+    let result = run.await?;
+    let snapshot = manager
+        .snapshot(task_id(&result)?)
+        .ok_or("task disappeared")?;
+    let status = snapshot.status;
+    manager.terminate_all_and_wait(Duration::from_secs(5)).await;
+    assert!(matches!(
+        status,
+        ProcessStatus::RunningBackground(BackgroundReason::YieldElapsed)
+    ));
+    Ok(())
+}
+
 #[test]
 fn every_background_reason_serializes_under_the_name_the_tui_matches() {
     // `output.ts` switches on these exact strings to say *why* a command went to
@@ -2873,4 +3255,178 @@ async fn a_yielded_command_is_not_blocked_by_the_single_task_cap() -> Result<(),
 
     manager.terminate_all_and_wait(Duration::from_secs(5)).await;
     Ok(())
+}
+
+#[tokio::test]
+async fn a_silent_task_wakes_the_wait_as_stalled_and_backs_off() -> Result<(), Box<dyn Error>> {
+    // The unbounded wait assumed a user at the keyboard. A deadlocked pytest
+    // once held one blocking task_output for 1h35m overnight because nothing
+    // told the model the task had gone silent. Silence, not elapsed time, is
+    // the signal: a healthy build that keeps printing must not trip this.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let output = TaskOutputTool::new(manager.clone()).with_stall_policy(StallPolicy {
+        quiet: Duration::from_millis(200),
+        hard_cap: Duration::from_secs(60),
+    });
+
+    let started = bash
+        .execute(
+            serde_json::json!({"command": "echo start; sleep 30", "run_in_background": true}),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let id = task_id(&started)?.to_string();
+
+    let waited = Instant::now();
+    let first = output
+        .execute(
+            serde_json::json!({"task_id": id}),
+            context("task_output", dir.path()),
+        )
+        .await?;
+    let first_wait = waited.elapsed();
+    assert_eq!(first.details["retrieval_status"], "stalled");
+    assert_eq!(first.details["status"], "running");
+    assert_eq!(first.details["stall_wakes"], 1);
+    assert!(first.details["quiet_ms"]
+        .as_u64()
+        .is_some_and(|ms| ms >= 200));
+    let body = text(&first);
+    // Says what happened, that the task is alive, and what to do — not "ask again".
+    assert!(body.contains("looks stalled"), "got: {body}");
+    assert!(body.contains("no output for"), "got: {body}");
+    assert!(body.contains("still running"), "got: {body}");
+    assert!(body.contains("task_stop"), "got: {body}");
+    assert!(body.contains("Decide now"), "got: {body}");
+    assert!(
+        body.contains("start"),
+        "output tail should be included, got: {body}"
+    );
+    assert!(
+        first_wait < Duration::from_secs(5),
+        "first wait took {first_wait:?}"
+    );
+
+    // A second wait on the same task tolerates twice the silence, so re-waiting
+    // is a real second chance instead of the first slice of a poll loop.
+    let waited = Instant::now();
+    let second = output
+        .execute(
+            serde_json::json!({"task_id": id}),
+            context("task_output", dir.path()),
+        )
+        .await?;
+    let second_wait = waited.elapsed();
+    assert_eq!(second.details["retrieval_status"], "stalled");
+    assert_eq!(second.details["stall_wakes"], 2);
+    // quiet_for is measured on the task: ~200ms already passed before the first
+    // wake, so the second wake lands once total silence reaches ~400ms.
+    assert!(second.details["quiet_ms"]
+        .as_u64()
+        .is_some_and(|ms| ms >= 400));
+    assert!(
+        second_wait < Duration::from_secs(5),
+        "second wait took {second_wait:?}"
+    );
+    assert!(
+        text(&second).contains("A further wait on this task"),
+        "got: {}",
+        text(&second)
+    );
+
+    manager.stop(&id).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_chatty_task_is_not_called_stalled_until_the_hard_cap() -> Result<(), Box<dyn Error>> {
+    // Output keeps arriving well inside the quiet window, so only total runtime
+    // can end the wait. A tail -f or a test spinning on a log line would
+    // otherwise hold the turn forever.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let output = TaskOutputTool::new(manager.clone()).with_stall_policy(StallPolicy {
+        quiet: Duration::from_secs(60),
+        hard_cap: Duration::from_millis(400),
+    });
+
+    let started = bash
+        .execute(
+            serde_json::json!({
+                "command": "for i in $(seq 1 300); do echo tick $i; sleep 0.05; done",
+                "run_in_background": true
+            }),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let id = task_id(&started)?.to_string();
+
+    let result = output
+        .execute(
+            serde_json::json!({"task_id": id}),
+            context("task_output", dir.path()),
+        )
+        .await?;
+    assert_eq!(result.details["retrieval_status"], "stalled");
+    assert!(result.details["quiet_ms"]
+        .as_u64()
+        .is_some_and(|ms| ms < 60_000));
+    let body = text(&result);
+    assert!(body.contains("still going"), "got: {body}");
+    assert!(body.contains("tick"), "got: {body}");
+
+    manager.stop(&id).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_task_finishing_inside_the_quiet_window_is_a_plain_success() -> Result<(), Box<dyn Error>>
+{
+    // Stall detection must not touch the common case.
+    let dir = tempfile::tempdir()?;
+    let manager = Arc::new(ProcessManager::new());
+    let bash = BashTool::new().with_process_manager(manager.clone());
+    let output = TaskOutputTool::new(manager.clone()).with_stall_policy(StallPolicy {
+        quiet: Duration::from_secs(5),
+        hard_cap: Duration::from_secs(60),
+    });
+
+    let started = bash
+        .execute(
+            serde_json::json!({"command": "sleep 0.3; echo done", "run_in_background": true}),
+            context("bash", dir.path()),
+        )
+        .await?;
+    let id = task_id(&started)?.to_string();
+    let result = output
+        .execute(
+            serde_json::json!({"task_id": id}),
+            context("task_output", dir.path()),
+        )
+        .await?;
+    assert_eq!(result.details["retrieval_status"], "success");
+    assert_eq!(result.details["stall_wakes"], 0);
+    assert!(!text(&result).contains("stalled"));
+    Ok(())
+}
+
+#[test]
+fn stall_detection_is_on_by_default_and_runtime_owned() {
+    // The thresholds are a runtime policy: the model cannot lengthen or disable
+    // them through the schema, and the description tells it a stall can end a wait.
+    let manager = Arc::new(ProcessManager::new());
+    let tool = TaskOutputTool::new(manager);
+    let schema = tool.parameters_schema();
+    assert!(schema["properties"]["stall"].is_null());
+    assert!(schema["properties"]["quiet"].is_null());
+    assert!(
+        tool.description().contains("stalled"),
+        "got: {}",
+        tool.description()
+    );
+    assert_eq!(StallPolicy::DEFAULT.quiet, Duration::from_secs(10 * 60));
+    assert_eq!(StallPolicy::DEFAULT.hard_cap, Duration::from_secs(30 * 60));
 }

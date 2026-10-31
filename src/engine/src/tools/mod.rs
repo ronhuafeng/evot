@@ -6,11 +6,13 @@ pub mod naming;
 pub mod process;
 pub mod sandbox;
 pub mod validation;
+#[cfg(feature = "web")]
 pub mod web_fetch;
 
 pub use bash::BashTool;
 pub use explore::GlobTool;
 pub use explore::GrepTool;
+#[cfg(feature = "code-search")]
 pub use explore::SearchTool;
 pub use file::EditFileTool;
 pub use file::ReadFileTool;
@@ -24,8 +26,10 @@ pub use process::ProcessManager;
 pub use process::ProcessSnapshot;
 pub use process::ProcessStatus;
 pub use process::ProcessSummary;
+pub use process::StallPolicy;
 pub use process::TaskOutputTool;
 pub use process::TaskStopTool;
 pub use sandbox::check_available;
 pub use sandbox::SandboxSupport;
+#[cfg(feature = "web")]
 pub use web_fetch::WebFetchTool;

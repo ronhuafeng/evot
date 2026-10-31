@@ -9,15 +9,20 @@
  */
 
 import stringWidth from 'string-width'
+import { confirmationHint } from './confirmation-hint.js'
+import { resolveComposerGuidance, type ComposerGuidance } from '../app/composer-guidance.js'
+import type { SuggestionFeedback } from '../app/suggestion.js'
+import { suggestionStatusText, suggestionAcceptHint, appendCompletionLines } from './suggestion.js'
+import { resolveRunInteraction } from '../app/run-interaction.js'
 import { COMMANDS, HIDDEN_COMMANDS } from '../../commands/index.js'
 import { getTheme } from '../../render/theme/index.js'
 import type { CompletionMenu } from '../input/editor.js'
-import { nextGraphemeBoundary } from '../input/grapheme.js'
-import { CURSOR_MARKER } from '../renderer.js'
+import { CURSOR_MARKER } from '../render-frame.js'
 import { atLeastHeight, atLeastWidth, heightTier, widthTier } from './breakpoints.js'
-import { createFrame } from './frame.js'
-import { promptMode, promptModeLabels, promptModeStyle, type PromptModeStyle } from './prompt-mode.js'
+import { createFrame, type RuleLabels } from './frame.js'
+import { promptMode, promptModeLabels, promptModeStyle } from './prompt-mode.js'
 import { buildPromptFooterBlocks, type PromptFooterVM } from './prompt-footer.js'
+import { rowMarker } from './selector-row.js'
 import { line, block, plain, dim, type ViewBlock, type StyledLine, type StyledSpan } from './types.js'
 import { finiteSize, truncateToWidth, truncateTailToWidth, wrapTextByWidth } from './width.js'
 
@@ -28,11 +33,25 @@ export interface PromptVMInput extends PromptFooterVM {
   active: boolean
   completion: CompletionMenu | null
   ghostHint: string
+  suggestion?: string
+  suggestionPosition?: { current: number; total: number }
+  suggestionCompletion?: string
+  suggestionReplacing?: boolean
+  suggestionStatus?: SuggestionFeedback
+  suggestionExplicit?: boolean
+  suggestionFrame?: number
+  guidance?: ComposerGuidance
   rows: number
   placeholder: boolean
   exitHint: boolean
-  /** Blink phase of the end-of-line caret; the on-character block never blinks. */
-  caretVisible: boolean
+  /** A turn is running. The placeholder then says what typing does now: steer it. */
+  busy?: boolean
+  /** Prompts waiting to reach the running turn. The placeholder points at their management shortcut. */
+  queuedCount?: number
+  /** A `/loop` is parked between ticks. The placeholder then says the loop
+   *  is still steerable: a plain message runs now, `/loop <interval>` changes
+   *  the pace, `esc` ends it. */
+  loopParked?: boolean
 }
 
 export interface PromptLayoutOptions {
@@ -48,13 +67,6 @@ const KNOWN_COMMANDS = new Set(
 /** Completion viewport height: taller terminals get more candidates. */
 const COMPLETION_ROWS_COMPACT = 5
 const COMPLETION_ROWS_TALL = 12
-
-/**
- * Three-eighths block (U+258D): the end-of-line caret. Thin enough to read as
- * a caret rather than a filled cell, and wide enough to survive fonts that
- * render the one-eighth bar as a hairline or drop it entirely.
- */
-const CARET = '▍'
 
 /** Share of the terminal the editor may grow to before it starts scrolling. */
 const MAX_INPUT_ROWS_RATIO = 0.3
@@ -86,17 +98,53 @@ function overflowLabel(arrow: '↑' | '↓', count: number): string | undefined 
 }
 
 /**
- * The top border label. Mode and scroll overflow compete for one slot, so they
- * share it: `╭─ plan · ↑ 3 lines ──╮`. Mode leads because it says what pressing
- * enter will do, while overflow only says where you are in a draft.
- *
- * The label carries the mode as text, not just as border hue — colour alone
- * fails on monochrome terminals and for colour-blind users.
+ * The top rule carries two labels at opposite ends: scroll overflow on the
+ * left where reading starts, and the mode on the right in the mode's own hue
+ * (`── ↑ 3 lines ──────── (log) ─`). The mode is text, not just colour —
+ * colour alone fails on monochrome terminals and for colour-blind users.
  */
-function topLabel(modes: string[], overflow: string | undefined): string | undefined {
-  const mode = modes.join(' · ')
-  if (!mode) return overflow
-  return overflow ? `${mode} · ${overflow}` : mode
+function topLabels(modes: string[], modeHex: string, overflow: string | undefined): RuleLabels {
+  const labels: RuleLabels = {}
+  if (overflow) labels.lead = overflow
+  if (modes.length > 0) labels.mode = { text: modes.join(' · '), hex: modeHex }
+  return labels
+}
+
+/**
+ * What the empty composer says. State beats mode: while a turn runs, the
+ * useful thing to know is that typing steers it, not which mode the next turn
+ * will start in.
+ */
+function composerGuidance(input: PromptVMInput): ComposerGuidance {
+  return input.guidance ?? resolveComposerGuidance({
+    interaction: resolveRunInteraction({ active: input.busy ?? false, owner: null, loopParked: input.loopParked }),
+    mode: input.logMode ? 'log' : 'normal',
+    queuedCount: input.queuedCount,
+  })
+}
+
+function suggestionVisible(input: PromptVMInput): boolean {
+  return input.active && !input.completion && (input.suggestionExplicit === true || composerGuidance(input).allowSuggestion)
+}
+
+function visibleSuggestion(input: PromptVMInput): string {
+  return input.placeholder && suggestionVisible(input) ? input.suggestion ?? '' : ''
+}
+
+/** Explicit draft completion remains available while foreground work runs. */
+function visibleCompletion(input: PromptVMInput): string {
+  return !input.placeholder && suggestionVisible(input)
+    ? input.suggestionCompletion ?? '' : ''
+}
+
+/** Feedback for an explicit Tab while nothing is showing yet. */
+function statusGhost(input: PromptVMInput): string {
+  if (!suggestionVisible(input)) return ''
+  return suggestionStatusText(input)
+}
+
+function completionGhost(input: PromptVMInput, completion: string): string {
+  return `${completion}${suggestionAcceptHint(input)}`
 }
 
 export function buildPromptBlocks(input: PromptVMInput, options: PromptLayoutOptions = {}): ViewBlock[] {
@@ -104,9 +152,9 @@ export function buildPromptBlocks(input: PromptVMInput, options: PromptLayoutOpt
   const rows = finiteSize(input.rows, 24)
   const mode = promptModeStyle(promptMode(input))
   const modeLabels = promptModeLabels(input)
-  const frame = createFrame(columns, { rows, hex: mode.hex })
+  const frame = createFrame(columns, { rows })
 
-  const visual = buildInputLines(input, frame.contentWidth, columns, mode)
+  const visual = buildInputLines(input, frame.contentWidth, columns)
   const maxInputRows = Math.max(MAX_INPUT_ROWS_FLOOR, Math.floor(rows * MAX_INPUT_ROWS_RATIO))
   const start = Math.max(0, Math.min(visual.cursorIndex - maxInputRows + 1, visual.lines.length - maxInputRows))
   const end = Math.min(visual.lines.length, start + maxInputRows)
@@ -120,6 +168,7 @@ export function buildPromptBlocks(input: PromptVMInput, options: PromptLayoutOpt
     - (frame.framed ? 1 : 0)
     - (input.exitHint ? 1 : 0)
     - (input.backgroundProcessCount > 0 ? 1 : 0)
+    - (visibleSuggestion(input) && composerGuidance(input).operationHint ? 1 : 0)
     - 2) // repository footer + trailing blank; background status is budgeted above
   const completionLines = buildCompletionLines(
     input.completion,
@@ -129,8 +178,8 @@ export function buildPromptBlocks(input: PromptVMInput, options: PromptLayoutOpt
   )
   // The candidate list already gives the composer height, so the blank-row
   // floor only applies when no menu is open. Otherwise the two stack and push
-  // the candidates away from what you typed. Rails are what make the blanks
-  // read as composer space, so an unframed terminal gets none.
+  // the candidates away from what you typed. The caret indent is what makes
+  // the blanks read as composer space, so an unframed terminal gets none.
   const filler = completionLines.length > 0 || !frame.framed
     ? 0
     : Math.max(0, minInputRows(rows) - inputRows.length)
@@ -141,29 +190,34 @@ export function buildPromptBlocks(input: PromptVMInput, options: PromptLayoutOpt
   const blank = () => frame.row(line(plain('')))
 
   const blocks: ViewBlock[] = []
-  // On a very short terminal the border rows are two of very few, and the
+  // On a very short terminal the rule rows are two of very few, and the
   // transcript needs them more than the composer needs an outline. The caret
   // still marks the row as the place you type, and the footer takes the mode
   // back over.
-  if (frame.ruled) blocks.push(block([frame.top(topLabel(modeLabels, overflowLabel('↑', start)))], options.attachedAbove ? 0 : 1))
+  if (frame.ruled) blocks.push(block([frame.top(topLabels(modeLabels, mode.hex, overflowLabel('↑', start)))], options.attachedAbove ? 0 : 1))
+  // The caret leads the first visible row only. Wrapped and later lines sit
+  // flush underneath, the way a multi-line shell prompt continues.
   blocks.push(block([
     ...Array.from({ length: above }, blank),
-    ...inputRows.map(frame.row),
+    ...inputRows.map((row, index) => frame.row(row, index === 0)),
     ...Array.from({ length: filler - above }, blank),
   ], frame.ruled ? undefined : (options.attachedAbove ? 0 : 1)))
 
   if (completionLines.length > 0) {
-    // A blank rail row separates what you typed from what is being suggested;
+    // A blank row separates what you typed from what is being suggested;
     // without it the selected candidate reads as a continuation of the input.
     // Only inside the frame: unframed terminals are too short to spend a row.
-    if (frame.framed) blocks.push(block([frame.row(line(plain('')))]))
-    blocks.push(block(completionLines.map(frame.row)))
+    if (frame.framed) blocks.push(block([blank()]))
+    blocks.push(block(completionLines.map(row => frame.row(row))))
   }
-  if (frame.ruled) blocks.push(block([frame.bottom(overflowLabel('↓', visual.lines.length - end))]))
+  if (frame.ruled) blocks.push(block([frame.bottom({ lead: overflowLabel('↓', visual.lines.length - end) })]))
 
-  if (input.exitHint) blocks.push(block([line(dim(truncateToWidth('  Press Ctrl+C again to exit', columns)))]))
+  if (input.exitHint) blocks.push(block([line(confirmationHint(truncateToWidth('  Press Ctrl+C again to exit', columns), true))]))
   // The border label carries the mode whenever it is drawn, so the footer only
   // repeats it on terminals too short for a border.
+  if (visibleSuggestion(input) && composerGuidance(input).operationHint) {
+    blocks.push(block([line(dim(truncateToWidth(`  ${composerGuidance(input).operationHint}`, columns)))]))
+  }
   blocks.push(...buildPromptFooterBlocks(input, { modeShownAbove: frame.ruled }))
   return blocks
 }
@@ -173,7 +227,6 @@ function buildInputLines(
   input: PromptVMInput,
   contentWidth: number,
   columns: number,
-  mode: PromptModeStyle,
 ): { lines: StyledLine[]; cursorIndex: number } {
   const lines: StyledLine[] = []
   // No prompt prefix any more, so text gets the full content width. When the
@@ -181,20 +234,31 @@ function buildInputLines(
   // rather than stealing a column from every line.
   const width = Math.max(1, contentWidth)
   let cursorIndex = 0
+  const completion = visibleCompletion(input)
+  // Ghost replacement never mutates the editor. The saved suffix returns as
+  // soon as the preview is dismissed or the caret/draft changes.
+  const replacing = Boolean(completion) && input.suggestionReplacing
+  const displayedLines = replacing
+    ? [...input.lines.slice(0, input.cursorLine), (input.lines[input.cursorLine] ?? '').slice(0, input.cursorCol)]
+    : input.lines
 
-  for (let lineIndex = 0; lineIndex < input.lines.length; lineIndex++) {
-    const text = input.lines[lineIndex]!
+  for (let lineIndex = 0; lineIndex < displayedLines.length; lineIndex++) {
+    const text = displayedLines[lineIndex]!
     const active = input.active && lineIndex === input.cursorLine
-    if (active && text === '' && input.lines.length === 1 && input.placeholder) {
+    if (active && text === '' && input.lines.length === 1 && input.placeholder && !replacing) {
       cursorIndex = lines.length
-      // The caret occupies 1 column; the rest is hint.
-      const full = atLeastWidth(widthTier(columns), 'md') ? mode.hint : mode.shortHint
-      const hint = truncateToWidth(` ${full}`, Math.max(0, contentWidth - 1))
-      lines.push(line(
-        plain(CURSOR_MARKER),
-        caret(input.caretVisible),
-        ...(hint ? [dim(hint)] : []),
-      ))
+      // The native cursor sits on the first hint cell without inserting text.
+      const guidance = composerGuidance(input)
+      const suggestion = visibleSuggestion(input)
+      const acceptHint = suggestionAcceptHint(input)
+      const full = suggestion
+        ? `${truncateToWidth(suggestion, Math.max(0, contentWidth - stringWidth(acceptHint)))}${acceptHint}`
+        : statusGhost(input).trimStart() || (atLeastWidth(widthTier(columns), 'md') ? guidance.placeholder : guidance.shortPlaceholder)
+      // An automatic request that found nothing: say so beside the placeholder
+      // so an empty composer is not read as "suggestions never ran".
+      const quiet = !suggestion && input.suggestionStatus === 'quiet' && suggestionVisible(input) ? ' · no suggestion' : ''
+      const hint = truncateToWidth(`${full}${quiet}`, contentWidth)
+      lines.push(line(plain(CURSOR_MARKER), ...(hint ? [dim(hint)] : [])))
       continue
     }
 
@@ -224,29 +288,19 @@ function buildInputLines(
 
       cursorIndex = lines.length
       const cursorCol = Math.max(0, input.cursorCol - chunk.start)
-      const rawGhost = !input.completion && chunk.end === text.length ? input.ghostHint : ''
+      const rawGhost = !input.completion && chunk.end === text.length
+        ? (completion ? completionGhost(input, completion) : statusGhost(input) || input.ghostHint) : ''
       // Style the whole chunk before splitting, otherwise a command straddling
       // the cursor is scored as two fragments and loses its brand hue.
       const styled = styleInputText(textChunk)
-      const graphemeEnd = nextGraphemeBoundary(textChunk, cursorCol)
-      const onChar = cursorCol < textChunk.length
       const [before, rest] = splitSpansAt(styled, cursorCol)
-      const spans: StyledSpan[] = [...before, plain(CURSOR_MARKER)]
-      if (onChar) {
-        // The cursor sits on a character: flip that cell to a solid block so
-        // the glyph stays visible and the line width is unchanged — no extra
-        // column, no word split.
-        const [onSpans, after] = splitSpansAt(rest, graphemeEnd - cursorCol)
-        spans.push(...onSpans.map(cursorBlock), ...after)
-      } else {
-        // At the end of the line there is nothing to sit on, so draw a thin
-        // bar in the caret column instead.
-        spans.push(caret(input.caretVisible))
+      // Position only: the terminal owns shape, color, blink and wide-cell fill.
+      const spans: StyledSpan[] = [...before, plain(CURSOR_MARKER), ...rest]
+      if (completion && (replacing || completion.includes('\n'))) {
+        appendCompletionLines(lines, spans, textChunk, rawGhost, width)
+        continue
       }
-      // The hint is advisory, so it yields to the terminal edge rather than
-      // overflowing it: `getGhostHint` can return the full command list, which
-      // is far wider than a narrow terminal. The bar costs one column when shown.
-      const ghostBudget = contentWidth - stringWidth(textChunk) - (onChar ? 0 : 1)
+      const ghostBudget = contentWidth - stringWidth(textChunk)
       const ghost = rawGhost ? truncateToWidth(rawGhost, Math.max(0, ghostBudget)) : ''
       if (ghost) spans.push(dim(ghost))
       lines.push(line(...spans))
@@ -293,7 +347,7 @@ function buildCompletionLines(
     const label = truncateTailToWidth(item.label, labelWidth)
     const padding = ' '.repeat(Math.max(0, labelWidth - stringWidth(label)))
     const bg = selected ? selectionBgHex : undefined
-    const prefix = selected ? { text: '❯ ', hex: brandHex, bold: true, bg } : plain('  ')
+    const prefix = rowMarker(selected, bg)
     const labelSpan = selected ? { text: label, hex: brandHex, bold: true, bg } : plain(label)
     const descriptionWidth = Math.max(0, contentWidth - 2 - labelWidth - 2)
     const description = item.description && descriptionWidth > 0
@@ -340,29 +394,6 @@ function styleInputText(text: string): StyledSpan[] {
 function blurred(span: StyledSpan): StyledSpan {
   const { hex: _hex, bold: _bold, ...rest } = span
   return { ...rest, dim: true }
-}
-
-/**
- * The end-of-line caret: a thin vertical bar in the cursor hue. Used only
- * where there is no character to sit on, so it reads as "type here" without an
- * `❯` prefix. Mid-line, `cursorBlock` highlights the character instead.
- *
- * On the blink's off phase the bar becomes a space, so the column stays claimed
- * and nothing after it shifts.
- */
-function caret(visible = true): StyledSpan {
-  if (!visible) return plain(' ')
-  return { text: CARET, hex: getTheme().cursorHex, bold: true }
-}
-
-/**
- * Recolour a span as the cell the cursor sits on: a solid block of the cursor
- * hue with contrasting text. Unlike inserting a bar, this keeps the glyph
- * visible and does not shift the rest of the line by a column.
- */
-function cursorBlock(span: StyledSpan): StyledSpan {
-  const { cursorHex, cursorFgHex } = getTheme()
-  return { ...span, hex: cursorFgHex, fg: undefined, bg: cursorHex, dim: false, bold: true }
 }
 
 /**

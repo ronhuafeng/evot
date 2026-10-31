@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll } from 'bun:test'
+import { createAppSelectorState } from '../src/term/app/selector-identity.js'
 import {
   createSelectorState,
   selectorUp,
@@ -11,10 +12,12 @@ import {
   selectorFocusOn,
   selectorRemoveItem,
   warmSearchableText,
+  SELECTOR_VIEWPORT,
   type SelectorState,
 } from '../src/term/selector.js'
-import { buildOverlayBlocks, buildSelectorRegionLines } from '../src/term/viewmodel/overlays.js'
-import { CURSOR_MARKER } from '../src/term/renderer.js'
+import { buildOverlayBlocks } from '../src/term/viewmodel/overlays.js'
+import { buildSelectorRegionLines } from '../src/term/viewmodel/selector.js'
+import { CURSOR_MARKER } from '../src/term/render-frame.js'
 import { getTheme } from '../src/render/theme/index.js'
 import { blocksToLines } from '../src/term/viewmodel/types.js'
 import stripAnsi from 'strip-ansi'
@@ -28,6 +31,21 @@ const items = [
   { label: 'gpt-4o', detail: 'OpenAI' },
   { label: 'gemini-pro', detail: 'Google' },
 ]
+
+test('cloud session scope survives navigation, searching and asynchronous expansion', () => {
+  const cloudRows = [{ id: 'a', label: 'alpha' }, { id: 'b', label: 'beta' }]
+  let state: SelectorState = {
+    ...createAppSelectorState('resume', 'Cloud sessions', cloudRows),
+    sessionScope: 'cloud',
+  }
+  for (const step of [selectorFocusList, selectorDown, selectorUp,
+    (s: SelectorState) => selectorType(s, 'a'), selectorBackspace,
+    (s: SelectorState) => selectorExpandItems(s, cloudRows)]) {
+    state = step(state)
+    expect(state.sessionScope).toBe('cloud')
+    expect(state.allItems.map(row => row.id)).toEqual(['a', 'b'])
+  }
+})
 
 describe('createSelectorState', () => {
   test('creates state with focus at 0', () => {
@@ -142,11 +160,12 @@ describe('renderSelector via viewmodel', () => {
     expect(lines[5]).toBe('models.')
     expect(lines[7]).toStartWith('>  ')
     expect(lines[9]).toBe('  openai')
-    expect(lines[10]).toBe('❯ grok-4.5 ✓')
+    expect(lines[10]).toBe('· grok-4.5 ✓')
     expect(lines[11]).toBe('')
     expect(lines[12]).toBe('  droid')
-    expect(lines[13]).toBe('  gpt-5.6-sol')
-    expect(lines[15]).toBe('  Model Name: grok-4.5')
+    // Idle model rows carry a `·` gutter; only group headings keep two spaces.
+    expect(lines[13]).toBe('· gpt-5.6-sol')
+    expect(lines[15]).toBe('  Model: grok-4.5')
     expect(lines.at(-1)).toBe('─'.repeat(40))
     expect(lines.join('\n')).not.toContain('Models  2')
     expect(lines.join('\n')).not.toContain('enter select')
@@ -185,7 +204,7 @@ describe('renderSelector via viewmodel', () => {
     // Typing keeps focus in the search input, but the current row retains the
     // same complete visual state used by every selector. The match still sits
     // under its own provider heading, named once.
-    expect(text).toContain('  droid\n❯ gpt-5.6-sol')
+    expect(text).toContain('  droid\n· gpt-5.6-sol')
     expect(text).not.toContain('[droid]')
   })
 
@@ -208,12 +227,12 @@ describe('renderSelector via viewmodel', () => {
 
     expect(lines.slice(listStart, listStart + 8)).toEqual([
       '  openai',
-      '❯ gpt-5.6-sol ✓',
-      '  grok-4.5',
+      '· gpt-5.6-sol ✓',
+      '· grok-4.5',
       '',
       '  anthropic',
-      '  claude-opus-4-8',
-      '  claude-sonnet-5',
+      '· claude-opus-4-8',
+      '· claude-sonnet-5',
       '',
     ])
     expect(lines.join('\n')).not.toContain('[openai]')
@@ -295,24 +314,24 @@ describe('renderSelector via viewmodel', () => {
     const state = createSelectorState('T', items)
     const lines = blocksToLines(buildOverlayBlocks({ kind: 'selector', state }, 80))
     const text = lines.map(l => stripAnsi(l)).join('\n')
-    expect(text).toContain('❯ claude-opus')
+    expect(text).toContain('· claude-opus')
   })
 
   test('shows navigation hint', () => {
     const state = createSelectorState('T', items)
     const lines = blocksToLines(buildOverlayBlocks({ kind: 'selector', state }, 80))
     const text = lines.map(l => stripAnsi(l)).join('\n')
-    expect(text).toContain('move')
-    expect(text).toContain('enter select')
+    expect(text).toContain('↑↓ select')
+    expect(text).toContain('↵ confirm')
     expect(text).toContain('esc close')
   })
 
   test('shows queue actions with the shared Ctrl+D remove shortcut', () => {
-    const state = createSelectorState('Prompt queue', items)
+    const state = createAppSelectorState('queue', 'Prompt queue', items)
     const lines = blocksToLines(buildOverlayBlocks({ kind: 'selector', state }, 80))
     const text = lines.map(l => stripAnsi(l)).join('\n')
-    expect(text).toContain('enter edit')
-    expect(text).toContain('Ctrl+D remove')
+    expect(text).toContain('↵ edit')
+    expect(text).toContain('ctrl+d remove')
     expect(text).not.toContain('del remove')
   })
 
@@ -346,7 +365,7 @@ describe('renderSelector via viewmodel', () => {
     expect(text).toContain('gpt-5.6-sol@cursor')
   })
 
-  test('renders provider group headers as dividers', () => {
+  test('renders provider group headers the same way every list does', () => {
     const state = createSelectorState('Models', [
       { label: 'anthropic', header: true, focusable: false },
       { label: 'claude-opus' },
@@ -356,9 +375,11 @@ describe('renderSelector via viewmodel', () => {
     ])
     const lines = blocksToLines(buildOverlayBlocks({ kind: 'selector', state }, 80))
     const text = lines.map(l => stripAnsi(l)).join('\n')
-    expect(text).toContain('── anthropic ──\n❯ claude-opus\n\n── openai ──')
-    expect(text).toContain('── openai ──')
-    expect(text).toContain('❯ claude-opus')
+    // One heading treatment across /model, /skill and /resume: indented accent
+    // label, blank line between groups. No per-list divider rule.
+    expect(text).toContain('  anthropic\n· claude-opus\n\n  openai')
+    expect(text).not.toContain('── ')
+    expect(text).toContain('· claude-opus')
     // Headers and spacing rows do not count as selectable items in the title tally.
     expect(text).toContain('Models  2')
   })
@@ -388,7 +409,7 @@ describe('renderSelector via viewmodel', () => {
       .map(part => Number.parseInt(part, 16))
 
     expect(preview).toContain(`\x1b[48;2;${red};${green};${blue}m`)
-    expect(stripAnsi(preview)).toContain('❯ gpt-4o ✓')
+    expect(stripAnsi(preview)).toContain('· gpt-4o ✓')
   })
 
   test('model preview omits the selector cursor while the composer is focused', () => {
@@ -401,7 +422,7 @@ describe('renderSelector via viewmodel', () => {
 
     expect(active).toContain(CURSOR_MARKER)
     expect(preview).not.toContain(CURSOR_MARKER)
-    expect(stripAnsi(preview)).toContain('Model Name:')
+    expect(stripAnsi(preview)).toContain('Model:')
   })
 
   test('a promoted model window drops its search caret, leaving one cursor', () => {
@@ -415,7 +436,7 @@ describe('renderSelector via viewmodel', () => {
     const promoted = buildSelectorRegionLines(state, 80, 24, true).join('\n')
 
     expect(promoted).not.toContain(CURSOR_MARKER)
-    expect(stripAnsi(promoted)).toContain('Model Name:')
+    expect(stripAnsi(promoted)).toContain('Model:')
   })
 
   test('generic selector transfers its cursor without changing row geometry', () => {
@@ -448,8 +469,8 @@ describe('renderSelector via viewmodel', () => {
 
     expect(preview).toContain(background)
     expect(focused).toContain(background)
-    expect(stripAnsi(preview)).toContain('❯ 01a06b6f  repl  current session')
-    expect(stripAnsi(focused)).toContain('❯ 01a06b6f  repl  current session')
+    expect(stripAnsi(preview)).toContain('· 01a06b6f  repl  current session')
+    expect(stripAnsi(focused)).toContain('· 01a06b6f  repl  current session')
   })
 })
 
@@ -521,6 +542,29 @@ describe('preview pane', () => {
     )
 
     expect(dividerColumns.size).toBe(1)
+  })
+
+  test('keeps the same pane height when focus moves between short and long previews', () => {
+    const state = createSelectorState('Resume session', [
+      { label: 'aaaaaaaa', preview: ['short', 'm1 · 1 turn · 1h ago'] },
+      {
+        label: 'bbbbbbbb',
+        preview: [
+          'long session',
+          'm1 · 40 turns · 1h ago',
+          '',
+          '# Started with', '› the original goal',
+          '',
+          '# Latest', '› later turn 1', '› later turn 2', '› later turn 3',
+          '',
+          '# Changed 3 files', '  a.ts · b.ts · c.ts',
+        ],
+      },
+    ])
+    const height = (focus: number) => rows({ ...state, focusIndex: focus }, 120)
+      .filter(row => row.includes('│')).length
+    expect(height(0)).toBe(height(1))
+    expect(height(0)).toBeGreaterThanOrEqual(SELECTOR_VIEWPORT)
   })
 
   test('stays within the terminal width without wrapping rows', () => {
@@ -598,6 +642,38 @@ describe('preview pane', () => {
     expect(text).toContain('the turn that must stay visible')
   })
 
+  test('sections trim by priority: Latest tail first, Changed dropped, Started with pinned', () => {
+    const sectioned = [
+      'sectioned session',
+      'm1 · 20 turns · 2d ago → 1h ago',
+      '',
+      '# Started with', '› the original goal',
+      '',
+      '# Latest', '› later turn 10', '› later turn 11', '› later turn 12',
+      '',
+      '# Changed 3 files', '  a.ts · b.ts · c.ts',
+    ]
+    const items = [
+      { label: 'hhhhhhhh', preview: sectioned },
+      ...Array.from({ length: 8 }, (_, i) => ({ label: `row-${i}`, preview: ['other'] })),
+    ]
+    const state = createSelectorState('Resume session', items)
+    const pane = rows(state, 160)
+      .filter(row => row.includes('│'))
+      .map(row => row.slice(row.indexOf('│') + 1).trim())
+
+    // The pinned opening ask survives; the list keeps its tail behind a cut and
+    // the optional Changed section is dropped before anything is truncated.
+    expect(pane).toContain('Started with')
+    expect(pane).toContain('› the original goal')
+    expect(pane).toContain('Latest')
+    expect(pane).toContain('⋮')
+    expect(pane).toContain('› later turn 12')
+    expect(pane).not.toContain('› later turn 10')
+    expect(pane).not.toContain('Changed 3 files')
+    expect(pane.indexOf('Started with')).toBeLessThan(pane.indexOf('Latest'))
+  })
+
   test('caps one entry so a single long turn cannot fill the pane', () => {
     // A pasted draft arrives as one turn with its newlines already collapsed.
     const draft = 'polish this tweet and make it shorter '.repeat(20)
@@ -626,7 +702,7 @@ describe('preview pane', () => {
     // Entry heights from the end are 2, 1, 2, 2, 2 — suffix sums 2, 3, 5, 7, 9.
     // The post-cut body budget is 6, which no suffix hits, so a row-based cut
     // has to land inside an entry while an entry-based one cannot.
-    const words = Array.from({ length: 16 }, (_, i) => `w${i}`).join(' ')
+    const words = Array.from({ length: 24 }, (_, i) => `w${i}`).join(' ')
     const twoRows = (label: string) => `› ${label} ${words}`
     const state = createSelectorState('Resume session', [{
       label: 'gggggggg',
@@ -863,34 +939,31 @@ describe('searchText field', () => {
   })
 
   test('snippets are built for rows that are read, not for every match', () => {
-    // A one-letter query matches thousands of rows while only ~10 are drawn.
-    // Cutting a snippet out of every matched transcript up front is what made
-    // the first keystroke stall, so `detail` resolves on access instead.
-    const bulk = Array.from({ length: 3000 }, (_, index) => ({
+    const prefixReads = Array<number>(12).fill(0)
+    const bulk = prefixReads.map((_, index) => ({
       label: `session-${index}`,
       detail: 'title',
-      searchText: `session-${index} ${'Payment timeout on checkout '.repeat(300)}`,
+      searchText: `session-${index} Payment timeout on checkout`,
+      get contextPrefix() {
+        prefixReads[index] = prefixReads[index]! + 1
+        return 'Resume: '
+      },
     }))
-    let state = createSelectorState('Resume session', bulk)
-    // Warm the lowercase cache so this measures snippet work alone.
-    const cancel = warmSearchableText(bulk)
-    for (const item of bulk) void item.searchText.toLowerCase()
-    cancel()
+    const state = selectorType(createSelectorState('Resume session', bulk), 'p')
 
-    const started = performance.now()
-    state = selectorType(state, 'p')
-    const elapsed = performance.now() - started
+    expect(state.items).toHaveLength(bulk.length)
+    // Copying each row reads its prefix once; resolving a snippet reads it again.
+    expect(prefixReads).toEqual(Array(12).fill(1))
 
-    expect(state.items.length).toBe(3000)
-    expect(elapsed).toBeLessThan(60)
-
-    // Reading a row still yields its snippet, in the original casing, and
-    // reading is idempotent.
     const first = state.items[0]!
+    expect(first.detail).toContain('Resume: ')
     expect(first.detail).toContain('Payment')
-    expect(first.detail).toBe(first.detail)
-    // Snippets are enumerable properties, so spreading a row keeps its detail.
+    expect(prefixReads).toEqual([2, ...Array(11).fill(1)])
     expect({ ...first }.detail).toBe(first.detail)
+    expect(prefixReads).toEqual([2, ...Array(11).fill(1)])
+
+    expect(state.items[1]!.detail).toContain('Payment')
+    expect(prefixReads).toEqual([2, 2, ...Array(10).fill(1)])
   })
 
   test('warmSearchableText yields between slices and is cancellable', async () => {
@@ -1022,6 +1095,35 @@ describe('selectorExpandItems', () => {
     state = selectorExpandItems(state, expanded)
     expect(state.items[state.focusIndex]?.id).toBe('openai:grok-4.5')
     expect(state.query).toBe('')
+  })
+
+  test('follows the focused model when a refresh regroups its provider', () => {
+    // The catalog merged `evot-pro-openai` into `evot-pro`: the row's id
+    // (spec) changed under the user, but it is the same model. Enter must
+    // still pick it rather than whatever landed first.
+    const initial = [
+      { label: 'Evot Premium', header: true, focusable: false, group: 'pro-anthropic' },
+      { label: 'claude-opus-4-6', id: 'evot-pro-anthropic:claude-opus-4-6', identity: 'claude-opus-4-6', group: 'pro-anthropic' },
+      { label: 'Evot Premium', header: true, focusable: false, group: 'pro-openai' },
+      { label: 'gpt-6.1-sol', id: 'evot-pro-openai:gpt-6.1-sol', identity: 'gpt-6.1-sol', group: 'pro-openai' },
+    ]
+    let state = { ...createSelectorState('Models', initial), presentation: 'model' as const }
+    state = selectorFocusOn(state, item => item.id === 'evot-pro-openai:gpt-6.1-sol')
+
+    const regrouped = [
+      { label: 'Evot Premium', header: true, focusable: false, group: 'pro' },
+      { label: 'claude-opus-4-6', id: 'evot-pro:claude-opus-4-6', identity: 'claude-opus-4-6', group: 'pro' },
+      { label: 'gpt-6.1-sol', id: 'evot-pro:gpt-6.1-sol', identity: 'gpt-6.1-sol', group: 'pro' },
+    ]
+    state = selectorExpandItems(state, regrouped)
+    expect(state.items[state.focusIndex]?.id).toBe('evot-pro:gpt-6.1-sol')
+
+    // Without an identity the old behaviour stands: the exact row is gone,
+    // so focus falls back to the first choice.
+    let plain = { ...createSelectorState('Models', initial.map(({ identity: _identity, ...item }) => item)), presentation: 'model' as const }
+    plain = selectorFocusOn(plain, item => item.id === 'evot-pro-openai:gpt-6.1-sol')
+    plain = selectorExpandItems(plain, regrouped.map(({ identity: _identity, ...item }) => item))
+    expect(plain.items[plain.focusIndex]?.id).toBe('evot-pro:claude-opus-4-6')
   })
 
   test('keeps a typed query after an async refresh', () => {

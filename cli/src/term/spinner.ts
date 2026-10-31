@@ -3,8 +3,12 @@
  * Pure logic: returns the string to display, no React.
  */
 
+import { providerFailurePresentation } from '../provider/error-presentation.js'
 import { formatCacheHitPercent } from '../render/cache.js'
-import { backgroundChord } from './app/hint.js'
+import { truncateAnsiToWidth, visibleWidth } from '../render/wrap.js'
+import { resolveRunInteraction, type RunInteractionState } from './app/run-interaction.js'
+import { runStatusPresentation } from './viewmodel/run-status.js'
+import { confirmationHintAnsi } from './viewmodel/confirmation-hint.js'
 
 function getSpinnerChars(): string[] {
   if (process.env.TERM === 'xterm-ghostty') {
@@ -20,11 +24,17 @@ const SPINNER_FRAMES = [...SPINNER_CHARS, ...[...SPINNER_CHARS].reverse()]
 const SLOW_THRESHOLD_MS = 8000
 // Actions that legitimately run long get wider thresholds so routine
 // execution is not painted red as "slow": bash commands regularly outlive 8s
-// (builds, test suites), and manual compaction includes an LLM summarization
-// pass with a 30s budget before its deterministic fallback kicks in.
+// (builds, test suites), and compaction includes a potentially long LLM
+// summarization pass. These are display thresholds, not execution deadlines.
 const SLOW_THRESHOLD_BY_TOOL_MS: Record<string, number> = {
   bash: 30_000,
   compact: 30_000,
+  compact_prune: 30_000,
+  compact_remote: 30_000,
+  compact_local: 30_000,
+  compact_local_fallback: 30_000,
+  compact_waiting: 30_000,
+  compact_generating: 30_000,
   log_shot_render: 30_000,
   log_shot_chrome: 30_000,
   log_shot_capture: 30_000,
@@ -77,6 +87,21 @@ export function isPassiveWaitPhase(phase: SpinnerPhase): boolean {
   return phase === 'awaiting_background'
 }
 
+/** Share compaction phase/activity presentation between automatic and manual runs. */
+export function compactionToolName(phase: string | null, activity?: string | null): string {
+  if (phase === 'local' || phase === 'local_fallback') {
+    if (activity === 'waiting') return 'compact_waiting'
+    if (activity === 'generating') return 'compact_generating'
+  }
+  switch (phase) {
+    case 'pruning': return 'compact_prune'
+    case 'remote': return 'compact_remote'
+    case 'local_fallback': return 'compact_local_fallback'
+    case 'local': return 'compact_local'
+    default: return 'compact'
+  }
+}
+
 /**
  * Map a tool name to a human action label shown on the spinner while it runs.
  * Grouped into verbs that mirror the tool-card glyphs (read/search/edit/...).
@@ -90,12 +115,14 @@ export function toolActionLabel(toolName: string): string {
     case 'write': case 'file_write': return 'Writing file'
     case 'bash': return 'Running command'
     case 'web_fetch': case 'webfetch': return 'Fetching'
-    case 'plan': return 'Planning'
     case 'skill': return 'Loading skill'
     case 'compact': return 'Compacting'
+    case 'compact_prune': return 'Asking judge which tool calls still matter'
     case 'compact_remote': return 'Compacting remote'
     case 'compact_local': return 'Compacting local'
     case 'compact_local_fallback': return 'Compacting local fallback'
+    case 'compact_waiting': return 'Compacting · waiting for summary'
+    case 'compact_generating': return 'Compacting · generating summary'
     case 'log_shot_render': return 'Rendering shot'
     case 'log_shot_chrome': return 'Starting Chrome'
     case 'log_shot_capture': return 'Capturing PNG'
@@ -113,6 +140,9 @@ export interface SpinnerState {
   streaming: boolean
   toolName: string | null
   waitRetryAt: number | null
+  /** Raw diagnostics are not displayed; the shared provider presenter maps them. */
+  retryError?: string
+  recoveryStartedAt?: number
   /** Which attempt the current retry storm is on, and its ceiling.
    *
    *  Held on the spinner rather than emitted as a card per attempt: the counter
@@ -166,10 +196,12 @@ export function setSpinnerPhase(state: SpinnerState, phase: SpinnerPhase, toolNa
   }
 }
 
-export function setLongWait(state: SpinnerState, phase: LongWaitPhase, delayMs: number, now = Date.now()): SpinnerState {
+export function setLongWait(state: SpinnerState, phase: LongWaitPhase, delayMs: number, now = Date.now(), error?: string): SpinnerState {
   return {
     ...resetStreamStats(state),
     phase,
+    recoveryStartedAt: state.recoveryStartedAt ?? now,
+    retryError: error ?? state.retryError,
     phaseStartedAt: now,
     toolName: null,
     waitRetryAt: now + Math.max(0, delayMs),
@@ -193,10 +225,13 @@ export function setRetryWait(
   attempt: number,
   maxAttempts: number,
   now = Date.now(),
+  error?: string,
 ): SpinnerState {
   return {
     ...resetStreamStats(state),
     phase: 'retrying',
+    recoveryStartedAt: state.recoveryStartedAt ?? now,
+    retryError: error ?? state.retryError,
     phaseStartedAt: now,
     toolName: null,
     waitRetryAt: now + Math.max(0, delayMs),
@@ -251,18 +286,13 @@ export interface SpinnerStats {
 }
 
 export interface SpinnerFormatOptions {
-  /** Show the keyboard interrupt hint. Defaults to true for agent/tool runs. */
-  interruptible?: boolean
+  /** Shared capabilities from the run interaction controller. */
+  interaction?: RunInteractionState
+  hideInteractionHint?: boolean
+  /** A status row is single-line; preserve its action hint before optional metrics. */
+  columns?: number
   /** Requested model, used to identify long quota waits. */
   model?: string
-  /**
-   * Work is running that ctrl+b can move to the background without killing it.
-   *
-   * Adds a second hint rather than replacing the interrupt one: esc always
-   * means interrupt, so swapping the text would hide the kill gesture exactly
-   * when a user might want it. Both keys are shown because both apply.
-   */
-  backgroundable?: boolean
 }
 
 export function formatSpinnerLine(
@@ -272,7 +302,11 @@ export function formatSpinnerLine(
   options: SpinnerFormatOptions = {},
 ): string {
   const elapsed = now - state.phaseStartedAt
-  const slow = isSlow(state, now)
+  const presentation = runStatusPresentation(options.interaction ?? resolveRunInteraction({
+    active: state.phase !== 'awaiting_background', owner: state,
+    phase: state.phase, backgroundTasks: 1,
+  }))
+  const slow = presentation.allowSlowWarning && isSlow(state, now)
   const char = SPINNER_FRAMES[state.frame]!
 
   const action = state.toolName ? toolActionLabel(state.toolName) : 'Working'
@@ -286,8 +320,7 @@ export function formatSpinnerLine(
       break
     case 'quota_waiting': {
       const seconds = Math.max(0, Math.ceil(((state.waitRetryAt ?? now) - now) / 1000))
-      const model = options.model?.replace(/\u001b(?:\[[0-9;?]*[ -/]*[@-~]|].*?(?:\u0007|\u001b\\)|.)/g, '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '').trim()
-      const subject = model ? `${model} quota unavailable` : 'Model quota unavailable'
+      const subject = providerFailurePresentation({ kind: 'quota' }).label
       label = seconds > 0
         ? `${subject} · retrying in ${formatWaitCountdown(seconds)}`
         : `${subject} · retrying…`
@@ -295,7 +328,7 @@ export function formatSpinnerLine(
     }
     case 'outage_waiting': {
       const seconds = Math.max(0, Math.ceil(((state.waitRetryAt ?? now) - now) / 1000))
-      label = `Upstream unavailable · retrying in ${seconds}s`
+      label = `${providerFailurePresentation({ error: state.retryError, sustained: true }).label} · retrying in ${seconds}s`
       break
     }
     case 'retrying': {
@@ -307,9 +340,10 @@ export function formatSpinnerLine(
       const counter = attempt !== null
         ? max !== null ? ` · attempt ${attempt}/${max}` : ` · attempt ${attempt}`
         : ''
+      const subject = state.retryError ? providerFailurePresentation({ error: state.retryError }).label : 'Retrying'
       label = seconds > 0
-        ? `Retrying in ${seconds}s${counter}`
-        : `Retrying…${counter}`
+        ? `${subject}${state.retryError ? ' · retrying' : ''} in ${seconds}s${counter}`
+        : `${subject}${state.retryError ? ' · retrying' : ''}…${counter}`
       break
     }
     case 'thinking':
@@ -321,33 +355,30 @@ export function formatSpinnerLine(
     case 'awaiting_background':
       // Not "Working": nothing is being computed here. The agent is parked
       // until a detached task reports back, and it will resume on its own.
-      label = 'Waiting for background task…'
+      label = '' // Run-status presentation supplies the passive-wait label.
       break
     default:
       label = slow ? 'Preparing slow…' : 'Preparing…'
   }
 
-  const status = humanDuration(elapsed)
-  const tokenSuffix = isLongWaitPhase(state.phase) || isPassiveWaitPhase(state.phase)
-    ? ''
-    : formatSpinnerTokenSuffix(state, now, stats)
-  // Ctrl+B is named again. It used to be hidden because foreground shells were
-  // handed back on a timer, which made the shortcut look like a required manual
-  // step for something the runtime did anyway. Nothing yields on a timer now, so
-  // this is the only way to get the turn back without killing the work — and an
-  // unadvertised key is one nobody presses.
-  const interruptHint = options.interruptible === false || isPassiveWaitPhase(state.phase)
-    ? ''
-    : options.backgroundable
-      ? ` · esc to interrupt · ${backgroundChord()} to background`
-      : ' · esc to interrupt'
+  const status = state.recoveryStartedAt !== undefined && isLongWaitPhase(state.phase)
+    ? `waiting ${humanDuration(Math.max(0, now - state.recoveryStartedAt))}` : humanDuration(elapsed)
+  label = presentation.label ?? label
+  const tokenSuffix = presentation.showUsage ? formatSpinnerTokenSuffix(state, now, stats) : ''
+  const interruptHint = options.hideInteractionHint ? '' : confirmationHintAnsi(presentation.hint, presentation.confirmationPending)
 
-  if (slow) {
-    return `\x1b[31m${char}\x1b[0m \x1b[31m${label}\x1b[0m\x1b[2m (${status}${tokenSuffix})${interruptHint}\x1b[0m`
+  const content = slow
+    ? `\x1b[31m${char}\x1b[0m \x1b[31m${label}\x1b[0m\x1b[2m (${status}${tokenSuffix})`
+    : `\x1b[36m${char}\x1b[0m ${glimmerText(label, state.glimmerPos)}\x1b[2m (${status}${tokenSuffix})`
+  if (options.columns === undefined) return `${content}${interruptHint}\x1b[0m`
+  const columns = Number.isFinite(options.columns) ? Math.max(1, Math.floor(options.columns)) : 80
+  const hintWidth = visibleWidth(interruptHint)
+  // Keep the complete action whenever there is still room for a status glyph.
+  // Metrics may shorten, but must not move the editor on every digit change.
+  if (interruptHint && hintWidth + 2 < columns) {
+    return `${truncateAnsiToWidth(content, columns - hintWidth)}${interruptHint}\x1b[0m`
   }
-
-  const glimmerLabel = glimmerText(label, state.glimmerPos)
-  return `\x1b[36m${char}\x1b[0m ${glimmerLabel}\x1b[2m (${status}${tokenSuffix})${interruptHint}\x1b[0m`
+  return truncateAnsiToWidth(`${content}${interruptHint}\x1b[0m`, columns)
 }
 
 function glimmerText(text: string, pos: number): string {

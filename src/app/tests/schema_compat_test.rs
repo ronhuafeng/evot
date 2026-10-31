@@ -19,6 +19,8 @@ type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 const CACHE_V0: &str = include_str!("fixtures/schema/models-cache-v0.json");
 const CACHE_V0_MISSING_DEFAULT: &str =
     include_str!("fixtures/schema/models-cache-v0-missing-default.json");
+const CACHE_V1_ACCOUNT_DEFAULT: &str =
+    include_str!("fixtures/schema/models-cache-v1-account-default.json");
 const ENV_WITH_CUSTOM_PROVIDER: &str =
     include_str!("fixtures/schema/evot-env-with-custom-provider.env");
 
@@ -57,6 +59,63 @@ fn current_reader_accepts_historical_cache_fixtures() -> TestResult {
     let transitional: auth::ModelsCache = serde_json::from_str(CACHE_V0_MISSING_DEFAULT)?;
     assert_eq!(transitional.schema_version, 0);
     assert_eq!(transitional.response.providers[0].default_model, "");
+
+    // Caches from servers without per-account defaults carry no top-level
+    // `default_model`; that reads as "no pin", not as a parse failure.
+    assert_eq!(legacy.response.default_model, "");
+    assert_eq!(transitional.response.default_model, "");
+
+    let pinned: auth::ModelsCache = serde_json::from_str(CACHE_V1_ACCOUNT_DEFAULT)?;
+    assert_eq!(pinned.schema_version, 1);
+    assert_eq!(pinned.response.default_model, "m-two");
+    // The per-provider legacy field is untouched by the account-level one.
+    assert_eq!(pinned.response.providers[0].default_model, "m-one");
+    Ok(())
+}
+
+#[test]
+fn suggestion_service_survives_current_cache_writes_and_legacy_readers() -> TestResult {
+    let cache: auth::ModelsCache = serde_json::from_str(include_str!(
+        "fixtures/schema/models-cache-v1-suggestion.json"
+    ))?;
+    let service = evot::suggestion::SuggestionEndpoint::from_catalog(&cache.response)
+        .ok_or("missing suggestion")?;
+    assert_eq!(service.model, "example/suggestion");
+    let original_services = cache.response.extra.get("services").cloned();
+    let serialized = serde_json::to_string(&auth::ModelsCache::new(500, cache.response))?;
+    let legacy: LegacyModelsCache = serde_json::from_str(&serialized)?;
+    assert_eq!(legacy.response.providers[0].default_model, "m-one");
+    let reread: auth::ModelsCache = serde_json::from_str(&serialized)?;
+    assert_eq!(
+        reread.response.extra.get("services"),
+        original_services.as_ref()
+    );
+    assert_eq!(reread.response.providers[0].models, ["m-one"]);
+    Ok(())
+}
+
+/// The account pin is a new top-level response field: current writers emit it,
+/// strict legacy readers (which never knew it) must still load the file, and a
+/// round trip through the current client must not drop it.
+#[test]
+fn account_default_model_survives_round_trip_and_legacy_readers() -> TestResult {
+    let pinned: auth::ModelsCache = serde_json::from_str(CACHE_V1_ACCOUNT_DEFAULT)?;
+    let current = auth::ModelsCache::new(500, pinned.response);
+    let serialized = serde_json::to_string_pretty(&current)?;
+
+    let legacy: LegacyModelsCache = serde_json::from_str(&serialized)?;
+    assert_eq!(legacy.synced_at, 500);
+    assert_eq!(legacy.response.providers[0].default_model, "m-one");
+
+    let reread: auth::ModelsCache = serde_json::from_str(&serialized)?;
+    assert_eq!(reread.response.default_model, "m-two");
+
+    // A current client writing a cache from an old server emits the field as
+    // an explicit empty string, which is what "no pin" means on the wire.
+    let unpinned: auth::ModelsCache = serde_json::from_str(CACHE_V0)?;
+    let written: serde_json::Value =
+        serde_json::to_value(auth::ModelsCache::new(501, unpinned.response))?;
+    assert_eq!(written["response"]["default_model"], serde_json::json!(""));
     Ok(())
 }
 
@@ -85,6 +144,54 @@ fn current_writer_remains_readable_by_legacy_clients() -> TestResult {
     assert_eq!(
         value["schema_version"],
         serde_json::json!(auth::MODELS_CACHE_SCHEMA_VERSION)
+    );
+    Ok(())
+}
+
+/// A cache rewritten by a client that predates a field (e.g. `role`) must
+/// hand that field back untouched, otherwise concurrent old/new clients flap
+/// the catalog every sync cycle.
+#[test]
+fn cache_round_trip_preserves_unknown_fields() -> TestResult {
+    let raw = serde_json::json!({
+        "schema_version": 1,
+        "synced_at": 7,
+        "future_top": true,
+        "response": {
+            "version": 410,
+            "future_response": [1, 2],
+            "providers": [{
+                "name": "evot-pro", "protocol": "anthropic", "base_url": "https://x",
+                "api_key": "k", "models": ["jev-latest"], "future_provider": "p"
+            }],
+            "models": [{
+                "id": "jev-latest", "role": "judge", "future_model": {"nested": 1}
+            }],
+            "notices": [{"id": "n", "future_notice": "x"}]
+        }
+    });
+    let mut cache: auth::ModelsCache = serde_json::from_value(raw.clone())?;
+    // Simulate the notices-only refresh path that rewrites the whole file.
+    cache.response.notices = cache.response.notices.clone();
+    let written: serde_json::Value = serde_json::to_value(&cache)?;
+
+    assert_eq!(written["future_top"], raw["future_top"]);
+    assert_eq!(
+        written["response"]["future_response"],
+        raw["response"]["future_response"]
+    );
+    assert_eq!(
+        written["response"]["providers"][0]["future_provider"],
+        raw["response"]["providers"][0]["future_provider"]
+    );
+    assert_eq!(written["response"]["models"][0]["role"], "judge");
+    assert_eq!(
+        written["response"]["models"][0]["future_model"],
+        raw["response"]["models"][0]["future_model"]
+    );
+    assert_eq!(
+        written["response"]["notices"][0]["future_notice"],
+        raw["response"]["notices"][0]["future_notice"]
     );
     Ok(())
 }
@@ -242,4 +349,52 @@ fn cache_store_rejects_future_schema_and_rewrites_legacy_atomically() -> TestRes
 
     restore_env_var("HOME", original_home);
     result
+}
+
+/// `CompactReason` as released before the `refusal` variant.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum LegacyCompactReason {
+    Threshold,
+    Overflow,
+    Manual,
+    Prune,
+}
+
+#[test]
+fn compact_reason_historical_values_and_refusal_contract() -> TestResult {
+    use evot::types::CompactReason;
+
+    // Old data → current reader: every historical value still parses.
+    for (wire, expected) in [
+        ("\"threshold\"", CompactReason::Threshold),
+        ("\"overflow\"", CompactReason::Overflow),
+        ("\"manual\"", CompactReason::Manual),
+        ("\"prune\"", CompactReason::Prune),
+    ] {
+        let reason: CompactReason = serde_json::from_str(wire)?;
+        assert_eq!(reason, expected);
+    }
+
+    // Current writer → legacy reader: historical values keep their spelling.
+    for reason in [
+        CompactReason::Threshold,
+        CompactReason::Overflow,
+        CompactReason::Manual,
+        CompactReason::Prune,
+    ] {
+        let wire = serde_json::to_string(&reason)?;
+        let _: LegacyCompactReason = serde_json::from_str(&wire)?;
+    }
+
+    // `refusal` is new. Its spelling is fixed here, and a legacy reader is
+    // known to reject it: an accepted, deliberate contract change.
+    let wire = serde_json::to_string(&CompactReason::Refusal)?;
+    assert_eq!(wire, "\"refusal\"");
+    assert_eq!(
+        serde_json::from_str::<CompactReason>(&wire)?,
+        CompactReason::Refusal
+    );
+    assert!(serde_json::from_str::<LegacyCompactReason>(&wire).is_err());
+    Ok(())
 }

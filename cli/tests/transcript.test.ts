@@ -1,8 +1,26 @@
 import { describe, expect, test } from 'bun:test'
 import { messagesToOutputLines } from '../src/render/output.js'
 import { transcriptToMessages } from '../src/session/transcript.js'
+import { assistantMessageToOutputLines } from '../src/render/assistant.js'
+import { buildOutputBlocks } from '../src/term/viewmodel/output.js'
+import { blocksToLines } from '../src/term/viewmodel/types.js'
+import stripAnsi from 'strip-ansi'
 
 describe('transcript conversion', () => {
+  test('replay accepts opaque JSON tool arguments without crashing preview reconstruction', () => {
+    for (const input of [null, false, 1, 'text', []]) {
+      for (const name of ['bash', 'read', 'write', 'edit']) {
+        const messages = transcriptToMessages([{
+          type: 'assistant', content: [{ type: 'tool_call', id: 'c1', name, input }],
+        }])
+        const block = messages[0]?.content?.[0]
+        if (block?.type !== 'tool_call') throw new Error('missing tool block')
+        expect(block.toolCall.args).toEqual({})
+        expect(block.toolCall.previewCommand).toBeUndefined()
+      }
+    }
+  })
+
   test('restores canonical assistant content in provider order', () => {
     const messages = transcriptToMessages([{
       type: 'assistant',
@@ -16,6 +34,35 @@ describe('transcript conversion', () => {
     expect(messages[0]?.text).toBe('answer')
     expect(messages[0]?.content?.map(block => block.type)).toEqual(['thinking', 'tool_call', 'text'])
     expect(messagesToOutputLines(messages).map(line => line.kind)).toContain('thinking')
+  })
+
+  test('resumed reasoning folds in the compact view and is lifted in the expanded view', () => {
+    const messages = transcriptToMessages([{
+      type: 'assistant',
+      content: [{ type: 'thinking', text: 'plan' }],
+    }])
+    const fold = (expanded?: boolean) =>
+      messagesToOutputLines(messages, expanded).filter(line => line.kind === 'thinking').map(line => line.thinkingFold)
+    expect(fold()).toEqual(['tail'])
+    expect(fold(true)).toEqual([undefined])
+  })
+
+  test('resumed reasoning retains the same compact window as the live and committed views', () => {
+    const text = Array.from({ length: 20 }, (_, i) => `reasoning row ${i + 1}`).join('\n\n')
+    const messages = transcriptToMessages([{
+      type: 'assistant',
+      content: [{ type: 'thinking', text }, { type: 'text', text: 'answer' }],
+    }])
+    const content = messages[0]?.content
+    if (!content) throw new Error('missing assistant content')
+    const render = (lines: ReturnType<typeof messagesToOutputLines>) =>
+      blocksToLines(buildOutputBlocks(lines, { columns: 80 })).map(stripAnsi)
+    const resumed = render(messagesToOutputLines(messages))
+    expect(resumed).toEqual(render(assistantMessageToOutputLines(content)))
+    expect(resumed).toEqual(render(assistantMessageToOutputLines(content, false, { streaming: true })))
+    expect(resumed).toContain('✻ ↑ 18 rows (ctrl+o)')
+    expect(resumed).toContain('  reasoning row 20')
+    expect(resumed).toContain('⏺ answer')
   })
 
   test('restores tool-result details onto the canonical tool block', () => {
@@ -122,13 +169,13 @@ describe('transcript conversion', () => {
     })
 
     const collapsed = messagesToOutputLines(messages).map(line => line.text).join('\n')
-    expect(collapsed).toContain('✦ compact')
-    expect(collapsed).toContain('fallback  Upstream error 400: Store must be set to false')
+    expect(collapsed).toContain('✦ compact  12k → 5k')
+    expect(collapsed).toContain('  Upstream error 400: Store must be set to false')
     expect(collapsed).toContain('summary hidden (ctrl+o to expand)')
     expect(collapsed).not.toContain('summary text')
 
     const expanded = messagesToOutputLines(messages, true).map(line => line.text).join('\n')
-    expect(expanded).toContain('✦ compact')
+    expect(expanded).toContain('✦ compact  12k → 5k')
     expect(expanded).toContain('summary text')
   })
 
@@ -169,7 +216,8 @@ describe('transcript conversion', () => {
     }]
 
     const rendered = messagesToOutputLines(messages).map(line => line.text).join('\n')
-    expect(rendered.split(err).length - 1).toBe(1)
+    expect(rendered.split('Model provider overloaded').length - 1).toBe(1)
+    expect(rendered).not.toContain(err)
     expect(rendered.split('✦ llm  retry').length - 1).toBe(1)
     // The storm is still visible as an event, just once.
     expect(rendered).toContain('attempt 1/10')
@@ -192,7 +240,8 @@ describe('transcript conversion', () => {
     }]
 
     const rendered = messagesToOutputLines(messages).map(line => line.text).join('\n')
-    expect(rendered).toContain('Overloaded: HTTP 529')
-    expect(rendered).toContain('API error: HTTP 500')
+    expect(rendered.split('Model provider overloaded').length - 1).toBe(1)
+    expect(rendered.split('Gateway error, not the model provider').length - 1).toBe(1)
+    expect(rendered).toContain('turn 29')
   })
 })

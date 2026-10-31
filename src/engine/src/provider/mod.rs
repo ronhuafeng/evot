@@ -1,23 +1,27 @@
 pub mod anthropic;
 pub mod bedrock;
 pub mod error;
+mod error_semantics;
 pub mod json_repair;
+mod legacy_bridge;
 pub mod mock;
 mod model;
 pub mod openai_compat;
 pub mod openai_responses;
 pub mod registry;
 pub mod route;
-pub mod stream_fallback;
-pub mod stream_http;
+pub mod stream;
 mod system_prompt;
 pub mod traits;
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
+pub use error::client_builder as http_client_builder;
+pub use error::new_client as http_client;
 pub use error::ProviderError;
 pub use mock::MockProvider;
 pub use mock::MockResponse;
+pub use mock::MockToolCall;
 pub(crate) use model::thinking;
 pub(crate) use model::thinking::effective_thinking_level;
 pub use model::InputModality;
@@ -37,5 +41,11 @@ pub use route::OpenAiCompat;
 pub use route::RouteCapabilities;
 pub use route::RouteCapabilityOverrides;
 pub use route::ThinkingFormat;
+// Compatibility re-exports: the streaming helpers moved under `stream/`.
+// Keep the old `provider::{sse,stream_*}` paths alive for existing callers.
+pub use stream::fallback as stream_fallback;
+pub use stream::http as stream_http;
+pub use stream::sink as stream_sink;
+pub use stream::sse;
 pub use system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
 pub use traits::*;

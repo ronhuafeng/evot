@@ -13,6 +13,19 @@ describe('command window trigger', () => {
     expect(resolveCommandWindowTrigger('/mo')).toBe('model')
     expect(resolveCommandWindowTrigger('/sk')).toBe('skill')
     expect(resolveCommandWindowTrigger('/he')).toBe('help')
+    expect(resolveCommandWindowTrigger('/ta')).toBe('task')
+  })
+
+  test('share prefixes preview the list, but visibility arguments never do', () => {
+    for (const text of ['/sh', '/sha', '/shar', '/share']) {
+      expect(resolveCommandWindowTrigger(text)).toBe('share')
+      expect(isCommandWindowBridge(text)).toBe(true)
+    }
+    for (const text of ['/sha ', '/share ', '/share public', '/share private', '/share off']) {
+      expect(resolveCommandWindowTrigger(text)).toBeNull()
+      expect(isCommandWindowBridge(text)).toBe(false)
+    }
+    expect(resolveCommandWindowTrigger('/s')).toBeNull()
   })
 
   test('resolves complete commands and alias prefixes', () => {
@@ -20,6 +33,7 @@ describe('command window trigger', () => {
     expect(resolveCommandWindowTrigger('/model')).toBe('model')
     expect(resolveCommandWindowTrigger('/skill')).toBe('skill')
     expect(resolveCommandWindowTrigger('/help')).toBe('help')
+    expect(resolveCommandWindowTrigger('/task')).toBe('task')
     expect(resolveCommandWindowTrigger('/sessions')).toBe('resume')
     expect(resolveCommandWindowTrigger('/sess')).toBe('resume')
   })
@@ -52,6 +66,9 @@ describe('command window trigger', () => {
     expect(resolveCommandWindowTrigger('/resume renderer')).toBeNull()
     expect(resolveCommandWindowTrigger('/model ')).toBeNull()
     expect(resolveCommandWindowTrigger('/model gpt')).toBeNull()
+    // `/task <prompt>` creates a task; only the bare command previews the list.
+    expect(resolveCommandWindowTrigger('/task ')).toBeNull()
+    expect(resolveCommandWindowTrigger('/task summarize hn')).toBeNull()
     expect(resolveCommandWindowTrigger('explain /resume')).toBeNull()
   })
 

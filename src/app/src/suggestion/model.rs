@@ -1,0 +1,98 @@
+use std::sync::Arc;
+
+use evot_engine::provider::ModelConfig;
+use evot_engine::provider::StreamProvider;
+
+use super::SuggestionEndpoint;
+use crate::conf::LlmConfig;
+use crate::error::EvotError;
+use crate::error::Result;
+
+/// Runtime-only request identity. Keep the complete resolved route rather
+/// than round-tripping the current model through a published service DTO.
+#[derive(Clone)]
+pub struct SuggestionModel {
+    /// Which credential set this request uses. Logged with failures so an
+    /// auth error can be attributed to the right key.
+    pub route: SuggestionRoute,
+    pub config: ModelConfig,
+    pub api_key: String,
+}
+
+/// The published cloud suggestion service and the active chat model carry
+/// different credentials; one can be rejected while the other works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionRoute {
+    Cloud,
+    CurrentModel,
+}
+
+impl SuggestionRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cloud => "cloud",
+            Self::CurrentModel => "current_model",
+        }
+    }
+}
+
+impl From<LlmConfig> for SuggestionModel {
+    fn from(current: LlmConfig) -> Self {
+        Self {
+            route: SuggestionRoute::CurrentModel,
+            config: current.model_config,
+            api_key: current.api_key,
+        }
+    }
+}
+
+impl TryFrom<&SuggestionEndpoint> for SuggestionModel {
+    type Error = EvotError;
+
+    fn try_from(service: &SuggestionEndpoint) -> Result<Self> {
+        let protocol = service
+            .parsed_protocol()
+            .ok_or_else(|| EvotError::Conf("invalid suggestion service protocol".into()))?;
+        Ok(Self {
+            route: SuggestionRoute::Cloud,
+            config: crate::conf::resolve_model_config(
+                protocol,
+                "evot-suggestion",
+                &service.model,
+                Some(&service.base_url),
+                Default::default(),
+                Default::default(),
+                Some(if service.context_window == 0 {
+                    8192
+                } else {
+                    service.context_window
+                }),
+                None,
+                // Published services already accept image requests. Do not
+                // apply this override to the active chat model's capability.
+                Some(true),
+            ),
+            api_key: service.api_key.clone(),
+        })
+    }
+}
+
+impl SuggestionModel {
+    /// Select exactly once, before sampling. Errors from service loading or
+    /// validation must not silently authorize traffic through another route.
+    pub(super) async fn resolve(current: LlmConfig) -> Result<Option<Self>> {
+        if let Some(service) = super::endpoint::current().await? {
+            return Self::try_from(&service).map(Some);
+        }
+        let model = Self::from(current);
+        // Local endpoints may intentionally have no API key.
+        Ok(
+            (!model.config.id().trim().is_empty() && !model.config.base_url().trim().is_empty())
+                .then_some(model),
+        )
+    }
+
+    pub(super) fn provider(&self) -> Arc<dyn StreamProvider> {
+        crate::models::transport::for_api(self.config.protocol())
+    }
+}

@@ -61,12 +61,31 @@ describe('renderBanner', () => {
     expect(banner).toContain('[Context]')
     expect(banner).toContain('AGENTS.md')
     expect(banner).toContain('[Skills]')
-    expect(banner).toContain('○ skill-00')
-    expect(banner).toContain('○ skill-11')
+    expect(banner).toContain('    skill-00')
+    expect(banner).toContain('    skill-11')
+    expect(banner).not.toContain('○')
     expect(banner).not.toContain('Directory')
     expect(banner).not.toContain('Model')
     expect(banner).not.toContain('available')
     expect(banner).not.toContain('/skill list')
+  })
+
+  test('the running UI is announced as Dashboard', () => {
+    const { cwd, skillsDir } = createFixture(1)
+    const banner = stripAnsi(renderBanner({
+      version: 'test',
+      model: 'model',
+      cwd,
+      configInfo: { provider: 'provider', hasApiKey: true },
+      columns: 80,
+      rows: 40,
+      skillsDirs: [skillsDir],
+      serverState: { address: 'http://127.0.0.1:8082', pid: 1 },
+    }))
+
+    expect(banner).toContain('[Dashboard]')
+    expect(banner).toContain('http://127.0.0.1:8082')
+    expect(banner).not.toContain('[Server]')
   })
 
   test('logged-out banner points at the Models page of the running UI', () => {
@@ -116,7 +135,8 @@ describe('renderBanner', () => {
       skillsDirs: [skillsDir],
     }))
 
-    expect(banner).toContain('● lark/')
+    expect(banner).toContain('    lark/')
+    expect(banner).not.toContain('●')
     expect(banner).toMatch(/lark\/[\s\S]*\b3\b/)
     expect(banner).not.toContain('lark-im')
     // The label matches `/skill list`, so the trailing slash marks the group.
@@ -268,5 +288,26 @@ describe('renderBanner', () => {
     expect(banner).toContain('Install mismatch')
     expect(banner).toContain('lib/evot-napi.darwin-arm64.node')
     expect(banner).toContain('run /update to reinstall')
+  })
+
+  test('surfaces an ignored --model with a remedy instead of exiting', () => {
+    const { cwd, skillsDir } = createFixture(1)
+    const opts = {
+      version: '2026.4.13',
+      model: 'claude-opus',
+      cwd,
+      configInfo: { provider: 'provider', hasApiKey: true },
+      columns: 80,
+      rows: 30,
+      skillsDirs: [skillsDir],
+    }
+    expect(stripAnsi(renderBanner({ ...opts, startupWarning: null }))).not.toContain('ignored')
+
+    const banner = stripAnsi(renderBanner({
+      ...opts,
+      startupWarning: "--model 'evot-free' ignored (no provider with model 'evot-free'); using 'claude-opus'",
+    }))
+    expect(banner).toContain("--model 'evot-free' ignored")
+    expect(banner).toContain('pick another with /model, or drop --model')
   })
 })

@@ -10,6 +10,9 @@ use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
+    /// Persistent format version, independent of catalog/server versions.
+    #[serde(default, deserialize_with = "read_schema_version")]
+    pub schema_version: u32,
     pub session_id: String,
     pub cwd: String,
     pub model: String,
@@ -23,6 +26,9 @@ pub struct SessionMeta {
     #[serde(default)]
     pub thinking_level: Option<String>,
     pub title: Option<String>,
+    /// User-owned name. Automatic title generation must never overwrite it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_title: Option<String>,
     #[serde(default)]
     pub source: String,
     pub turns: u32,
@@ -46,6 +52,18 @@ pub struct SessionMeta {
     /// dashboard falls back to `turns` for those until the next save.
     #[serde(default)]
     pub span_count: Option<u32>,
+    /// Session this one was forked from. `None` for roots and for sessions
+    /// persisted before fork existed. A dangling id (parent deleted) makes
+    /// this session behave as a root again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+    /// Last transcript seq of the parent at fork time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_seq: Option<u64>,
+    /// Cloud sync state. `None` for sessions that only live on this machine.
+    /// Owned by the sync path; ordinary saves preserve the persisted value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<super::CloudSync>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -54,12 +72,14 @@ impl SessionMeta {
     pub fn new(session_id: String, cwd: String, model: String) -> Self {
         let now = Utc::now().to_rfc3339();
         Self {
+            schema_version: 1,
             session_id,
             cwd,
             model,
             provider: String::new(),
             thinking_level: None,
             title: None,
+            custom_title: None,
             source: String::new(),
             turns: 0,
             message_count: 0,
@@ -68,9 +88,16 @@ impl SessionMeta {
             total_input_tokens: 0,
             total_output_tokens: 0,
             span_count: None,
+            parent_session_id: None,
+            fork_seq: None,
+            cloud: None,
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    pub fn display_title(&self) -> Option<&str> {
+        self.custom_title.as_deref().or(self.title.as_deref())
     }
 
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
@@ -82,6 +109,18 @@ impl SessionMeta {
         self.source = source.into();
         self
     }
+}
+
+fn read_schema_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version > 1 {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported session schema version: {version}"
+        )));
+    }
+    Ok(version)
 }
 
 // ---------------------------------------------------------------------------

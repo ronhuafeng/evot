@@ -14,8 +14,8 @@ use super::json_fallback;
 use super::request;
 use super::sse_decode;
 use crate::provider::error::*;
-use crate::provider::stream_http::StreamResponseKind;
-use crate::provider::stream_http::{self};
+use crate::provider::stream::http::StreamResponseKind;
+use crate::provider::stream::http::{self};
 use crate::provider::traits::*;
 
 pub struct OpenAiCompatProvider;
@@ -26,6 +26,39 @@ impl StreamProvider for OpenAiCompatProvider {
         &self,
         config: StreamConfig,
         tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.stream_sink(
+            config,
+            crate::provider::stream::sink::StreamSink::Legacy(tx),
+            cancel,
+        )
+        .await
+    }
+
+    async fn stream_bounded(
+        &self,
+        config: StreamConfig,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.stream_sink(
+            config,
+            crate::provider::stream::sink::StreamSink::Bounded {
+                tx,
+                cancel: cancel.clone(),
+            },
+            cancel,
+        )
+        .await
+    }
+}
+
+impl OpenAiCompatProvider {
+    async fn stream_sink(
+        &self,
+        config: StreamConfig,
+        tx: crate::provider::stream::sink::StreamSink,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<StreamOutcome, ProviderError> {
         let model_config = config.model_config.as_ref().ok_or_else(|| {
@@ -39,25 +72,30 @@ impl StreamProvider for OpenAiCompatProvider {
         let body = request::build_request_body(&config, &compat);
         debug!("OpenAI compat request: model={} url={}", config.model, url);
 
-        let client = crate::provider::error::new_client()?;
+        let client = config.http_client()?;
         let mut builder = client
             .post(&url)
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {}", config.api_key));
+
+        // Session identity is independent of upstream prompt-cache support.
+        if let Some(session_id) = config.prompt_cache_key.as_deref() {
+            if !session_id.is_empty() {
+                builder = builder.header("session-id", session_id);
+            }
+        }
 
         // Add any extra headers from model config
         for (k, v) in model_config.headers() {
             builder = builder.header(k, v);
         }
 
-        let builder = builder.json(&body);
-
-        // Send request and check HTTP status
-        let response = stream_http::send_stream_request(builder).await?;
-        let response = stream_http::check_error_status(response).await?;
+        // Send request (gzipped where the endpoint has said it accepts it) and check HTTP status
+        let response = http::send_json_stream_request(builder, &url, body).await?;
+        let response = http::check_error_status(response).await?;
 
         // Classify response by content-type
-        let kind = stream_http::classify_response(&response);
+        let kind = http::classify_response(&response);
         debug!("OpenAI compat response kind: {kind:?}");
 
         match kind {
@@ -65,7 +103,7 @@ impl StreamProvider for OpenAiCompatProvider {
                 sse_decode::decode_sse_stream(response, tx, cancel, &config, &compat).await
             }
             StreamResponseKind::Json => {
-                json_fallback::handle_json_response(response, tx, &config, &compat)
+                json_fallback::handle_json_response_sink(response, tx, &config, &compat)
                     .await
                     .map(StreamOutcome::complete)
             }

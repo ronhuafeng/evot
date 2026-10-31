@@ -19,6 +19,33 @@ fn responses_config(model: &str) -> StreamConfigBuilder {
 }
 
 #[tokio::test]
+async fn bounded_responses_preserves_terminal_and_delta_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let body = concat!(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"one\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"two\"}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}}\n\n",
+    );
+    let (_, events) = super::super::fixtures::mock_server::run_provider_sse_bounded(
+        &OpenAiResponsesProvider,
+        responses_config("gpt-5.5").build(),
+        body,
+    )
+    .await?;
+    let deltas: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["one", "two"]);
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    Ok(())
+}
+
+#[tokio::test]
 async fn rejected_compaction_replay_retries_once_with_fallback_text(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let server = MockServer::start().await;
@@ -58,6 +85,7 @@ async fn rejected_compaction_replay_retries_once_with_fallback_text(
     let config = StreamConfigBuilder::openai()
         .model("gpt-5.5")
         .model_config(model)
+        .prompt_cache_key("session-replay-123")
         .messages(vec![Message::Assistant {
             content: vec![Content::Thinking {
                 thinking: "portable fallback".into(),
@@ -92,6 +120,23 @@ async fn rejected_compaction_replay_retries_once_with_fallback_text(
         .await
         .ok_or("request recording unavailable")?;
     assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(
+            request
+                .headers
+                .get("accept")
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("session-id")
+                .ok_or("missing session header")?
+                .to_str()?,
+            "session-replay-123",
+        );
+    }
     let first: serde_json::Value = serde_json::from_slice(&requests[0].body)?;
     let second: serde_json::Value = serde_json::from_slice(&requests[1].body)?;
     assert_eq!(first["input"][0]["type"], "compaction");
@@ -326,4 +371,80 @@ async fn responses_requires_terminal_event() {
             if message.contains("terminal response event")
     ));
     assert!(evotengine::retry::should_retry(&error));
+}
+
+#[tokio::test]
+async fn responses_incomplete_content_filter_is_a_refusal() -> Result<(), Box<dyn std::error::Error>>
+{
+    let sse = concat!(
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
+        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"content_filter\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+    );
+    let (message, _) = run_provider_sse(
+        &OpenAiResponsesProvider,
+        responses_config("gpt-5.5").build(),
+        sse,
+        200,
+    )
+    .await?;
+    let Message::Assistant {
+        stop_reason,
+        error_message,
+        ..
+    } = message
+    else {
+        return Err("expected assistant message".into());
+    };
+    assert_eq!(stop_reason, StopReason::Error);
+    assert!(error_message
+        .as_deref()
+        .is_some_and(evotengine::provider::error::is_refusal_message));
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_incomplete_max_output_tokens_stays_a_length_stop(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sse = concat!(
+        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"partial\"}\n\n",
+        "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_1\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
+    );
+    let (message, _) = run_provider_sse(
+        &OpenAiResponsesProvider,
+        responses_config("gpt-5.5").build(),
+        sse,
+        200,
+    )
+    .await?;
+    assert!(matches!(
+        message,
+        Message::Assistant {
+            stop_reason: StopReason::Length,
+            error_message: Some(ref reason),
+            ..
+        } if reason == "response incomplete: max_output_tokens"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_content_filter_error_event_is_a_refusal(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = run_provider_sse(
+        &OpenAiResponsesProvider,
+        responses_config("gpt-5.5").build(),
+        "event: error\ndata: {\"type\":\"error\",\"code\":\"content_filter\",\"message\":\"filtered\"}\n\n",
+        200,
+    )
+    .await;
+    let Err(error) = result else {
+        return Err("expected a refusal error".into());
+    };
+    assert!(evotengine::provider::error::is_refusal_message(
+        &error.to_string()
+    ));
+    assert!(!evotengine::retry::should_retry(&error));
+    Ok(())
 }

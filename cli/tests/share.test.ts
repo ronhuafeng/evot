@@ -1,448 +1,257 @@
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
-import { execFileSync } from 'child_process'
-import { createServer } from 'http'
-import { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'fs'
-import { join } from 'path'
-import { tmpdir, homedir } from 'os'
-import { gzipSync } from 'zlib'
-import { _testing } from '../src/commands/share.js'
+import { describe, test, expect } from 'bun:test'
+import { isShareLink, paintUploadProgress, runShareCommand, type ShareContext } from '../src/commands/share.js'
+import type { CloudPushResult, SessionMeta } from '../src/native/index.js'
 
-const {
-  isSharedSessionUrl,
-  tmpfilesViewerUrl,
-  extractTmpfilesDownloadUrl,
-  resolveRedirectUrl,
-  download,
-  hasExportMagic,
-  encrypt,
-  decrypt,
-  validateArchiveSize,
-  validateArchive,
-  validateAndImport,
-  listFilesRecursive,
-  generatePassword,
-  collectFiles,
-} = _testing
+function synced(visibility: 'private' | 'public', seq = 3): CloudPushResult {
+  return {
+    kind: 'synced', pushed: seq,
+    cloud: { visibility, synced_seq: seq, synced_at: 't', origin_host: 'laptop',
+      public_url: visibility === 'public' ? 'https://evot.ai/share/abcdefghijklmnopqrstuv' : null },
+  }
+}
 
-// ---------------------------------------------------------------------------
-// shared URL detection
-// ---------------------------------------------------------------------------
+function setup(result: (visibility: string) => CloudPushResult = v => synced(v === 'public' ? 'public' : 'private')) {
+  const output: string[] = []
+  const calls: string[] = []
+  const ctx: ShareContext = {
+    agent: {
+      listSessions: async () => [{ session_id: 'abc12345-0000', cwd: '/w', model: 'm', turns: 1, created_at: '', updated_at: '' } as SessionMeta],
+      cloudShareSession: async (sid, visibility) => { calls.push(`share:${sid}:${visibility}`); return result(visibility) },
+      cloudUnshareSession: async sid => { calls.push(`off:${sid}`) },
+      cloudPushSession: async (sid, force) => { calls.push(`push:${sid}:${force}`); return synced('private') },
+      cloudForkRemoteSession: async sid => { calls.push(`fork:${sid}`); return { session_id: 'fork0000-1111', cwd: '/w', model: 'm', turns: 1, created_at: '', updated_at: '' } as SessionMeta },
+      importSharedSession: async link => { calls.push(`import:${link}`); return { session_id: 'imp00000-2222', cwd: '/w', model: 'm', turns: 1, created_at: '', updated_at: '' } as SessionMeta },
+    },
+    openShareList: async () => { calls.push('open-list') },
+    getSessionId: () => 'session',
+    commitSystem: (_, text) => output.push(text),
+    flushShareNotices: async () => { calls.push('flush') },
+    requestRender() {},
+    cloudAcknowledged: sid => { calls.push(`ack:${sid}`) },
+    cloudForgotten: sid => { calls.push(`forget:${sid}`) },
+    resumeSession: async session => { calls.push(`resume:${session.session_id}`) },
+  }
+  return { ctx, output, calls }
+}
 
-describe('isSharedSessionUrl', () => {
-  test('accepts HTTP and HTTPS shared-session URLs', () => {
-    expect(isSharedSessionUrl('https://tmpfiles.org/abc/evot-log.bin#password')).toBe(true)
-    expect(isSharedSessionUrl('http://tmpfiles.org/abc/evot-log.bin#password')).toBe(true)
-  })
-
-  test('rejects session ids and non-HTTP protocols', () => {
-    expect(isSharedSessionUrl('abcdef01')).toBe(false)
-    expect(isSharedSessionUrl('not-a-url')).toBe(false)
-    expect(isSharedSessionUrl('file:///tmp/evot-log.bin#password')).toBe(false)
-  })
+test('bare /share opens the list without mutating or requiring a current session', async () => {
+  const { ctx, output, calls } = setup()
+  ctx.getSessionId = () => null
+  ctx.isBusy = () => true
+  await runShareCommand(ctx, '')
+  expect(calls).toEqual(['open-list'])
+  expect(output).toEqual([])
 })
 
-// ---------------------------------------------------------------------------
-// tmpfiles.org download URL resolution
-// ---------------------------------------------------------------------------
-
-describe('tmpfiles.org download URL resolution', () => {
-  const viewer = 'https://tmpfiles.org/wywHXeSghysu/evot-log.bin'
-  const signed = 'https://tmpfiles.org/dl/1784975103.3bb43207d08d3530/wywHXeSghysu/evot-log.bin'
-
-  test('keeps viewer URLs unchanged', () => {
-    expect(tmpfilesViewerUrl(new URL(viewer))).toBe(viewer)
-  })
-
-  test('normalizes HTTP viewer URLs to canonical HTTPS', () => {
-    expect(tmpfilesViewerUrl(new URL('http://tmpfiles.org/wywHXeSghysu/evot-log.bin')))
-      .toBe(viewer)
-  })
-
-  test('converts legacy and signed download URLs back to the viewer', () => {
-    expect(tmpfilesViewerUrl(new URL('https://tmpfiles.org/dl/wywHXeSghysu/evot-log.bin')))
-      .toBe(viewer)
-    expect(tmpfilesViewerUrl(new URL(signed))).toBe(viewer)
-  })
-
-  test('extracts the signed URL for the same file from the viewer', () => {
-    const html = `<p><a class="download" href="${signed}">Download</a></p>`
-    expect(extractTmpfilesDownloadUrl(viewer, html)).toBe(signed)
-  })
-
-  test('accepts relative signed download links', () => {
-    const path = '/dl/1784975103.3bb43207d08d3530/wywHXeSghysu/evot-log.bin'
-    expect(extractTmpfilesDownloadUrl(viewer, `<a href="${path}">Download</a>`)).toBe(signed)
-  })
-
-  test('rejects links on another host, custom ports, credentials, or another file', () => {
-    const rejected = [
-      'https://example.com/dl/x/wywHXeSghysu/evot-log.bin',
-      'https://tmpfiles.org:444/dl/x/wywHXeSghysu/evot-log.bin',
-      'https://user@tmpfiles.org/dl/x/wywHXeSghysu/evot-log.bin',
-      'https://tmpfiles.org/dl/x/other/file.bin',
-    ]
-    for (const href of rejected) {
-      expect(() => extractTmpfilesDownloadUrl(viewer, `<a href="${href}">Download</a>`))
-        .toThrow('download link was not found')
-    }
-  })
-
-  test('resolves relative redirects while enforcing the trusted origin', () => {
-    const current = new URL(viewer)
-    expect(resolveRedirectUrl(current, '/next/file.bin', 'https://tmpfiles.org'))
-      .toBe('https://tmpfiles.org/next/file.bin')
-    expect(() => resolveRedirectUrl(current, 'https://example.com/file.bin', 'https://tmpfiles.org'))
-      .toThrow('left trusted origin')
-  })
-
-  test('recognizes encrypted export payloads by magic', () => {
-    expect(hasExportMagic(Buffer.from('EVOTLOG1payload'))).toBe(true)
-    expect(hasExportMagic(Buffer.from('<!DOCTYPE html>'))).toBe(false)
-  })
-
-  test('download bounds redirects and response size', async () => {
-    const server = createServer((req, res) => {
-      switch (req.url) {
-        case '/redirect':
-          res.writeHead(302, { Location: '/payload' })
-          res.end()
-          break
-        case '/cross-origin':
-          res.writeHead(302, { Location: 'https://example.com/payload' })
-          res.end()
-          break
-        case '/declared-large':
-          res.writeHead(200, { 'Content-Length': '6' })
-          res.end('123456')
-          break
-        case '/chunked-large':
-          res.writeHead(200)
-          res.write('123')
-          res.end('456')
-          break
-        default:
-          res.writeHead(200)
-          res.end('payload')
-      }
-    })
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(0, '127.0.0.1', resolve)
-    })
-
-    try {
-      const address = server.address()
-      if (!address || typeof address === 'string') throw new Error('missing test server address')
-      const origin = `http://127.0.0.1:${address.port}`
-
-      expect((await download(`${origin}/redirect`, 5, origin, 1024)).toString()).toBe('payload')
-      await expect(download(`${origin}/cross-origin`, 5, origin, 1024))
-        .rejects.toThrow('left trusted origin')
-      await expect(download(`${origin}/declared-large`, 5, origin, 5))
-        .rejects.toThrow('exceeds 5 byte limit')
-      await expect(download(`${origin}/chunked-large`, 5, origin, 5))
-        .rejects.toThrow('exceeds 5 byte limit')
-      await expect(download('file:///tmp/payload'))
-        .rejects.toThrow('Unsupported download protocol')
-    } finally {
-      await new Promise<void>((resolve, reject) => {
-        server.close(err => err ? reject(err) : resolve())
-      })
-    }
-  })
+test('/share private explicitly syncs privately', async () => {
+  const { ctx, output, calls } = setup()
+  await runShareCommand(ctx, 'private')
+  expect(calls).toEqual(['flush', 'share:session:private', 'ack:session'])
+  // No bar factory here: the notice is one line and the result follows it.
+  expect(output[0]).toBe('Syncing to the cloud')
+  expect(output[1]).toContain('☁ Shared to cloud')
+  expect(output[1]).toContain('any machine')
 })
 
-// ---------------------------------------------------------------------------
-// generatePassword
-// ---------------------------------------------------------------------------
-
-describe('generatePassword', () => {
-  test('generates 8-char password', () => {
-    const pw = generatePassword()
-    expect(pw.length).toBe(8)
-  })
-
-  test('only contains expected characters', () => {
-    const allowed = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
-    for (let i = 0; i < 20; i++) {
-      const pw = generatePassword()
-      for (const ch of pw) {
-        expect(allowed.includes(ch)).toBe(true)
-      }
-    }
-  })
+test('with a progress bar the upload is one row that becomes the result', async () => {
+  const { ctx, output, calls } = setup()
+  const bar: Array<[number, number] | string> = []
+  ctx.progressBar = () => ({ set: (done, total) => { bar.push([done, total]) }, finish: text => { bar.push(text) } })
+  ctx.agent.cloudShareSession = async (sid, visibility, onProgress) => {
+    calls.push(`share:${sid}:${visibility}`)
+    onProgress?.({ uploaded_entries: 0, total_entries: 9000, batch: 0, batches: 2 })
+    onProgress?.({ uploaded_entries: 5000, total_entries: 9000, batch: 1, batches: 2 })
+    onProgress?.({ uploaded_entries: 9000, total_entries: 9000, batch: 2, batches: 2 })
+    return synced('public')
+  }
+  await runShareCommand(ctx, 'public')
+  expect(bar.slice(0, 3)).toEqual([[0, 9000], [5000, 9000], [9000, 9000]])
+  expect(String(bar.at(-1))).toContain('https://evot.ai/share/')
+  // The scope warning is its own line; the result lives in the bar's row.
+  expect(output).toHaveLength(1)
+  expect(output[0]).toContain('anyone with the link can read it')
 })
 
-// ---------------------------------------------------------------------------
-// encrypt / decrypt round-trip
-// ---------------------------------------------------------------------------
-
-describe('encrypt / decrypt', () => {
-  test('round-trip preserves data', () => {
-    const original = Buffer.from('hello world — session log data')
-    const { payload, password } = encrypt(original)
-    const result = decrypt(payload, password)
-    expect(result.equals(original)).toBe(true)
-  })
-
-  test('wrong password fails', () => {
-    const original = Buffer.from('secret data')
-    const { payload } = encrypt(original)
-    expect(() => decrypt(payload, 'WrOnGpWd')).toThrow()
-  })
-
-  test('bad magic fails', () => {
-    const bad = Buffer.from('BADMAGIC' + '0'.repeat(44))
-    expect(() => decrypt(bad, 'whatever')).toThrow('Invalid file format')
-  })
-
-  test('too small payload fails', () => {
-    const tiny = Buffer.from('short')
-    expect(() => decrypt(tiny, 'whatever')).toThrow('too small')
-  })
+test('a failed upload closes the progress row before the error line', async () => {
+  const { ctx, output } = setup()
+  const bar: string[] = []
+  ctx.progressBar = () => ({ set: () => {}, finish: text => { bar.push(text) } })
+  ctx.agent.cloudShareSession = async () => { throw new Error('invalid session push: too big (HTTP 400)') }
+  await runShareCommand(ctx, 'team')
+  expect(bar).toEqual(['Sharing with your team — failed'])
+  expect(output.at(-1)).toContain('Share failed: invalid session push: too big (HTTP 400)')
 })
 
-// ---------------------------------------------------------------------------
-// archive validation before extraction
-// ---------------------------------------------------------------------------
-
-describe('validateArchive', () => {
-  let tmpDir: string
-
-  beforeEach(() => {
-    tmpDir = join(tmpdir(), `evot-test-archive-${process.pid}-${Date.now()}-${Math.random()}`)
-    mkdirSync(tmpDir, { recursive: true })
-  })
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true })
-  })
-
-  test('accepts the expected session archive layout', () => {
-    const sid = 'abcdef01-2345-6789-abcd-ef0123456789'
-    mkdirSync(join(tmpDir, 'sessions', sid), { recursive: true })
-    mkdirSync(join(tmpDir, 'logs'), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', sid, 'session.json'), '{}')
-    writeFileSync(join(tmpDir, 'logs', `${sid}.log`), 'log')
-    const archive = join(tmpDir, 'valid.tar.gz')
-    execFileSync('tar', ['czf', archive, `sessions/${sid}/session.json`, `logs/${sid}.log`], { cwd: tmpDir })
-
-    expect(() => validateArchive(archive)).not.toThrow()
-  })
-
-  test('rejects unexpected archive members', () => {
-    writeFileSync(join(tmpDir, 'unexpected.txt'), 'bad')
-    const archive = join(tmpDir, 'unexpected.tar.gz')
-    execFileSync('tar', ['czf', archive, 'unexpected.txt'], { cwd: tmpDir })
-
-    expect(() => validateArchive(archive)).toThrow('unsafe archive path')
-  })
-
-  test('rejects uppercase session ids to match extraction strictness', () => {
-    const upper = 'ABCDEF01-2345-6789-ABCD-EF0123456789'
-    mkdirSync(join(tmpDir, 'sessions', upper), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', upper, 'session.json'), '{}')
-    const archive = join(tmpDir, 'upper.tar.gz')
-    execFileSync('tar', ['czf', archive, `sessions/${upper}/session.json`], { cwd: tmpDir })
-
-    expect(() => validateArchive(archive)).toThrow('unsafe archive path')
-  })
-
-  test('rejects archives whose expanded tar stream exceeds the limit', async () => {
-    const archive = join(tmpDir, 'large.tar.gz')
-    writeFileSync(archive, gzipSync(Buffer.alloc(1024, 0)))
-
-    await expect(validateArchiveSize(archive, 512))
-      .rejects.toThrow('expands beyond 512 byte limit')
-  })
-
-  test('rejects symbolic links before extraction', () => {
-    const sid = 'abcdef01-2345-6789-abcd-ef0123456789'
-    mkdirSync(join(tmpDir, 'sessions', sid), { recursive: true })
-    symlinkSync('/tmp', join(tmpDir, 'sessions', sid, 'session.json'))
-    const archive = join(tmpDir, 'link.tar.gz')
-    execFileSync('tar', ['czf', archive, `sessions/${sid}/session.json`], { cwd: tmpDir })
-
-    expect(() => validateArchive(archive)).toThrow('unsupported entry types')
-  })
+test('/share public warns before publishing and returns the live page link', async () => {
+  const { ctx, output, calls } = setup()
+  await runShareCommand(ctx, 'public')
+  expect(calls).toEqual(['flush', 'share:session:public', 'ack:session'])
+  expect(output[0]).toContain('anyone with the link can read it')
+  expect(output.at(-1)).toContain('https://evot.ai/share/')
+  expect(output.at(-1)).toContain('🌐')
 })
 
-// ---------------------------------------------------------------------------
-// validateAndImport
-// ---------------------------------------------------------------------------
-
-describe('validateAndImport', () => {
-  const SID = 'abcdef01-2345-6789-abcd-ef0123456789'
-  let tmpDir: string
-
-  beforeEach(() => {
-    tmpDir = join(tmpdir(), `evot-test-validate-${Date.now()}`)
-    mkdirSync(tmpDir, { recursive: true })
-  })
-
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true })
-  })
-
-  test('imports valid session files', () => {
-    // Create valid structure
-    mkdirSync(join(tmpDir, 'sessions', SID), { recursive: true })
-    mkdirSync(join(tmpDir, 'logs'), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', SID, 'session.json'), '{}')
-    writeFileSync(join(tmpDir, 'sessions', SID, 'transcript.jsonl'), '')
-    writeFileSync(join(tmpDir, 'logs', `${SID}.log`), 'log data')
-    writeFileSync(join(tmpDir, 'logs', `${SID}.screen.log`), 'screen data')
-    writeFileSync(join(tmpDir, 'logs', `${SID}.markdown.log`), '--- markdown trace asst-1 ---\n')
-
-    const targetDir = join(tmpdir(), `evot-test-target-${Date.now()}`)
-    mkdirSync(targetDir, { recursive: true })
-
-    const result = validateAndImport(tmpDir, targetDir)
-    expect(result).toBe(SID)
-
-    // Verify files were moved to target
-    expect(existsSync(join(targetDir, 'sessions', SID, 'session.json'))).toBe(true)
-    expect(existsSync(join(targetDir, 'sessions', SID, 'transcript.jsonl'))).toBe(true)
-    expect(existsSync(join(targetDir, 'logs', `${SID}.log`))).toBe(true)
-    expect(existsSync(join(targetDir, 'logs', `${SID}.screen.log`))).toBe(true)
-    expect(existsSync(join(targetDir, 'logs', `${SID}.markdown.log`))).toBe(true)
-
-    rmSync(targetDir, { recursive: true, force: true })
-  })
-
-  test('rejects existing targets without overwriting or partially importing', () => {
-    mkdirSync(join(tmpDir, 'sessions', SID), { recursive: true })
-    mkdirSync(join(tmpDir, 'logs'), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', SID, 'session.json'), '{"incoming":true}')
-    writeFileSync(join(tmpDir, 'logs', `${SID}.log`), 'incoming log')
-
-    const targetDir = join(tmpdir(), `evot-test-conflict-${Date.now()}`)
-    mkdirSync(join(targetDir, 'sessions', SID), { recursive: true })
-    const existing = join(targetDir, 'sessions', SID, 'session.json')
-    writeFileSync(existing, '{"existing":true}')
-
-    try {
-      expect(() => validateAndImport(tmpDir, targetDir)).toThrow('would overwrite existing file')
-      expect(readFileSync(existing, 'utf8')).toBe('{"existing":true}')
-      expect(existsSync(join(targetDir, 'logs', `${SID}.log`))).toBe(false)
-    } finally {
-      rmSync(targetDir, { recursive: true, force: true })
-    }
-  })
-
-  test('rolls back files copied before a later destination failure', () => {
-    mkdirSync(join(tmpDir, 'sessions', SID), { recursive: true })
-    mkdirSync(join(tmpDir, 'logs'), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', SID, 'session.json'), '{}')
-    writeFileSync(join(tmpDir, 'logs', `${SID}.log`), 'incoming log')
-
-    const targetDir = join(tmpdir(), `evot-test-rollback-${Date.now()}`)
-    mkdirSync(targetDir, { recursive: true })
-    // Sorted imports copy logs first. A file at sessions/ makes the subsequent
-    // session destination fail after that first copy has succeeded.
-    writeFileSync(join(targetDir, 'sessions'), 'blocking file')
-
-    try {
-      expect(() => validateAndImport(tmpDir, targetDir)).toThrow()
-      expect(existsSync(join(targetDir, 'logs', `${SID}.log`))).toBe(false)
-      expect(readFileSync(join(targetDir, 'sessions'), 'utf8')).toBe('blocking file')
-    } finally {
-      rmSync(targetDir, { recursive: true, force: true })
-    }
-  })
-
-  test('rejects path traversal', () => {
-    mkdirSync(join(tmpDir, 'sessions', SID), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', SID, 'session.json'), '{}')
-    // Create a file that would be listed with ..
-    mkdirSync(join(tmpDir, '..hack'), { recursive: true })
-    writeFileSync(join(tmpDir, '..hack', 'evil.txt'), 'bad')
-
-    // listFilesRecursive won't produce ".." paths from normal extraction,
-    // but validateAndImport rejects unexpected files
-    expect(() => validateAndImport(tmpDir)).toThrow('Rejected unsafe path')
-  })
-
-  test('rejects unexpected files', () => {
-    mkdirSync(join(tmpDir, 'sessions', SID), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', SID, 'session.json'), '{}')
-    writeFileSync(join(tmpDir, 'sessions', SID, 'extra.txt'), 'bad')
-
-    expect(() => validateAndImport(tmpDir)).toThrow('Unexpected file')
-  })
-
-  test('rejects multiple session ids', () => {
-    const SID2 = '11111111-2222-3333-4444-555555555555'
-    mkdirSync(join(tmpDir, 'sessions', SID), { recursive: true })
-    mkdirSync(join(tmpDir, 'sessions', SID2), { recursive: true })
-    writeFileSync(join(tmpDir, 'sessions', SID, 'session.json'), '{}')
-    writeFileSync(join(tmpDir, 'sessions', SID2, 'session.json'), '{}')
-
-    expect(() => validateAndImport(tmpDir)).toThrow('multiple sessions')
-  })
-
-  test('rejects empty archive', () => {
-    expect(() => validateAndImport(tmpDir)).toThrow('Could not determine session id')
-  })
+test('/share team warns who can read it and returns the team page link', async () => {
+  const team: CloudPushResult = {
+    kind: 'synced', pushed: 3,
+    cloud: { visibility: 'private', synced_seq: 3, synced_at: 't', origin_host: 'laptop', public_url: null,
+      team: true, team_url: 'https://auto.evot.ai/team/abcdefghijklmnopqrstuv', team_name: 'Databend' },
+  }
+  const { ctx, output, calls } = setup(() => team)
+  await runShareCommand(ctx, 'team')
+  expect(calls).toEqual(['flush', 'share:session:team', 'ack:session'])
+  expect(output[0]).toContain('members of your group who sign in')
+  expect(output.at(-1)).toContain('👥 Team Databend')
+  expect(output.at(-1)).toContain('https://auto.evot.ai/team/')
 })
 
-describe('collectFiles', () => {
-  const SID = 'abcdef01-2345-6789-abcd-ef0123456789'
-  const evotDir = join(homedir(), '.evotai')
-  const created: string[] = []
-
-  afterEach(() => {
-    for (const dir of created.splice(0).reverse()) {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  })
-
-  test('includes markdown trace log when present', () => {
-    const sessionDir = join(evotDir, 'sessions', SID)
-    const logsDir = join(evotDir, 'logs')
-    mkdirSync(sessionDir, { recursive: true })
-    mkdirSync(logsDir, { recursive: true })
-    created.push(sessionDir)
-
-    writeFileSync(join(sessionDir, 'session.json'), '{}')
-    writeFileSync(join(logsDir, `${SID}.markdown.log`), '--- markdown trace asst-1 ---\n')
-
-    try {
-      const files = collectFiles(SID)
-      expect(files).toContain(`sessions/${SID}/session.json`)
-      expect(files).toContain(`logs/${SID}.markdown.log`)
-    } finally {
-      rmSync(join(logsDir, `${SID}.markdown.log`), { force: true })
-    }
-  })
+test('/share off removes the cloud copy and keeps the local one', async () => {
+  const { ctx, output, calls } = setup()
+  await runShareCommand(ctx, 'off')
+  expect(calls).toEqual(['flush', 'off:session', 'forget:session'])
+  expect(output.at(-1)).toContain('local copy kept')
 })
 
-// ---------------------------------------------------------------------------
-// listFilesRecursive
-// ---------------------------------------------------------------------------
+test('a session id prefix targets another session, with or without a visibility word', async () => {
+  const { ctx, calls } = setup()
+  await runShareCommand(ctx, 'abc1')
+  await runShareCommand(ctx, 'public abc1')
+  expect(calls.filter(c => c.startsWith('share:'))).toEqual(['share:abc12345-0000:keep', 'share:abc12345-0000:public'])
+})
 
-describe('listFilesRecursive', () => {
-  let tmpDir: string
+test('divergence is reported as a choice, and each side has a word', async () => {
+  const { ctx, output, calls } = setup(() => ({ kind: 'diverged', local_seq: 4, remote_seq: 6 }))
+  await runShareCommand(ctx, 'private')
+  expect(output.at(-1)).toContain('/share cloud')
+  expect(output.at(-1)).toContain('/share local')
+  await runShareCommand(ctx, 'cloud')
+  expect(calls).toContain('fork:session')
+  expect(calls).toContain('resume:fork0000-1111')
+  await runShareCommand(ctx, 'local')
+  expect(calls).toContain('push:session:true')
+  expect(output.at(-1)).toContain('replaced')
+})
 
-  beforeEach(() => {
-    tmpDir = join(tmpdir(), `evot-test-list-${Date.now()}`)
-    mkdirSync(tmpDir, { recursive: true })
+test('does not sync partial runs, and rejects anything that is not a word or id', async () => {
+  const { ctx, output, calls } = setup()
+  ctx.isBusy = () => true
+  await runShareCommand(ctx, 'public')
+  expect(output.at(-1)).toContain('Wait for')
+  ctx.isBusy = () => false
+  await runShareCommand(ctx, 'https://tmpfiles.org/old#key')
+  expect(output.at(-1)).toContain('Usage:')
+  await runShareCommand(ctx, 'rm abcdefghijklmnopqrstuv')
+  expect(output.at(-1)).toContain('Usage: /share [public | team | private | off | list] [session-id | url]')
+  expect(calls).toEqual([])
+})
+
+test('list opens the cloud-filtered sessions list', async () => {
+  const { ctx, output, calls } = setup()
+  await runShareCommand(ctx, 'list')
+  expect(calls).toEqual(['open-list'])
+  expect(output).toEqual([])
+})
+
+test('failed notice persistence prevents an incomplete push', async () => {
+  const { ctx, output, calls } = setup()
+  ctx.flushShareNotices = async () => { throw new Error('notices unavailable') }
+  await runShareCommand(ctx, 'private')
+  expect(calls).toEqual([])
+  expect(output.at(-1)).toContain('notices unavailable')
+})
+
+test('bare /share on a public session opens the list without changing visibility', async () => {
+  const { ctx, output, calls } = setup(() => synced('public'))
+  await runShareCommand(ctx, '')
+  expect(calls).toEqual(['open-list'])
+  expect(output).toEqual([])
+})
+
+test('list rejects extra arguments instead of silently ignoring them', async () => {
+  const { ctx, output, calls } = setup()
+  await runShareCommand(ctx, 'list abc1')
+  expect(calls).toEqual([])
+  expect(output.at(-1)).toContain('Usage:')
+})
+
+test('/share <url> imports the public page as a local session and lands in it', async () => {
+  const { ctx, output, calls } = setup()
+  ctx.getSessionId = () => null // works without a current session
+  const url = 'https://evot.ai/share/abcdefghijklmnopqrstuv'
+  await runShareCommand(ctx, `  ${url}  `)
+  expect(calls).toEqual([`import:${url}`, 'resume:imp00000-2222'])
+  expect(output[0]).toContain('Fetching the shared session')
+  expect(output[1]).toContain('saved as imp00000')
+  expect(output[1]).toContain('original is untouched')
+})
+
+test('/share <team-url> with deep-link parameters imports and resumes', async () => {
+  const { ctx, output, calls } = setup()
+  const url = 'https://auto.evot.ai/team/hRJJIer7dHx160uXgASZxQ?leafId=e135&targetId=e134'
+  await runShareCommand(ctx, url)
+  expect(calls).toEqual([`import:${url}`, 'resume:imp00000-2222'])
+  expect(output.at(-1)).toContain('original is untouched')
+})
+
+test('/share <url> reports an import failure and never changes visibility', async () => {
+  const { ctx, output, calls } = setup()
+  ctx.agent.importSharedSession = async () => { throw new Error('shared session not found; ask the owner') }
+  await runShareCommand(ctx, 'https://evot.ai/share/abcdefghijklmnopqrstuv/session.json')
+  expect(calls).toEqual([])
+  expect(output.at(-1)).toContain('Import failed: shared session not found')
+})
+
+test('task links and local ids are not treated as session imports', async () => {
+  expect(isShareLink('https://evot.ai/share/abcdefghijklmnopqrstuv')).toBe(true)
+  expect(isShareLink('evot.ai/share/abcdefghijklmnopqrstuv/content')).toBe(true)
+  expect(isShareLink('https://auto.evot.ai/team/hRJJIer7dHx160uXgASZxQ?leafId=e135&targetId=e134')).toBe(true)
+  expect(isShareLink('https://evot.ai/share/t/abcdefghijklmnopqrstuv')).toBe(false)
+  expect(isShareLink('abcdefghijklmnopqrstuv')).toBe(false)
+  expect(isShareLink('abc12345')).toBe(false)
+  expect(isShareLink('public')).toBe(false)
+})
+
+describe('paintUploadProgress', () => {
+  const MB = 1024 * 1024
+  function recorder() {
+    const calls: { done: number; total: number; count?: string; note?: string }[] = []
+    const bar = {
+      set: (done: number, total: number, detail?: { count?: string; note?: string | (() => string) }) => {
+        const note = typeof detail?.note === 'function' ? detail.note() : detail?.note
+        calls.push({ done, total, ...(detail?.count ? { count: detail.count } : {}), ...(note ? { note } : {}) })
+      },
+      finish: () => {},
+    }
+    return { bar, calls }
+  }
+  const tick = (extra: Record<string, unknown>) => ({ uploaded_entries: 0, total_entries: 900, batch: 0, batches: 3, ...extra })
+
+  test('bytes drive the bar while a batch is still going up', () => {
+    const { bar, calls } = recorder()
+    paintUploadProgress(bar, tick({ phase: 'preparing', sent_bytes: 0, total_bytes: 0 }))
+    paintUploadProgress(bar, tick({ phase: 'uploading', sent_bytes: 3.1 * MB, total_bytes: 19.1 * MB }))
+    paintUploadProgress(bar, tick({ phase: 'confirming', sent_bytes: 4 * MB, total_bytes: 19.1 * MB }))
+    // Preparing keeps the pending text; there is no size to draw yet.
+    expect(calls).toEqual([
+      { done: 3.1 * MB, total: 19.1 * MB, count: '3.1 / 19.1 MB' },
+      { done: 4 * MB, total: 19.1 * MB, count: '4.0 / 19.1 MB', note: 'waiting for the server' },
+    ])
   })
 
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true })
+  test('a rate-limited batch says when it goes again', () => {
+    const { bar, calls } = recorder()
+    let clock = 10_000
+    paintUploadProgress(bar, tick({ phase: 'rate_limited', sent_bytes: 4 * MB, total_bytes: 8 * MB, retry_in_ms: 12_000 }), () => clock)
+    expect(calls[0]!.note).toBe('server busy · retrying in 12s')
+    clock += 5_000
+    const { bar: again, calls: later } = recorder()
+    paintUploadProgress(again, tick({ phase: 'rate_limited', sent_bytes: 4 * MB, total_bytes: 8 * MB, retry_in_ms: 7_000 }), () => clock)
+    expect(later[0]!.note).toBe('server busy · retrying in 7s')
   })
 
-  test('lists nested files with relative paths', () => {
-    mkdirSync(join(tmpDir, 'a', 'b'), { recursive: true })
-    writeFileSync(join(tmpDir, 'a', 'b', 'c.txt'), '')
-    writeFileSync(join(tmpDir, 'top.txt'), '')
-
-    const files = listFilesRecursive(tmpDir)
-    expect(files.sort()).toEqual(['a/b/c.txt', 'top.txt'])
-  })
-
-  test('returns empty for empty dir', () => {
-    expect(listFilesRecursive(tmpDir)).toEqual([])
+  test('older addons without bytes still count entries', () => {
+    const { bar, calls } = recorder()
+    paintUploadProgress(bar, { uploaded_entries: 300, total_entries: 900, batch: 1, batches: 3 })
+    expect(calls).toEqual([{ done: 300, total: 900 }])
   })
 })

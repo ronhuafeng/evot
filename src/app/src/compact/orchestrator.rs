@@ -13,11 +13,11 @@ use evot_engine::context::compaction::summary::SummaryOutcome;
 use tokio_util::sync::CancellationToken;
 
 use super::context_view::compact_summary_item;
-use crate::agent::run::convert;
-use crate::agent::session::Session;
 use crate::conf::LlmConfig;
+use crate::conversation::convert;
 use crate::error::EvotError;
 use crate::error::Result;
+use crate::sessions::Session;
 use crate::types::CompactDetails;
 use crate::types::CompactReason;
 use crate::types::CompactionMethod;
@@ -61,10 +61,10 @@ pub struct CompactSummarizer {
     pub llm: LlmConfig,
     /// Maximum summary output. Split-turn prefix summaries use half this value.
     pub reserve_tokens: u32,
-    /// Maximum wall-clock time for one summary stage (remote or LLM). Expiry
-    /// uses the deterministic fallback; explicit user cancellation still
-    /// cancels the entire compaction without writing a marker.
-    pub timeout: std::time::Duration,
+    /// Optional wall-clock bound per summary stage for explicit callers.
+    /// Interactive compaction has no deadline: it waits for completion unless
+    /// the user cancels. Explicit expiry may use the deterministic fallback.
+    pub timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -79,6 +79,7 @@ pub enum ManualCompactionOutcome {
         context_window: usize,
         messages_evicted: usize,
         current_run_reclaimed: usize,
+        /// Deprecated wire field, always 3; compaction has no levels anymore.
         compaction_level: usize,
         used_fallback: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +91,67 @@ pub enum ManualCompactionOutcome {
     },
     NothingToCompact,
     Cancelled,
+}
+
+impl ManualCompactionOutcome {
+    pub fn describe(&self) -> String {
+        match self {
+            ManualCompactionOutcome::Compacted {
+                tokens_before,
+                tokens_after,
+                messages_before,
+                messages_after,
+                context_window,
+                used_fallback,
+                method,
+                remote_blob_bytes,
+                fallback_reason,
+                ..
+            } => {
+                let mut line = format!(
+                    "Session compacted: {tokens_before} → {tokens_after} tokens, {messages_before} → {messages_after} messages."
+                );
+                if *used_fallback {
+                    line.push_str(
+                        "\nNote: the LLM summary was unavailable; a deterministic fallback summary was used.",
+                    );
+                }
+                match method {
+                    Some(evot_engine::CompactionMethod::Remote) => {
+                        line.push_str("\nProvider-native remote compaction was used.");
+                        if let Some(bytes) = remote_blob_bytes {
+                            line.push_str(&format!(" Native blob: {bytes} bytes."));
+                        }
+                    }
+                    Some(evot_engine::CompactionMethod::RemoteFailedLocal) => {
+                        line.push_str(
+                            "\nProvider-native remote compaction failed; local summarization was used.",
+                        );
+                        if let Some(reason) = fallback_reason {
+                            line.push_str(&format!(" Reason: {reason}"));
+                        }
+                    }
+                    Some(evot_engine::CompactionMethod::Local) if fallback_reason.is_some() => {
+                        if let Some(reason) = fallback_reason {
+                            line.push_str(&format!(
+                                "\nProvider-native remote compaction was unavailable; local summarization was used. Reason: {reason}"
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                if *context_window > 0 && tokens_after >= context_window {
+                    line.push_str(&format!(
+                        "\nWarning: context is still {tokens_after} tokens, above this model's {context_window}-token window. \
+                         Switch to a larger-context model or start a new session to continue."
+                    ));
+                }
+                line
+            }
+            ManualCompactionOutcome::NothingToCompact => "Nothing to compact.".into(),
+            ManualCompactionOutcome::Cancelled => "Compaction cancelled.".into(),
+        }
+    }
 }
 
 /// Result from the compaction orchestrator. `status` distinguishes cancellation
@@ -206,7 +268,7 @@ pub async fn compact_session_with_status(
         &config,
         summary::SummaryOptions {
             llm_policy: LlmPolicy::PreferLlm,
-            timeout: request.summarizer.as_ref().map(|s| s.timeout),
+            timeout: request.summarizer.as_ref().and_then(|s| s.timeout),
             observer: observer.clone(),
             cancel: cancel.clone(),
         },

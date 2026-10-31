@@ -1,5 +1,12 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Map;
+use serde_json::Value;
+
+/// Fields this build does not know about. Carried through every cache
+/// load/save so an older client rewriting `models.cache.json` (for example
+/// to refresh notices) never strips fields a newer client relies on.
+pub type ExtraFields = Map<String, Value>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudUser {
@@ -58,6 +65,36 @@ pub struct FreeModelOption {
     /// older servers, which keeps the catalog's own order.
     #[serde(default)]
     pub sort_order: i64,
+    /// `chat` (default) answers in the conversation; `judge` answers typed
+    /// questions about it (TypeSafe Jev) and never generates text. Judges are
+    /// kept out of the picker and used for side decisions such as pruning.
+    #[serde(default)]
+    pub role: String,
+    /// Context window in tokens, when the server publishes it. Zero (and
+    /// absent on older servers) means unknown: the client falls back to its
+    /// own per-model default.
+    #[serde(default)]
+    pub context_window: u32,
+    /// Public capability profile id, independent of the private upstream route.
+    /// Empty on historical catalogs: resolve the wire id or use the fallback.
+    #[serde(default)]
+    pub capability_profile: String,
+    /// Independent output limit; absent/zero leaves the profile's limit intact.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(flatten, default)]
+    pub extra: ExtraFields,
+}
+
+impl FreeModelOption {
+    /// The published window, if any.
+    pub fn context_window(&self) -> Option<u32> {
+        (self.context_window > 0).then_some(self.context_window)
+    }
+
+    pub fn is_judge(&self) -> bool {
+        self.role.eq_ignore_ascii_case("judge")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -71,6 +108,8 @@ pub struct Notice {
     pub title: String,
     #[serde(default)]
     pub body_md: String,
+    #[serde(flatten, default)]
+    pub extra: ExtraFields,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +129,8 @@ pub struct CloudProviderConfig {
     #[serde(default)]
     pub default_model: String,
     pub models: Vec<String>,
+    #[serde(flatten, default)]
+    pub extra: ExtraFields,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +138,11 @@ pub struct ModelsResponse {
     /// Absent in caches written by early versions; 0 marks those as legacy.
     #[serde(default)]
     pub version: i64,
+    /// The wire id every new session of this account lands on. Empty (and
+    /// absent in caches from older servers) means "follow catalog rank". The
+    /// server blanks it while the pinned model is unavailable to the user.
+    #[serde(default)]
+    pub default_model: String,
     /// One entry per (tier, protocol) pair in use, so a single account can mix
     /// Anthropic and OpenAI models.
     #[serde(default)]
@@ -105,6 +151,8 @@ pub struct ModelsResponse {
     pub models: Vec<FreeModelOption>,
     #[serde(default)]
     pub notices: Vec<Notice>,
+    #[serde(flatten, default)]
+    pub extra: ExtraFields,
 }
 
 /// Current on-disk schema for `models.cache.json`.
@@ -119,6 +167,8 @@ pub struct ModelsCache {
     pub schema_version: u32,
     pub synced_at: i64,
     pub response: ModelsResponse,
+    #[serde(flatten, default)]
+    pub extra: ExtraFields,
 }
 
 impl ModelsCache {
@@ -127,6 +177,7 @@ impl ModelsCache {
             schema_version: MODELS_CACHE_SCHEMA_VERSION,
             synced_at,
             response,
+            extra: ExtraFields::new(),
         }
     }
 }

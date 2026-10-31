@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::provider::error::ProviderError;
-use crate::provider::stream_fallback::FallbackEmitter;
-use crate::provider::stream_http;
+use crate::provider::stream::fallback::FallbackEmitter;
+use crate::provider::stream::http;
 use crate::provider::traits::StreamConfig;
 use crate::provider::traits::StreamEvent;
 use crate::types::*;
@@ -23,12 +23,12 @@ pub(crate) async fn handle_json_response(
     tx: mpsc::UnboundedSender<StreamEvent>,
     config: &StreamConfig,
 ) -> Result<Message, ProviderError> {
-    let value = stream_http::read_json_body(response).await?;
+    let value = http::read_json_body(response).await?;
 
     // Check for error-shaped JSON first
     if is_error_response(&value) {
         debug!("Anthropic JSON fallback: error response detected");
-        return Err(stream_http::classify_json_error(&value));
+        return Err(http::classify_json_error(&value));
     }
 
     debug!("Anthropic JSON fallback: parsing as success completion");
@@ -86,8 +86,8 @@ fn parse_success_response(
         Some("tool_use") => StopReason::ToolUse,
         Some("max_tokens") => StopReason::Length,
         Some(reason @ ("refusal" | "sensitive")) => {
-            return Err(ProviderError::Api(format!(
-                "Provider ended the response with stop reason '{reason}' (safety filter / refusal)"
+            return Err(ProviderError::Api(crate::provider::error::refusal_message(
+                reason,
             )));
         }
         Some(reason) => {
@@ -182,4 +182,18 @@ fn parse_success_response(
         .map(|model| model.provider())
         .unwrap_or("anthropic");
     Ok(emitter.finalize(&config.model, provider))
+}
+
+/// JSON fallback is one finite response, not an unbounded streaming producer.
+pub(crate) async fn handle_json_response_sink(
+    response: reqwest::Response,
+    tx: crate::provider::stream::sink::StreamSink,
+    config: &StreamConfig,
+) -> Result<Message, ProviderError> {
+    let (legacy_tx, mut rx) = mpsc::unbounded_channel();
+    let message = handle_json_response(response, legacy_tx, config).await?;
+    while let Some(event) = rx.recv().await {
+        tx.send(event).await.map_err(|_| ProviderError::Cancelled)?;
+    }
+    Ok(message)
 }

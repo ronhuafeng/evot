@@ -5,14 +5,14 @@ import type { UIMessage } from './types.js'
 /** Default number of most-recent messages painted to scrollback on resume. */
 export const RESUME_DISPLAY_LIMIT = 80
 
-export function shouldPreloadStartupSessions(opts: { continueLatest?: boolean; resumeSessionId?: string }): boolean {
-  return Boolean(opts.continueLatest || opts.resumeSessionId)
+export function shouldPreloadStartupSessions(opts: { continueLatest?: boolean; resumeSessionId?: string; forkFrom?: unknown }): boolean {
+  return Boolean(opts.continueLatest || opts.resumeSessionId || opts.forkFrom)
 }
 
 export function findPreviousSession(preloaded: SessionMeta[], cwd: string): SessionMeta | undefined {
   return [...preloaded]
     .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))
-    .find(s => s.cwd === cwd)
+    .find(s => s.cwd === cwd && s.source !== 'automation')
 }
 
 /**

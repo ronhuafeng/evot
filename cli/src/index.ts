@@ -9,6 +9,10 @@ async function main() {
   const rawArgs = process.argv.slice(2)
   const opts = await parseArgs(rawArgs)
 
+  // Load outside best-effort catches: a failed first import must terminate
+  // launch, not leave a partial module for createAgent to reuse.
+  const { version } = await import('./native/index.js')
+
   // Apply a background-staged download before any interactive path comes up.
   // A verified archive is already on disk, so this is a local copy-and-swap —
   // the whole point of staging was to keep it off the network. Interactive
@@ -22,7 +26,6 @@ async function main() {
   if (opts.command === 'repl' || opts.command === 'login' || opts.command === 'prompt') {
     try {
       const { applyStagedOnStartup, execIntoInstalledUpdate } = await import('./update/index.js')
-      const { version } = await import('./native/index.js')
       const applied = await applyStagedOnStartup(version())
       if (applied) execIntoInstalledUpdate(applied)
     } catch { /* never block launch on update bookkeeping */ }
@@ -36,10 +39,12 @@ async function main() {
     if (applied) reportAppliedUpdate(applied, opts.command)
   } catch { /* never block launch on update bookkeeping */ }
 
-  if (opts.command === 'repl' || opts.command === 'login' || opts.command === 'prompt') {
+  // One-shot commands get their catalog check here. The REPL owns its own as a
+  // periodic background job, so a session left open stays current too.
+  if (opts.command === 'login' || opts.command === 'prompt') {
     try {
-      const { startOfficialSkillSync } = await import('./commands/skill.js')
-      void startOfficialSkillSync().catch(() => { /* never block launch on skill sync */ })
+      const { startOfficialSkillMaintenance } = await import('./commands/skill.js')
+      void startOfficialSkillMaintenance().catch(() => { /* never block launch on skill sync */ })
     } catch { /* never block launch on skill sync bookkeeping */ }
   }
 
@@ -48,6 +53,13 @@ async function main() {
       const { startServer } = await import('./native/index.js')
       await startServer(opts.port, opts.model, opts.envFile)
       break
+    }
+
+    case 'acp': {
+      // Stdout belongs to the protocol from here on; nothing else may print.
+      const { runAcp } = await import('./native/index.js')
+      await runAcp({ model: opts.model, envFile: opts.envFile, tools: opts.acpTools, permission: opts.acpPermission, ephemeral: opts.ephemeral })
+      process.exit(0)
     }
 
     case 'prompt': {
@@ -68,6 +80,7 @@ async function main() {
         agent,
         resumeSessionId: opts.resume,
         continueLatest: opts.continueLatest,
+        forkFrom: opts.fork,
         serverPort: opts.port,
         envFile: opts.envFile,
       })
@@ -88,9 +101,26 @@ async function main() {
 
     case 'update': {
       const { runUpdate } = await import('./update/index.js')
-      const { version } = await import('./native/index.js')
       console.log('  checking for updates...')
-      const result = await runUpdate(version())
+      // The installer runs in its own process group so cancellation can reach
+      // curl/tar; Ctrl+C on this CLI must therefore be forwarded explicitly, or
+      // the swap would continue after the user believes it stopped.
+      const cancel = new AbortController()
+      const onInterrupt = () => cancel.abort()
+      process.once('SIGINT', onInterrupt)
+      const meter = process.stderr.isTTY
+      const result = await runUpdate(version(), {
+        signal: cancel.signal,
+        // curl's meter arrives as \r-separated frames; on a terminal redraw one
+        // line instead of logging every frame.
+        onProgress: line => process.stderr.write(meter ? `\r\x1b[2K  ${line}` : `  ${line}\n`),
+      })
+      process.off('SIGINT', onInterrupt)
+      if (meter) process.stderr.write('\n')
+      if (cancel.signal.aborted) {
+        console.error('  ✗ update cancelled')
+        process.exit(130)
+      }
       switch (result.kind) {
         case 'up_to_date':
           console.log(
@@ -127,6 +157,7 @@ async function main() {
         agent,
         resumeSessionId: opts.resume,
         continueLatest: opts.continueLatest,
+        forkFrom: opts.fork,
         serverPort: opts.port,
         envFile: opts.envFile,
       })

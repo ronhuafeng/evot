@@ -4,7 +4,7 @@ pub use evot_engine::CompactionMethod;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::UsageSummary;
+use crate::observability::UsageSummary;
 
 // ---------------------------------------------------------------------------
 // MarkerKind — types of transcript markers that reset the context baseline
@@ -87,6 +87,10 @@ pub enum CompactReason {
     Threshold,
     Overflow,
     Manual,
+    /// Judge-decided prune applied at run end (no summary written).
+    Prune,
+    /// Automatic compact-and-retry after a provider safety refusal.
+    Refusal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -114,6 +118,9 @@ pub enum TranscriptItem {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         content: Vec<TranscriptUserContent>,
+        /// Versioned source metadata; never changes text/content sent to models.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<evot_engine::InputProvenance>,
     },
     Assistant {
         #[serde(alias = "content_blocks")]
@@ -136,7 +143,7 @@ pub enum TranscriptItem {
         content: String,
         is_error: bool,
         /// Structured metadata for UI rendering and state reconstruction on
-        /// resume (e.g. a plan artifact's task list). Never sent to the LLM.
+        /// resume (e.g. a file edit's diff). Never sent to the LLM.
         /// Defaults to null for transcripts written before this field existed.
         #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         details: serde_json::Value,
@@ -236,7 +243,11 @@ impl TranscriptItem {
             })
             .collect();
 
-        Self::User { text, content }
+        Self::User {
+            text,
+            content,
+            provenance: None,
+        }
     }
 }
 

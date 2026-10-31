@@ -1,4 +1,5 @@
 use evot::conf::StorageConfig;
+use evot::observability::UsageSummary;
 use evot::storage::open_storage;
 use evot::types::*;
 use tempfile::TempDir;
@@ -25,6 +26,7 @@ async fn open_storage_returns_working_backend() -> TestResult {
             1,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "hello".into(),
                 content: vec![],
             },
@@ -82,6 +84,7 @@ async fn list_sessions_uses_transcript_activity_for_running_sessions() -> TestRe
             1,
             1,
             TranscriptItem::User {
+                provenance: None,
                 text: "still active".into(),
                 content: vec![],
             },
@@ -97,6 +100,110 @@ async fn list_sessions_uses_transcript_activity_for_running_sessions() -> TestRe
     assert_eq!(sessions.len(), 2);
     assert_eq!(sessions[0].session_id, "sess-running");
     assert!(sessions[0].updated_at > sessions[1].updated_at);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_sessions_handles_missing_and_invalid_roots() -> TestResult {
+    let root = TempDir::new()?;
+    let storage = open_storage(&StorageConfig::fs(root.path().to_path_buf()))?;
+    assert!(storage
+        .list_sessions(ListSessions::default())
+        .await?
+        .is_empty());
+    std::fs::write(root.path().join("sessions"), b"not a directory")?;
+    assert!(storage
+        .list_sessions(ListSessions::default())
+        .await
+        .is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_sessions_preserves_tolerance_ordering_and_pagination() -> TestResult {
+    let root = TempDir::new()?;
+    let storage = open_storage(&StorageConfig::fs(root.path().to_path_buf()))?;
+    for (id, updated_at) in [
+        ("sess-old", "2020-01-01T00:00:00Z"),
+        ("sess-middle", "2021-01-01T00:00:00Z"),
+        ("sess-new", "2022-01-01T00:00:00Z"),
+    ] {
+        let mut session = SessionMeta::new(id.into(), "/work".into(), "model".into());
+        session.updated_at = updated_at.into();
+        storage.save_session(session).await?;
+    }
+    let sessions_dir = root.path().join("sessions");
+    std::fs::write(sessions_dir.join(".DS_Store"), b"ignored")?;
+    for id in ["sess-missing", "sess-malformed", "sess-unreadable"] {
+        std::fs::create_dir(sessions_dir.join(id))?;
+    }
+    std::fs::write(sessions_dir.join("sess-malformed/session.json"), b"{broken")?;
+    std::fs::create_dir(sessions_dir.join("sess-unreadable/session.json"))?;
+
+    let all = storage.list_sessions(ListSessions::default()).await?;
+    assert_eq!(
+        all.iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["sess-new", "sess-middle", "sess-old"]
+    );
+    let page = storage
+        .list_sessions(ListSessions {
+            limit: 1,
+            offset: 1,
+        })
+        .await?;
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].session_id, "sess-middle");
+    let tail = storage
+        .list_sessions(ListSessions {
+            limit: 0,
+            offset: 2,
+        })
+        .await?;
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].session_id, "sess-old");
+    assert!(storage
+        .list_sessions(ListSessions {
+            limit: 20,
+            offset: 10
+        })
+        .await?
+        .is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_sessions_activity_does_not_override_newer_saved_time() -> TestResult {
+    let root = TempDir::new()?;
+    let storage = open_storage(&StorageConfig::fs(root.path().to_path_buf()))?;
+    for (id, updated_at) in [
+        ("sess-future", "2099-01-01T00:00:00Z"),
+        ("sess-invalid", "invalid timestamp"),
+    ] {
+        let mut session = SessionMeta::new(id.into(), "/work".into(), "model".into());
+        session.updated_at = updated_at.into();
+        storage.save_session(session).await?;
+        std::fs::write(
+            root.path()
+                .join("sessions")
+                .join(id)
+                .join("transcript.jsonl"),
+            b"[]\n",
+        )?;
+    }
+    let all = storage.list_sessions(ListSessions::default()).await?;
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].session_id, "sess-future");
+    assert_eq!(all[0].updated_at, "2099-01-01T00:00:00Z");
+    assert_eq!(all[1].session_id, "sess-invalid");
+    assert!(chrono::DateTime::parse_from_rfc3339(&all[1].updated_at).is_ok());
+    // Listing adjusts only the returned metadata, not the stored contract.
+    let saved = storage
+        .get_session("sess-invalid")
+        .await?
+        .ok_or("missing session")?;
+    assert_eq!(saved.updated_at, "invalid timestamp");
     Ok(())
 }
 
@@ -163,6 +270,7 @@ async fn legacy_object_lines_are_migrated_before_append() -> TestResult {
             2,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "new".into(),
                 content: vec![],
             },
@@ -193,6 +301,7 @@ async fn load_active_entries_starts_at_latest_control_without_decoding_large_pre
     let transcript_path = session_dir.join("transcript.jsonl");
 
     let obsolete = TranscriptEntry::new(session_id.into(), None, 1, 0, TranscriptItem::User {
+        provenance: None,
         text: "x".repeat(2 * 1024 * 1024),
         content: vec![],
     });
@@ -201,6 +310,7 @@ async fn load_active_entries_starts_at_latest_control_without_decoding_large_pre
         messages: vec![],
     });
     let tail = TranscriptEntry::new(session_id.into(), None, 3, 0, TranscriptItem::User {
+        provenance: None,
         text: "active".into(),
         content: vec![],
     });
@@ -231,6 +341,7 @@ async fn compare_and_append_rejects_non_contiguous_first_sequence() -> TestResul
             2,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "must not persist".into(),
                 content: vec![],
             },
@@ -265,6 +376,7 @@ async fn append_to_large_current_transcript_uses_tail_sequence() -> TestResult {
     let session_dir = root.path().join("sessions").join(session_id);
     let transcript_path = session_dir.join("transcript.jsonl");
     let first = TranscriptEntry::new(session_id.into(), None, 1, 0, TranscriptItem::User {
+        provenance: None,
         text: "x".repeat(2 * 1024 * 1024),
         content: vec![],
     });
@@ -279,6 +391,7 @@ async fn append_to_large_current_transcript_uses_tail_sequence() -> TestResult {
             2,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "tail".into(),
                 content: vec![],
             },
@@ -315,6 +428,7 @@ async fn append_repairs_interrupted_tail_before_writing_next_batch() -> TestResu
             1,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "before crash".into(),
                 content: vec![],
             },
@@ -340,6 +454,7 @@ async fn append_repairs_interrupted_tail_before_writing_next_batch() -> TestResu
             2,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "after recovery".into(),
                 content: vec![],
             },

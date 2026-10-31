@@ -1,14 +1,22 @@
 /**
- * The rounded frame drawn around the prompt editor.
+ * The frame drawn around the prompt editor: a rule above, a rule below, and a
+ * `❭` caret leading the draft.
  *
- * A frame owns one invariant: every row it emits is exactly `columns` wide.
- * That is what keeps the right rail in a straight line and lets a selected
- * row's background reach it. Callers get `contentWidth` from the frame rather
- * than deriving it, so content and rails cannot disagree about the budget.
+ * There are deliberately no vertical rails. A terminal copies mouse selections
+ * cell by cell, so a boxed editor puts a `│` at both ends of every line the
+ * user drags across. Horizontal rules sit on their own rows and never land in
+ * a selection of the text between them; the caret is one familiar character
+ * on one row.
  *
- * Colour comes from the active theme directly. A terminal shows one frame
- * style at a time, so threading a palette through every call site would add
- * noise without adding choice.
+ * Colour follows attention. The rules are separators, so they take the subtle
+ * border hue and stay out of the way. The caret is where you type, so it
+ * carries the brand colour. A mode label on the top rule takes the mode's own
+ * hue, so "log" reads as log without recolouring the whole frame.
+ *
+ * A frame owns one invariant: every rule it emits is exactly `columns` wide,
+ * and every content row indents by the same prefix width. Callers get
+ * `contentWidth` from the frame rather than deriving it, so content and prefix
+ * cannot disagree about the budget.
  */
 
 import stringWidth from 'string-width'
@@ -17,109 +25,122 @@ import { atLeastHeight, atLeastWidth, heightTier, widthTier } from './breakpoint
 import { line, plain, type StyledLine, type StyledSpan } from './types.js'
 import { spansWidth, truncateSpansToWidth, truncateToWidth } from './width.js'
 
-/**
- * Blank columns between each rail and the content, scaled to the terminal.
- * Wide terminals can spend cells on breathing room; narrow ones need every
- * column for text, so the gutter shrinks before content does. Costs no rows.
- *
- * This stays a step table rather than a tier: it scales smoothly with width
- * instead of tracking a semantic threshold.
- */
-const GUTTER_STEPS: readonly { minColumns: number; gutter: number }[] = [
-  { minColumns: 100, gutter: 3 },
-  { minColumns: 60, gutter: 2 },
-  { minColumns: 0, gutter: 1 },
-]
+/** The caret that leads the draft. `❭` rather than `>` so copied text does not read as a shell prompt or a quote. */
+export const PROMPT_CARET = '❭'
+/** `❭ ` — two columns every framed row spends before content. */
+const PREFIX_WIDTH = 2
 
-function gutterFor(columns: number): number {
-  return GUTTER_STEPS.find(step => columns >= step.minColumns)?.gutter ?? 1
+export interface RuleLabels {
+  /** Leads the rule: `── ↑ 3 lines ────`. Muted, like the rule itself. */
+  lead?: string
+  /**
+   * Trails the rule in parentheses: `──── (log) ─`. Carries `hex`, the
+   * mode's own colour, so the mode is legible without recolouring the frame.
+   */
+  mode?: { text: string; hex: string }
 }
 
-/** Columns a labelled border spends on chrome: `╭─ ` + ` ` + `╮`. */
-const LABEL_CHROME_COST = 5
-
 export interface Frame {
-  /** Columns available to content inside the rails. */
+  /** Columns available to content after the prefix. */
   readonly contentWidth: number
-  /** False when rails degrade to plain rules, or vanish entirely. */
+  /** False when the terminal is too narrow to spend columns on a caret. */
   readonly framed: boolean
   /**
    * False on very short terminals, where even a horizontal rule is a row the
-   * transcript needs more. Callers skip the border rows entirely.
+   * transcript needs more. Callers skip the rule rows entirely.
    */
   readonly ruled: boolean
-  /** Top border, optionally labelled (`╭─ ↑ 3 lines ────╮`). */
-  top(label?: string): StyledLine
-  /** Bottom border, optionally labelled. */
-  bottom(label?: string): StyledLine
-  /** Lay one content line out to the full frame width, rails included. */
-  row(styled: StyledLine): StyledLine
+  /** Top rule, optionally labelled at either end. */
+  top(labels?: RuleLabels): StyledLine
+  /** Bottom rule, optionally labelled at either end. */
+  bottom(labels?: RuleLabels): StyledLine
+  /**
+   * Lay one content line out behind the prefix. `caret` puts the `❭` there;
+   * every other row indents by the same width so text lines up underneath.
+   */
+  row(styled: StyledLine, caret?: boolean): StyledLine
 }
 
 export interface FrameOptions {
-  /** Terminal rows. Short terminals drop the border to keep the transcript. */
+  /** Terminal rows. Short terminals drop the rules to keep the transcript. */
   rows?: number
-  /** Border hue; defaults to the brand colour. Input modes recolour the frame. */
-  hex?: string
 }
 
 export function createFrame(columns: number, options: FrameOptions = {}): Frame {
-  const { rows, hex } = options
+  const { rows } = options
   // Two chrome rows are affordable down to 10 rows. Below that a framed
-  // composer plus footer claims the whole screen, so the border goes.
+  // composer plus footer claims the whole screen, so the rules go.
   const ruled = rows === undefined || atLeastHeight(heightTier(rows), 'sm')
   const framed = ruled && atLeastWidth(widthTier(columns), 'sm')
-  const gutterWidth = framed ? gutterFor(columns) : 0
-  // Two rails plus a gutter on each side.
-  const contentWidth = Math.max(1, framed ? columns - 2 - gutterWidth * 2 : columns)
-  const borderHex = () => hex ?? getTheme().brandHex
+  const contentWidth = Math.max(1, framed ? columns - PREFIX_WIDTH : columns)
 
-  const border = (label: string | undefined, left: string, right: string): StyledLine => {
-    const hex = borderHex()
-    if (!framed) return line({ text: plainRule(columns, label), hex })
-    // `╭─ ` + label + ` ` on the left, one corner on the right.
-    const lead = label ? `${left}─ ${truncateToWidth(label, Math.max(0, columns - LABEL_CHROME_COST))} ` : left
-    const fill = Math.max(0, columns - stringWidth(lead) - 1)
-    return line({ text: `${lead}${'─'.repeat(fill)}${right}`, hex })
-  }
+  const rule = (labels: RuleLabels = {}): StyledLine => ruleLine(columns, labels)
 
   return {
     contentWidth,
     framed,
     ruled,
-    top: label => border(label, '╭', '╮'),
-    bottom: label => border(label, '╰', '╯'),
-    row: styled => {
+    top: rule,
+    bottom: rule,
+    row: (styled, caret = false) => {
       const width = spansWidth(styled.spans)
       const spans = width <= contentWidth
         ? styled.spans
         : truncateSpansToWidth(styled.spans, contentWidth)
+      // A row background has to cover the padding too, otherwise the band
+      // stops at the end of the text instead of reaching the right edge.
+      // Without a background there is nothing to pad for, and trailing blanks
+      // would only end up in a mouse selection.
       const padding = Math.max(0, contentWidth - Math.min(width, contentWidth))
-      // A row background has to cover the padding too, otherwise the fill
-      // stops at the end of the text instead of reaching the rail.
-      const fill: StyledSpan[] = styled.bg
-        ? [{ text: ' '.repeat(padding), bg: styled.bg }]
-        : [plain(' '.repeat(padding))]
+      const fill: StyledSpan[] = styled.bg ? [{ text: ' '.repeat(padding), bg: styled.bg }] : []
 
       if (!framed) {
-        // No rails to reach, so padding only matters when a background has to
-        // span the full width. Truncation still applies.
         if (styled.bg) return { spans: [...spans, ...fill] }
         return spans === styled.spans ? styled : { spans }
       }
-      const rail = { text: '│', hex: borderHex() }
-      // The gutter carries the row background so a selected row reads as one
-      // continuous band from rail to rail.
-      const blanks = ' '.repeat(gutterWidth)
-      const gutter = styled.bg ? { text: blanks, bg: styled.bg } : plain(blanks)
-      return line(rail, gutter, ...spans, ...fill, gutter, rail)
+      // A blank filler row has nothing to indent. Emitting the prefix anyway
+      // would leave two spaces on an otherwise empty row for a selection to pick up.
+      // Zero-width is not blank: an empty draft line still carries the cursor
+      // marker, and dropping it hides the cursor after Enter.
+      if (!caret && !styled.bg && styled.spans.every(span => span.text === '')) return line(plain(''))
+      // The prefix carries the row background so a selected row reads as one
+      // continuous band from the left edge.
+      const prefix: StyledSpan = caret
+        ? { text: `${PROMPT_CARET} `, hex: getTheme().brandHex, ...(styled.bg ? { bg: styled.bg } : {}) }
+        : styled.bg ? { text: ' '.repeat(PREFIX_WIDTH), bg: styled.bg } : plain(' '.repeat(PREFIX_WIDTH))
+      return line(prefix, ...spans, ...fill)
     },
   }
 }
 
-/** `── label ─────` — the degraded border, label in the same slot as framed. */
-function plainRule(columns: number, label: string | undefined): string {
-  if (!label) return '─'.repeat(columns)
-  const lead = `── ${label} `
-  return truncateToWidth(lead, columns) + '─'.repeat(Math.max(0, columns - stringWidth(lead)))
+/**
+ * `── lead ───────── (mode) ─` — a full-width rule. The lead label shares the
+ * rule's muted hue; the mode label keeps its own. When both cannot fit, the
+ * mode label wins: it is state, the lead is a hint.
+ */
+function ruleLine(columns: number, labels: RuleLabels): StyledLine {
+  const borderHex = getTheme().subtleHex
+  const dash = (n: number): StyledSpan => ({ text: '─'.repeat(Math.max(0, n)), hex: borderHex })
+
+  const trail = labels.mode ? ` (${labels.mode.text}) ` : ''
+  const trailWidth = stringWidth(trail)
+  // One dash on the right so the label never touches the edge.
+  const trailBudget = trailWidth ? trailWidth + 1 : 0
+
+  if (!labels.lead) {
+    if (!labels.mode) return line(dash(columns))
+    if (trailBudget > columns) return line({ text: truncateToWidth(trail.trimStart(), columns), hex: labels.mode.hex })
+    return line(dash(columns - trailBudget), { text: trail, hex: labels.mode.hex }, dash(1))
+  }
+
+  const lead = `── ${labels.lead} `
+  const leadRoom = columns - trailBudget
+  if (leadRoom < stringWidth('── … ')) {
+    // No room for the lead at all: draw as if it were absent.
+    return ruleLine(columns, { mode: labels.mode })
+  }
+  const leadText = truncateToWidth(lead, leadRoom)
+  const middle = columns - stringWidth(leadText) - trailBudget
+  if (!labels.mode) return line({ text: leadText, hex: borderHex }, dash(middle))
+  return line({ text: leadText, hex: borderHex }, dash(middle), { text: trail, hex: labels.mode.hex }, dash(1))
 }

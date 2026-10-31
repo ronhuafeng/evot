@@ -12,6 +12,10 @@ mod guard;
 mod host_tool;
 #[path = "tools/naming.rs"]
 mod naming;
+#[path = "tools/schema_order.rs"]
+mod schema_order;
+#[path = "tools/spawn_session.rs"]
+mod spawn_session;
 #[path = "tools/spill.rs"]
 mod spill;
 #[path = "tools/tool_sets.rs"]

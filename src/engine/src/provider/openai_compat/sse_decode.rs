@@ -3,10 +3,10 @@
 //! Parses OpenAI Chat Completions streaming chunks and translates them
 //! into internal [`StreamEvent`]s while accumulating the final [`Message`].
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use super::reasoning_details;
 use super::request::ToolCallBuffer;
 use super::types::*;
 use crate::context::now_ms;
@@ -14,8 +14,9 @@ use crate::provider::error::classify_stream_error;
 use crate::provider::error::ProviderError;
 use crate::provider::route::OpenAiCompat;
 use crate::provider::route::ThinkingFormat;
-use crate::provider::stream_http;
-use crate::provider::stream_http::SseEvent;
+use crate::provider::stream::http::SseEvent;
+use crate::provider::stream::sink::StreamSink;
+use crate::provider::stream::sse::SseReader;
 use crate::provider::traits::StreamConfig;
 use crate::provider::traits::StreamEvent;
 use crate::provider::traits::StreamOutcome;
@@ -24,18 +25,12 @@ use crate::types::*;
 /// Drive an OpenAI-compatible SSE stream from a raw HTTP response.
 pub(crate) async fn decode_sse_stream(
     response: reqwest::Response,
-    tx: mpsc::UnboundedSender<StreamEvent>,
+    tx: StreamSink,
     cancel: CancellationToken,
     config: &StreamConfig,
     compat: &OpenAiCompat,
 ) -> Result<StreamOutcome, ProviderError> {
-    let (sse_tx, mut sse_rx) = mpsc::unbounded_channel::<SseEvent>();
-
-    let sse_cancel = cancel.clone();
-    let sse_handle =
-        tokio::spawn(
-            async move { stream_http::drive_sse_response(response, sse_tx, sse_cancel).await },
-        );
+    let mut reader = SseReader::new(response);
 
     let mut content: Vec<Content> = Vec::new();
     let mut usage = Usage::default();
@@ -45,15 +40,16 @@ pub(crate) async fn decode_sse_stream(
     let mut response_model: Option<String> = None;
     let mut incomplete_reason: Option<String> = None;
 
-    let _ = tx.send(StreamEvent::Start);
+    let _ = tx.send(StreamEvent::Start).await;
 
     loop {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 return Err(ProviderError::Cancelled);
             }
-            event = sse_rx.recv() => {
-                match event {
+            event = reader.next(&cancel) => {
+                match event.map_err(ProviderError::Network)? {
                     None => break,
                     Some(sse) => {
                         if sse.data == "[DONE]" {
@@ -70,36 +66,38 @@ pub(crate) async fn decode_sse_stream(
                             &mut response_id,
                             &mut response_model,
                             &mut incomplete_reason,
-                        )?;
+                        ).await?;
                     }
                 }
             }
         }
     }
 
-    // Wait for SSE driver to finish.
-    // If the driver errored (e.g. network disconnect mid-stream), always
-    // propagate — partial content is incomplete and must not be used.
-    if let Ok(Err(e)) = sse_handle.await {
-        debug!(
-            "SSE driver error (content_len={}, tool_calls={}): {e}",
-            content.len(),
-            tool_call_buffers.len()
-        );
-        return Err(ProviderError::Network(e));
-    }
+    // `finish_reason: content_filter` means the output was stopped by the
+    // safety filter: surface it as an error so refusal recovery can compact,
+    // never as a normal completion or a tool call.
+    let refused = incomplete_reason
+        .as_deref()
+        .is_some_and(crate::provider::error::is_content_filter_reason);
 
     // Detect empty response: no content and no usage from provider
-    if content.is_empty() && tool_call_buffers.is_empty() && usage.input == 0 && usage.output == 0 {
+    if !refused
+        && content.is_empty()
+        && tool_call_buffers.is_empty()
+        && usage.input == 0
+        && usage.output == 0
+    {
         return Err(ProviderError::Api(
             "Empty response from provider (no content, no usage)".into(),
         ));
     }
 
     // Finalize tool calls
-    finalize_tool_calls(&tx, &mut content, &tool_call_buffers);
+    finalize_tool_calls(&tx, &mut content, &tool_call_buffers).await;
 
-    if !tool_call_buffers.is_empty()
+    if refused {
+        stop_reason = StopReason::Error;
+    } else if !tool_call_buffers.is_empty()
         || content
             .iter()
             .any(|c| matches!(c, Content::ToolCall { .. }))
@@ -118,20 +116,24 @@ pub(crate) async fn decode_sse_stream(
             .unwrap_or_else(|| "openai".into()),
         usage,
         timestamp: now_ms(),
-        error_message: incomplete_reason.map(|reason| format!("response incomplete: {reason}")),
+        error_message: incomplete_reason
+            .as_deref()
+            .map(crate::provider::error::incomplete_message),
         response_id,
     };
 
-    let _ = tx.send(StreamEvent::Done {
-        message: message.clone(),
-    });
+    let _ = tx
+        .send(StreamEvent::Done {
+            message: message.clone(),
+        })
+        .await;
     Ok(StreamOutcome::complete(message).served_by(response_model))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_sse_chunk(
+async fn process_sse_chunk(
     sse: &SseEvent,
-    tx: &mpsc::UnboundedSender<StreamEvent>,
+    tx: &StreamSink,
     content: &mut Vec<Content>,
     usage: &mut Usage,
     stop_reason: &mut StopReason,
@@ -254,24 +256,43 @@ fn process_sse_chunk(
             // interleave reasoning and visible text; appending later reasoning
             // to the first block makes the UI rewrite content above an answer
             // that is already streaming below it.
-            let idx = if matches!(content.last(), Some(Content::Thinking { .. })) {
-                content.len() - 1
-            } else {
-                content.push(Content::Thinking {
-                    thinking: String::new(),
-                    metadata: Some(ThinkingMetadata::OpenAiCompletions {
-                        field: reasoning_field,
-                    }),
-                });
-                content.len() - 1
-            };
+            let idx = ensure_thinking_block(content, reasoning_field);
             if let Some(Content::Thinking { thinking, .. }) = content.get_mut(idx) {
                 thinking.push_str(reasoning_text);
             }
-            let _ = tx.send(StreamEvent::ThinkingDelta {
-                content_index: idx,
-                delta: reasoning_text.to_string(),
-            });
+            let _ = tx
+                .send(StreamEvent::ThinkingDelta {
+                    content_index: idx,
+                    delta: reasoning_text.to_string(),
+                })
+                .await;
+        }
+
+        // `reasoning_details` are replay metadata rather than user-visible
+        // deltas: accumulate them on the current thinking block so the
+        // opaque state is sent back with the next request. A block is kept
+        // even when no reasoning text ever arrives (encrypted-only models).
+        if let Some(details) = &delta.reasoning_details {
+            let valid: Vec<&serde_json::Value> = details
+                .iter()
+                .filter(|detail| reasoning_details::is_reasoning_detail(detail))
+                .collect();
+            if !valid.is_empty() {
+                let idx = ensure_thinking_block(content, ReasoningField::ReasoningContent);
+                if let Some(Content::Thinking {
+                    metadata:
+                        Some(ThinkingMetadata::OpenAiCompletions {
+                            details: stored, ..
+                        }),
+                    ..
+                }) = content.get_mut(idx)
+                {
+                    let items = stored.get_or_insert_with(Vec::new);
+                    for detail in valid {
+                        reasoning_details::append_reasoning_detail(items, detail.clone());
+                    }
+                }
+            }
         }
 
         // Handle text content. As with reasoning, preserve type transitions so
@@ -288,16 +309,26 @@ fn process_sse_chunk(
             if let Some(Content::Text { text: t }) = content.get_mut(idx) {
                 t.push_str(text);
             }
-            let _ = tx.send(StreamEvent::TextDelta {
-                content_index: idx,
-                delta: text.clone(),
-            });
+            let _ = tx
+                .send(StreamEvent::TextDelta {
+                    content_index: idx,
+                    delta: text.clone(),
+                })
+                .await;
         }
 
         // Handle tool calls
         if let Some(tool_calls) = &delta.tool_calls {
             for tc in tool_calls {
-                let tc_index = tc.index as usize;
+                // A chunk that names an id already being buffered belongs to
+                // that call even when upstream moved it to a new `index`;
+                // otherwise one call would become two blocks sharing an id.
+                let known = tc
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .and_then(|id| tool_call_buffers.iter().position(|buf| buf.id == id));
+                let tc_index = known.unwrap_or(tc.index as usize);
                 while tool_call_buffers.len() <= tc_index {
                     tool_call_buffers.push(ToolCallBuffer::default());
                 }
@@ -335,11 +366,13 @@ fn process_sse_chunk(
 
                 if !buf.started && (!buf.id.is_empty() || !buf.name.is_empty()) {
                     buf.started = true;
-                    let _ = tx.send(StreamEvent::ToolCallStart {
-                        content_index,
-                        id: buf.id.clone(),
-                        name: buf.name.clone(),
-                    });
+                    let _ = tx
+                        .send(StreamEvent::ToolCallStart {
+                            content_index,
+                            id: buf.id.clone(),
+                            name: buf.name.clone(),
+                        })
+                        .await;
                 }
                 if let Some(delta) = tc
                     .function
@@ -347,12 +380,14 @@ fn process_sse_chunk(
                     .and_then(|function| function.arguments.as_ref())
                 {
                     if buf.started && !delta.is_empty() {
-                        let _ = tx.send(StreamEvent::ToolCallDelta {
-                            content_index,
-                            id: buf.id.clone(),
-                            name: buf.name.clone(),
-                            delta: delta.clone(),
-                        });
+                        let _ = tx
+                            .send(StreamEvent::ToolCallDelta {
+                                content_index,
+                                id: buf.id.clone(),
+                                name: buf.name.clone(),
+                                delta: delta.clone(),
+                            })
+                            .await;
                     }
                 }
             }
@@ -360,6 +395,10 @@ fn process_sse_chunk(
 
         // Handle finish reason
         if let Some(reason) = &choice.finish_reason {
+            if crate::provider::error::is_content_filter_reason(reason) {
+                // Finalized as a refusal after the stream ends.
+                *incomplete_reason = Some(reason.clone());
+            }
             *stop_reason = match reason.as_str() {
                 "stop" => StopReason::Stop,
                 "length" => StopReason::Length,
@@ -372,12 +411,30 @@ fn process_sse_chunk(
     Ok(())
 }
 
-fn finalize_tool_calls(
-    tx: &mpsc::UnboundedSender<StreamEvent>,
+/// Index of the trailing thinking block, creating one when the last block
+/// is not thinking so reasoning never rewrites content already streamed
+/// below it.
+fn ensure_thinking_block(content: &mut Vec<Content>, field: ReasoningField) -> usize {
+    if matches!(content.last(), Some(Content::Thinking { .. })) {
+        return content.len() - 1;
+    }
+    content.push(Content::Thinking {
+        thinking: String::new(),
+        metadata: Some(ThinkingMetadata::completions_text_only(field)),
+    });
+    content.len() - 1
+}
+
+async fn finalize_tool_calls(
+    tx: &StreamSink,
     content: &mut Vec<Content>,
     tool_call_buffers: &[ToolCallBuffer],
 ) {
-    for buf in tool_call_buffers.iter() {
+    // Sparse upstream indices leave untouched slots; they are not calls.
+    for buf in tool_call_buffers
+        .iter()
+        .filter(|buf| buf.content_index.is_some())
+    {
         let args = crate::provider::json_repair::try_repair_json(&buf.arguments)
             .unwrap_or(serde_json::Value::Object(Default::default()));
         let content_index = match buf.content_index {
@@ -399,11 +456,13 @@ fn finalize_tool_calls(
             // well-formed streams.
             content.push(tool_call);
         }
-        let _ = tx.send(StreamEvent::ToolCallEnd {
-            content_index,
-            id: buf.id.clone(),
-            name: buf.name.clone(),
-            arguments: args,
-        });
+        let _ = tx
+            .send(StreamEvent::ToolCallEnd {
+                content_index,
+                id: buf.id.clone(),
+                name: buf.name.clone(),
+                arguments: args,
+            })
+            .await;
     }
 }

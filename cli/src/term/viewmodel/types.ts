@@ -1,3 +1,4 @@
+import { getTheme } from '../../render/theme/index.js'
 import chalk from 'chalk'
 import { wrapHyperlink } from '../../render/hyperlink.js'
 
@@ -71,7 +72,8 @@ function spansToAnsi(spans: StyledSpan[]): string {
       result = chalk.hex(span.hex)(result)
     } else if (span.fg) {
       switch (span.fg) {
-        case 'red': result = chalk.red(result); break
+        // Failure ink is themed, not the terminal's ANSI red; see `errorHex`.
+        case 'red': result = chalk.hex(getTheme().errorHex)(result); break
         case 'green': result = chalk.green(result); break
         case 'yellow': result = chalk.yellow(result); break
         case 'cyan': result = chalk.cyan(result); break
@@ -81,7 +83,7 @@ function spansToAnsi(spans: StyledSpan[]): string {
       }
     }
     if (span.bold) result = chalk.bold(result)
-    if (span.dim) result = chalk.hex('#777777')(result)
+    if (span.dim) result = chalk.hex(getTheme().mutedHex)(result)
     if (span.italic) result = chalk.italic(result)
     if (span.inverse) result = `\x1b[7m${s}\x1b[27m`
     // Background wraps last so it survives the inner foreground resets emitted

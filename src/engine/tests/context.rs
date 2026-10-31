@@ -8,6 +8,8 @@ mod dsl;
 mod executor;
 #[path = "context/history.rs"]
 mod history;
+#[path = "context/image_format.rs"]
+mod image_format;
 #[path = "context/image_resize.rs"]
 mod image_resize;
 #[path = "context/limits.rs"]
@@ -16,10 +18,14 @@ mod limits;
 mod memory;
 #[path = "context/plan.rs"]
 mod plan;
+#[path = "context/prune.rs"]
+mod prune;
 #[path = "context/remote.rs"]
 mod remote;
 #[path = "context/summarizer.rs"]
 mod summarizer;
+#[path = "context/summarizer_progress.rs"]
+mod summarizer_progress;
 #[path = "context/summary.rs"]
 mod summary;
 #[path = "context/tokens.rs"]

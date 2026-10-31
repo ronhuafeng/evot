@@ -35,6 +35,25 @@ describe('term stream machine', () => {
     expect(complete.state.spinnerState.phase).toBe('preparing')
   })
 
+  test('summary activity changes the spinner without exposing summary deltas', () => {
+    let state = createStreamMachineState(createInitialState('model', '/tmp'), createSpinnerState())
+    for (const [activity, toolName] of [['waiting', 'compact_waiting'], ['generating', 'compact_generating']] as const) {
+      const update = reduceRunEvent(state, {
+        kind: 'context_compaction_phase', payload: { phase: 'local', activity },
+      }, { termRows: 24 })
+      state = update.state
+      expect(state.spinnerState.toolName).toBe(toolName)
+      expect(state.spinnerState.tokenCount).toBe(0)
+      expect(update.commitLines).toEqual([])
+      expect(update.rerenderStatus).toBe(true)
+    }
+    const complete = reduceRunEvent(state, {
+      kind: 'context_compaction_phase', payload: { phase: 'complete' },
+    }, { termRows: 24 })
+    expect(complete.state.spinnerState.phase).toBe('preparing')
+    expect(complete.state.spinnerState.toolName).toBeNull()
+  })
+
   test('long quota wait shows one model-specific error card and deduplicates re-probes', () => {
     const initial = createStreamMachineState(createInitialState('claude-fable-5', '/tmp'), createSpinnerState())
     const event = {
@@ -46,19 +65,22 @@ describe('term stream machine', () => {
     }
     const waiting = reduceRunEvent(initial, event, { termRows: 24 })
 
+    expect(waiting.noticeLines).toHaveLength(1)
+    expect(waiting.noticeLines[0]?.text).toContain('quota unavailable')
     expect(waiting.state.spinnerState.phase).toBe('quota_waiting')
     expect(waiting.state.spinnerState.waitRetryAt).toBeGreaterThan(Date.now())
     const text = waiting.commitLines.map(line => line.text).join('\n')
     expect(text).toContain('✦ llm  claude-fable-5')
     expect(text).toContain('quota unavailable · retry in 30m')
-    expect(text).toContain('HTTP 429: rate_limit_error: Rate limit exceeded. Please retry later.')
+    expect(text).toContain('Rate limited')
     expect(text).not.toContain('attempt 1/10')
-    expect(waiting.writeLines).toEqual([])
+    expect(waiting.writeLines.some(line => line.text.includes('HTTP 429'))).toBe(true)
     expect(waiting.state.appState.verboseEvents).toEqual([])
     expect(waiting.rerenderStatus).toBe(true)
 
     const repeated = reduceRunEvent(waiting.state, event, { termRows: 24 })
     expect(repeated.commitLines).toEqual([])
+    expect(repeated.noticeLines).toEqual([])
     expect(repeated.state.spinnerState.waitRetryAt).toBeGreaterThan(Date.now())
 
     const changed = reduceRunEvent(waiting.state, {
@@ -109,7 +131,7 @@ describe('term stream machine', () => {
       },
     }, { termRows: 24 })
     const text = waiting.commitLines.map(line => line.text).join('\n')
-    expect(text).toContain('HTTP 429')
+    expect(text).toContain('Rate limited')
     expect(text).not.toContain('\x1b')
     expect(text).not.toContain(']8;;')
   })
@@ -143,7 +165,7 @@ describe('term stream machine', () => {
     expect(waiting.state.spinnerState.phase).toBe('outage_waiting')
     expect(waiting.state.spinnerState.waitRetryAt).toBeGreaterThan(Date.now())
     expect(waiting.commitLines).toEqual([])
-    expect(waiting.writeLines).toEqual([])
+    expect(waiting.writeLines.some(line => line.text.includes('Upstream request failed'))).toBe(true)
     expect(waiting.state.appState.verboseEvents).toEqual([])
     expect(waiting.rerenderStatus).toBe(true)
   })
@@ -908,6 +930,7 @@ describe('term stream machine', () => {
       payload: {
         tool_call_id: 'call-edit',
         tool_name: 'edit',
+        text: '',
         details: { diff: '@@ -1 +1 @@\n-old\n+new', phase: 'preview' },
       },
     }, { termRows: 24 }).state
@@ -932,7 +955,7 @@ describe('term stream machine', () => {
       removed_lines: 1,
     })
     const card = completed ? buildToolCard(completed) : []
-    expect(card[1]!.text).toBe('  ✓ · 1 replacement · +1 −1 · 9ms')
+    expect(card[1]!.text).toBe('  ✓ · 1 replacement · +1 −1')
     expect(card.map(line => line.text).join('\n')).toContain('+new')
   })
 
@@ -1052,11 +1075,11 @@ describe('term stream machine', () => {
       durationMs: 12,
     })
     expect(completed[0]!.text).toBe('◫ read  src/a.rs')
-    expect(completed[1]!.text).toBe('  ✓ · 1 line · 12ms')
+    expect(completed[1]!.text).toBe('  ✓ · 1 line')
   })
 
-  test('queued write streams a bounded content preview while edit stays a stable summary', () => {
-    const content = Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join('\n')
+  test('queued write streams its full diff body while edit stays a stable summary', () => {
+    const content = Array.from({ length: 25 }, (_, index) => `line ${index + 1}`).join('\n')
     const writeCall = {
       id: 'call-write',
       name: 'write',
@@ -1065,16 +1088,16 @@ describe('term stream machine', () => {
       argsComplete: false,
     }
     const write = buildToolCard(writeCall)
-    const writeText = write.map(line => line.text).join('\n')
-    expect(writeText).toContain('✎ write  src/a.txt\n  ○ · generating 12 lines')
-    expect(writeText).toContain('  line 1')
-    expect(writeText).toContain('  line 10')
-    expect(writeText).not.toContain('  line 11')
-    expect(writeText).toContain('... (2 more lines, 12 total, ctrl+o to expand)')
+    const writeText = stripAnsi(write.map(line => line.text).join('\n'))
+    expect(writeText).toContain('✎ write  src/a.txt')
+    expect(write.at(-1)?.text).toBe('  ○ · generating 25 lines')
+    // The whole body is on screen from the first streamed line — never folded.
+    expect(writeText).toContain('+line 1')
+    expect(writeText).toContain('+line 25')
+    expect(writeText).not.toContain('ctrl+o to expand')
 
-    const expandedWriteText = buildToolCard(writeCall, true).map(line => line.text).join('\n')
-    expect(expandedWriteText).toContain('  line 12')
-    expect(expandedWriteText).toContain('(ctrl+o to collapse)')
+    const expandedWriteText = stripAnsi(buildToolCard(writeCall, true).map(line => line.text).join('\n'))
+    expect(expandedWriteText).toContain('+line 25')
 
     const edit = buildToolCard({
       id: 'call-edit',
@@ -1132,7 +1155,7 @@ describe('term stream machine', () => {
     expect(text).toContain('const two = 2')
   })
 
-  test('running write keeps the streamed content preview until the diff arrives', () => {
+  test('running write keeps its content layout when the diff arrives', () => {
     const base = {
       id: 'call-write-running',
       name: 'write',
@@ -1148,40 +1171,28 @@ describe('term stream machine', () => {
     expect(noDiff).toContain('● · running')
     expect(noDiff).toContain('const one = 1')
 
-    // Once the authoritative diff arrives it replaces the content preview.
+    // The authoritative diff must not reformat code already in scrollback.
     const withDiff = stripAnsi(buildToolCard({
       ...base,
       details: { diff: '@@ -0,0 +1,2 @@\n+const one = 1\n+const two = 2', preview: true },
     }).map(line => line.text).join('\n'))
-    expect(withDiff).toContain('+const one = 1')
-    expect(withDiff.split('const two = 2').length).toBe(2)
-  })
-
-  test('oversized write content renders a plain (unhighlighted) preview', () => {
-    const content = `const first = 1\n${'x'.repeat(250 * 1024)}`
-    const card = buildToolCard({
-      id: 'call-write-huge',
-      name: 'write',
-      args: { path: 'src/a.ts', content },
-      status: 'queued',
-      argsComplete: false,
-    })
-    const previewLines = card.filter(line => line.toolCodePreview)
-    expect(previewLines[0]?.text).toBe('  const first = 1')
-    expect(previewLines.every(line => !line.text.includes('\x1b['))).toBe(true)
+    expect(withDiff).toBe(noDiff)
   })
 
   test('write preview sanitizes terminal controls from model output', () => {
-    const text = buildToolCard({
+    const card = buildToolCard({
       id: 'call-write-controls',
       name: 'write',
       args: { path: 'src/a.txt', content: 'safe\x1b]133;A\x07visible' },
       status: 'queued',
       argsComplete: false,
-    }).map(line => line.text).join('\n')
+    })
+    const text = card.map(line => line.text).join('\n') + card.map(line => line.diffText).join('\n')
 
     expect(text).toContain('safe�]133;A�visible')
-    expect(text).not.toContain('\x1b')
+    // Only the renderer's own SGR styling may survive; the injected OSC and
+    // BEL never do.
+    expect(text).not.toContain('\x1b]133')
     expect(text).not.toContain('\x07')
   })
 
@@ -1198,7 +1209,7 @@ describe('term stream machine', () => {
     const completedText = completed.map(line => line.text).join('\n')
     expect(completedText).toContain('-old')
     expect(completedText).toContain('+new')
-    expect(completedText).toContain('✓ · 12ms')
+    expect(completedText).toMatch(/✓\n/)
     expect(completedText).not.toContain('applying changes')
   })
 
@@ -1218,7 +1229,7 @@ describe('term stream machine', () => {
     const text = update.commitLines.map(l => l.text).join('\n')
     expect(text).toContain('✦ llm  retry')
     expect(text).toContain('\u21bb \u00b7 retrying in 1 second \u00b7 attempt 1/3')
-    expect(text).toContain('network error')
+    expect(text).toContain('Connection interrupted')
   })
 
   test('llm stats route to writeLines (screen.log only), not commitLines', () => {
@@ -1255,12 +1266,13 @@ describe('term stream machine', () => {
     // Pre-call estimate lands first via llm_call_started.
     state = reduceRunEvent(state, {
       kind: 'llm_call_started',
-      payload: { model: 'test', messages: [], estimated_context_tokens: 5000, context_window: 160000 },
+      payload: { model: 'test', messages: [], estimated_context_tokens: 95000, context_window: 160000 },
     }, { termRows: 24 }).state
-    expect(state.appState.currentRunStats.contextTokens).toBe(5000)
+    expect(state.appState.currentRunStats.contextTokens).toBe(95000)
 
     // On completion the footer must switch to the provider's real usage,
     // matching the compaction trigger: input + cache_read + cache_write + output.
+    // (A count wildly above the estimate is rejected instead; see typed-reducer.)
     const completed = reduceRunEvent(state, {
       kind: 'llm_call_completed',
       payload: {
@@ -1299,7 +1311,7 @@ describe('term stream machine', () => {
     }, { termRows: 24 })
     const text = update.commitLines.map(l => l.text).join('\n')
     expect(text).toContain('✦ llm  retry')
-    expect(text).toContain('rate limited')
+    expect(text).toContain('Rate limited')
   })
 
   test('a retry storm commits one card and advances the spinner in place', () => {
@@ -1319,7 +1331,7 @@ describe('term stream machine', () => {
     state = first.state
     const firstText = first.commitLines.map(l => l.text).join('\n')
     expect(firstText).toContain('✦ llm  retry')
-    expect(firstText).toContain(err)
+    expect(firstText).toContain('Model provider overloaded')
     expect(state.spinnerState.phase).toBe('retrying')
     expect(state.spinnerState.retryAttempt).toBe(1)
     expect(state.spinnerState.retryMaxAttempts).toBe(10)
@@ -1363,7 +1375,7 @@ describe('term stream machine', () => {
     }, { termRows: 24 })
 
     const text = [...failed.commitLines, ...retry.commitLines].map(l => l.text).join('\n')
-    expect(text.split(err).length - 1).toBe(1)
+    expect(text.split('Model provider overloaded').length - 1).toBe(1)
     // Both cards still appear; only the repeated sentence is gone.
     expect(text).toContain('✦ llm  claude-opus-5')
     expect(text).toContain('✦ llm  retry')
@@ -1429,7 +1441,75 @@ describe('term stream machine', () => {
       kind: 'llm_call_completed',
       payload: { model: 'claude-opus-5', turn: 28, error: 'API error: HTTP 500', metrics: { duration_ms: 120 } },
     }, { termRows: 24 })
-    expect(failed.commitLines.map(l => l.text).join('\n')).toContain('API error: HTTP 500')
+    // A bare 500 is the gateway's own failure, and the card says so.
+    expect(failed.commitLines.map(l => l.text).join('\n')).toContain('Gateway error, not the model provider')
+  })
+
+  test('overflow card preserves the diagnosis before compaction starts', () => {
+    const err = 'Context overflow: HTTP 400: invalid_request_error: prompt is too long'
+    const state = createStreamMachineState(createInitialState('test', '/tmp'), createSpinnerState())
+    const failed = reduceRunEvent(state, {
+      kind: 'llm_call_completed',
+      payload: { model: 'test', turn: 1, error: err, metrics: { duration_ms: 24900 } },
+    }, { termRows: 24 })
+    const text = failed.commitLines.map(l => l.text).join('\n')
+    expect(text).toContain('Context limit exceeded')
+    expect(text).not.toContain('Invalid request')
+    const terminal = reduceRunEvent(failed.state, { kind: 'error', payload: { message: err } }, { termRows: 24 })
+    expect(terminal.commitLines.map(l => l.text).join('\n')).not.toContain('Context limit exceeded')
+    expect(terminal.writeLines.some(line => line.text.includes(err))).toBe(true)
+  })
+
+  test('a privacy block is one card, and the terminal error does not repeat it', () => {
+    const err = 'Invalid request: privacy blocked this request: it contains PRIVATE_KEY. Nothing was sent; run /privacy to review the rule.'
+    const state = createStreamMachineState(createInitialState('test', '/tmp'), createSpinnerState())
+    const failed = reduceRunEvent(state, {
+      kind: 'llm_call_completed',
+      payload: { model: 'test', turn: 1, error: err, metrics: { duration_ms: 2 } },
+    }, { termRows: 24 })
+    const text = failed.commitLines.map(l => l.text).join('\n')
+    expect(text).toContain('⊘ privacy  blocked request')
+    expect(text).toContain('contains PRIVATE_KEY · nothing was sent')
+    expect(text).not.toContain('Invalid request')
+    // The record behind the block enriches the card when the host has it.
+    const detailed = reduceRunEvent(state, {
+      kind: 'llm_call_completed',
+      payload: { model: 'test', turn: 1, error: err, metrics: { duration_ms: 2 } },
+    }, { termRows: 24, privacyDetail: () => ({ model: 'm', provider: 'p', origins: [{ at: 'Bash result', label: 'cat key', n: 1 }] }) })
+    const rich = detailed.commitLines.map(l => l.text).join('\n')
+    expect(rich).toContain('blocked request → m · p')
+    expect(rich).toContain('in: Bash result "cat key"')
+    const terminal = reduceRunEvent(failed.state, { kind: 'error', payload: { message: err } }, { termRows: 24 })
+    expect(terminal.commitLines.map(l => l.text).join('\n')).not.toContain('privacy')
+    expect(terminal.writeLines.some(line => line.text.includes(err))).toBe(true)
+
+    // Raised before any LLM card (no call completed): the error alone shows it.
+    const alone = reduceRunEvent(createStreamMachineState(createInitialState('test', '/tmp'), createSpinnerState()),
+      { kind: 'error', payload: { message: err } }, { termRows: 24 })
+    expect(alone.commitLines[0]?.text).toBe('⊘ privacy  blocked request')
+  })
+
+  test('an unconfigured model reports the configuration gap instead of an outage', () => {
+    // Production: evot asked for a model with no channel behind it. llmproxy
+    // answered 503 "No permitted model backend is configured.", which used to
+    // render as "Service busy" — vocabulary for a transient outage that also
+    // invited ten pointless retries. The card must name the real gap.
+    const err = 'Model not found: HTTP 404: model_not_found: Model not found.'
+    const state = createStreamMachineState(createInitialState('k3', '/tmp'), createSpinnerState())
+    const failed = reduceRunEvent(state, {
+      kind: 'llm_call_completed',
+      payload: { model: 'k3', turn: 1, error: err, metrics: { duration_ms: 4000 } },
+    }, { termRows: 24 })
+    const text = failed.commitLines.map(l => l.text).join('\n')
+    expect(text).toContain('Model not found')
+    expect(text).not.toContain('Service busy')
+
+    // The run's terminal error event carries the same message as the card, so
+    // it is deduplicated from scrollback and keeps the raw detail in screen.log.
+    const terminal = reduceRunEvent(failed.state, { kind: 'error', payload: { message: err } }, { termRows: 24 })
+    const visible = terminal.commitLines.map(l => l.text).join('\n')
+    expect(visible).not.toContain('Model not found')
+    expect(terminal.writeLines.some(line => line.text.includes(err))).toBe(true)
   })
 
   test('an exhausted storm still reports the failure that ended the run', () => {
@@ -1456,8 +1536,9 @@ describe('term stream machine', () => {
       payload: { message: err },
     }, { termRows: 24 })
     const visible = terminal.commitLines.map(l => l.text).join('\n')
-    expect(visible).toContain(err)
-    expect(visible.split(err).length - 1).toBe(1)
+    expect(visible).toContain('Model provider overloaded')
+    expect(visible.split('Model provider overloaded').length - 1).toBe(1)
+    expect(terminal.writeLines.some(line => line.text.includes(err))).toBe(true)
   })
 
   test('llm error card and following error event do not duplicate the message', () => {
@@ -1472,7 +1553,7 @@ describe('term stream machine', () => {
     const tui = [...u1.commitLines, ...u2.commitLines].map(l => l.text).join('\n')
     // Message shows exactly once in the TUI (the llm card), and the redundant
     // standalone error line is routed to screen.log instead.
-    expect((tui.match(/HTTP 520: error code: 520/g) ?? []).length).toBe(1)
+    expect(tui.split('Model provider unavailable').length - 1).toBe(1)
     expect(tui).toContain('✦ llm  claude-opus-4-6')
     expect(u2.writeLines.some(l => l.text.includes('HTTP 520'))).toBe(true)
   })
@@ -1519,7 +1600,8 @@ describe('term stream machine', () => {
       // BYOK keys are user-managed: evot has nothing to re-mint, so these stay
       // visible errors instead of entering the cloud recovery path.
       expect(update.sessionRevoked).toBe(false)
-      expect(terminal).toContain(raw.includes('session_revoked') ? 'custom gateway session ended' : 'invalid API key')
+      expect(terminal).toContain('Authentication failed')
+      expect(terminal).not.toContain('custom gateway session ended')
     }
   })
 
@@ -1839,5 +1921,35 @@ describe('term stream machine', () => {
     expect(assistantToolCalls(state.appState.currentAssistantContent).map(call => call.id)).toEqual(['call-read', 'call-edit'])
     expect(findAssistantToolCall(state.appState.currentAssistantContent, 'call-read')?.status).toBe('running')
     expect(findAssistantToolCall(state.appState.currentAssistantContent, 'call-edit')?.status).toBe('done')
+  })
+})
+
+describe('judge review of a tool-call window', () => {
+  const ctx = { termRows: 24 }
+  const call = (id: string, relevance: number, name = 'read') => ({ tool_call_id: id, tool_name: name, arguments: `{"path":"${id}.md"}`, relevance })
+  const initial = () => createStreamMachineState({ ...createInitialState('model', '/tmp'), judge: 'jev-latest' }, createSpinnerState())
+
+  test('a clean window is silent on screen and recorded in the log', () => {
+    const update = reduceRunEvent(initial(), {
+      kind: 'tool_calls_reviewed',
+      payload: { calls: [call('a', 0.9), call('b', 0.8), call('c', 0.35), call('d', 0.95), call('e', 0.7), call('f', 0.88)] },
+    }, ctx)
+    expect(update.commitLines).toHaveLength(0)
+    expect(update.noticeLines).toHaveLength(0)
+    const log = update.writeLines.map(line => stripAnsi(line.text)).join('\n')
+    expect(log).toContain('[JEV] review · 6 calls · 1 off-task')
+    expect(log).toContain('35%  read')
+  })
+
+  test('an off-task window is one notice line naming the calls', () => {
+    const update = reduceRunEvent(initial(), {
+      kind: 'tool_calls_reviewed',
+      payload: { calls: [call('a', 0.9), call('notes', 0.14), call('c', 0.8), call('ls', 0.22, 'bash'), call('e', 0.7), call('f', 0.88)] },
+    }, ctx)
+    const text = update.commitLines.map(line => stripAnsi(line.text)).join('\n')
+    expect(text).toContain('⚑ jev: 2 of the last 6 tool calls look off-task')
+    expect(text).toContain('read path=notes.md 14%')
+    expect(text).toContain('bash path=ls.md 22%')
+    expect(update.noticeLines).toHaveLength(1)
   })
 })

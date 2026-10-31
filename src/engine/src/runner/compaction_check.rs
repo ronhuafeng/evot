@@ -2,10 +2,13 @@
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::config::AgentLoopConfig;
+use super::event_sink::EventSink;
+use crate::context::compaction::Checkpoint;
+use crate::context::tokens::total_tokens;
+use crate::context::window::usage_is_plausible;
 use crate::context::AfterResponseAction;
 use crate::context::CompactionController;
 use crate::context::CompactionResponse;
@@ -25,6 +28,17 @@ const OVERFLOW_EXHAUSTED_MESSAGE: &str =
 const OVERFLOW_RECOVERY_FAILED_MESSAGE: &str =
     "Context overflow recovery failed: could not compact the context. \
      Try reducing context or switching to a larger-context model.";
+
+/// User-visible message emitted when the provider refuses again after the
+/// context was already compacted and retried once.
+const REFUSAL_EXHAUSTED_MESSAGE: &str =
+    "The provider refused the request again after compacting the context and retrying. \
+     Rephrase the request or remove the content that triggers the safety filter.";
+
+/// User-visible message emitted when refusal recovery could not compact.
+const REFUSAL_RECOVERY_FAILED_MESSAGE: &str =
+    "Refusal recovery failed: could not compact the context. \
+     Rephrase the request or remove the content that triggers the safety filter.";
 
 pub(super) struct CompactionRequestShape<'a> {
     pub(super) system_prompt: &'a str,
@@ -52,6 +66,11 @@ impl CompactionRequestShape<'_> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CompactionCheckPhase {
     BeforePrompt,
+    /// Between tool turns of one run, once the local estimate says the
+    /// active context has reached the summary threshold. Without this a
+    /// tool-heavy run only compacts when the provider rejects the request,
+    /// which a large-window model or a lenient gateway may never do.
+    ToolTurn,
     RunEnd,
 }
 
@@ -65,15 +84,16 @@ pub(super) struct CompactionCheckInput<'a> {
 /// Apply pi's single response-driven compaction policy.
 ///
 /// Run-end checks ignore aborted responses. Before a new explicit prompt, the
-/// same response is checked again with aborted usage included. Internal tool,
-/// steering, retry, and follow-up turns never invoke this function.
+/// same response is checked again with aborted usage included. Tool turns
+/// invoke it only through [`tool_turn_needs_compaction_check`]; steering,
+/// retry, and follow-up turns never do.
 pub(super) async fn check_compaction(
     controller: &mut Option<CompactionController>,
     tracker: &mut ContextTracker,
     messages: &mut Vec<AgentMessage>,
     input: CompactionCheckInput<'_>,
     cancel: CancellationToken,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
 ) -> bool {
     let CompactionCheckInput {
         assistant_message,
@@ -94,42 +114,101 @@ pub(super) async fn check_compaction(
         Some(ctrl) => ctrl,
         None => return false,
     };
-    let usage = match usage_snapshot_from_message(assistant_message) {
+    let mut usage = match usage_snapshot_from_message(assistant_message) {
         Some(usage) => usage,
         None => return false,
     };
+    // The pre-prompt check runs before the turn loop records this request's
+    // overhead; refresh it so the plausibility bound sees the same request.
+    tracker.record_request_overhead(request_shape.system_prompt, request_shape.tools);
+
+    // A provider count that cannot describe the request it answered (e.g. a
+    // gateway summing a whole run's prompt tokens into the final response) must
+    // not be read as a silent overflow or a threshold hit. Drop the numbers and
+    // let the estimate fallback below decide from the last trustworthy anchor.
+    // Explicit overflow errors keep their dedicated compact-and-retry path.
+    let local_estimate =
+        total_tokens(messages).saturating_add(tracker.system_tool_overhead_tokens());
+    let reported = crate::context::compaction::trigger::context_tokens(&usage);
+    let usage_rejected =
+        usage.stop_reason != StopReason::Error && !usage_is_plausible(reported, local_estimate);
+    if usage_rejected {
+        tracing::warn!(
+            reported_tokens = reported,
+            local_estimate,
+            model = %usage.model.model,
+            provider = %usage.model.provider,
+            "provider usage cannot describe this request; ignoring it for compaction"
+        );
+        usage.input = 0;
+        usage.cache_read = 0;
+        usage.cache_write = 0;
+        usage.output = 0;
+        usage.total_tokens = 0;
+    }
     let current_model = ModelId {
         provider: target_provider(config)
             .unwrap_or(&usage.model.provider)
             .to_string(),
         model: config.model.clone(),
     };
+    // A dedicated summary model (e.g. the model that produced this history
+    // before a switch) is tried first; when it is unavailable the active model
+    // takes over unless an explicit fallback was configured.
+    let checkpoint = match phase {
+        CompactionCheckPhase::RunEnd => Checkpoint::RunEnd,
+        CompactionCheckPhase::BeforePrompt | CompactionCheckPhase::ToolTurn => Checkpoint::MidRun,
+    };
     let remote_ctx = request_shape.summarizer_context(config);
     let llm_ctx = config.compaction_context.as_ref().unwrap_or(&remote_ctx);
-    let contexts = SummaryContexts::separate(
-        Some(&remote_ctx),
-        Some(llm_ctx),
-        config.compaction_fallback_context.as_ref(),
-    );
+    let fallback_ctx = config
+        .compaction_fallback_context
+        .as_ref()
+        .or(config.compaction_context.as_ref().map(|_| &remote_ctx));
+    let contexts = SummaryContexts::separate(Some(&remote_ctx), Some(llm_ctx), fallback_ctx);
     let response = ctrl
-        .after_response_with_contexts(messages, &usage, &current_model, contexts, cancel.clone())
+        .after_response_with_contexts(
+            messages,
+            &usage,
+            &current_model,
+            contexts,
+            checkpoint,
+            cancel.clone(),
+        )
         .await;
 
-    // Error/all-zero responses do not provide a direct context size. Estimate
-    // only from the selected model's latest real usage plus trailing messages;
-    // without that model-specific anchor there is no compaction decision. This
-    // prevents a model switch from compacting against the old model's boundary.
+    // Error/all-zero responses do not provide a direct context size. Mirror
+    // pi's `estimateContextTokens`: anchor on the selected model's latest real
+    // usage plus trailing messages when one exists; otherwise the full local
+    // estimate of the current history is the only size we have and still
+    // guards the window. Some gateways never report usage on tool_use
+    // responses (kimi-k3 via evot-pro), so a long tool-heavy run would
+    // otherwise grow past the model's limit with no compaction at all. The
+    // byte heuristic overcounts, which errs toward compacting early — the
+    // safe side of the window. A foreign model's usage is never the anchor,
+    // so a model switch cannot compact against the old model's boundary.
     // Any response the trigger already classified (overflow, exhausted, failed
     // recovery) must not re-enter through the estimate fallback.
+    //
+    // A tool turn always takes the anchor path when usage alone did not act:
+    // the response's usage predates the tool results just appended, and the
+    // anchor adds those trailing messages, so the summary happens before the
+    // oversized request is sent instead of one turn later.
     let anchor_estimate = if response.action == AfterResponseAction::Continue
         && response.stats.is_none()
         && response.reason.is_none()
-        && needs_usage_anchor_estimate(assistant_message)
+        && (usage_rejected
+            || phase == CompactionCheckPhase::ToolTurn
+            || needs_usage_anchor_estimate(assistant_message))
     {
-        tracker.estimate_context_tokens_from_anchor_for_model(
-            messages,
-            Some(&current_model.provider),
-            Some(&current_model.model),
+        Some(
+            tracker
+                .estimate_context_tokens_from_anchor_for_model(
+                    messages,
+                    Some(&current_model.provider),
+                    Some(&current_model.model),
+                )
+                .unwrap_or(local_estimate),
         )
     } else {
         None
@@ -140,6 +219,7 @@ pub(super) async fn check_compaction(
             estimated_tokens,
             &current_model,
             contexts,
+            checkpoint,
             cancel,
         )
         .await
@@ -148,7 +228,10 @@ pub(super) async fn check_compaction(
     };
 
     let should_retry = response.action == AfterResponseAction::Retry;
-    emit_compaction_events(ctrl, tracker, messages, &response, tx);
+    if let Some(outcome) = response.pruned.clone() {
+        super::driver::emit_context_pruned(ctrl, messages, outcome, tx).await;
+    }
+    emit_compaction_events(ctrl, tracker, messages, &response, tx).await;
     should_retry
 }
 
@@ -156,12 +239,12 @@ pub(super) async fn check_compaction(
 ///
 /// Shared by post-response and pre-prompt compaction so both surface the same
 /// observability events and persist via the app layer's compact orchestrator.
-fn emit_compaction_events(
+async fn emit_compaction_events(
     ctrl: &CompactionController,
     tracker: &mut ContextTracker,
     messages: &[AgentMessage],
     response: &CompactionResponse,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
 ) {
     if let Some(ref stats) = response.stats {
         let reason = response
@@ -176,6 +259,7 @@ fn emit_compaction_events(
             trigger_threshold: ctrl.config().trigger_threshold(),
             will_retry,
         })
+        .await
         .ok();
         tx.send(AgentEvent::ContextCompactionEnd {
             reason,
@@ -186,29 +270,89 @@ fn emit_compaction_events(
             context_window: ctrl.config().displayed_window(),
             will_retry,
         })
+        .await
         .ok();
         tracker.record_compaction_done(ctrl.state().timestamp);
     }
 
+    let refusal = response.reason == Some(crate::context::CompactReason::Refusal);
     if response.overflow_exhausted {
+        let message = if refusal {
+            REFUSAL_EXHAUSTED_MESSAGE
+        } else {
+            OVERFLOW_EXHAUSTED_MESSAGE
+        };
         tx.send(AgentEvent::Error {
             error: AgentErrorInfo {
                 kind: AgentErrorKind::Runtime,
-                message: OVERFLOW_EXHAUSTED_MESSAGE.to_string(),
+                message: message.to_string(),
             },
         })
+        .await
         .ok();
     }
 
     if response.overflow_recovery_failed {
+        let message = if refusal {
+            REFUSAL_RECOVERY_FAILED_MESSAGE
+        } else {
+            OVERFLOW_RECOVERY_FAILED_MESSAGE
+        };
         tx.send(AgentEvent::Error {
             error: AgentErrorInfo {
                 kind: AgentErrorKind::Runtime,
-                message: OVERFLOW_RECOVERY_FAILED_MESSAGE.to_string(),
+                message: message.to_string(),
             },
         })
+        .await
         .ok();
     }
+}
+
+/// Whether a tool turn should run the compaction check before the next
+/// provider call: the active context plus request overhead, by the local
+/// byte heuristic, has reached the mid-run summary threshold. The heuristic
+/// overcounts, so this fires early and the usage-driven check decides; below
+/// the line the turn continues without touching the controller.
+pub(super) fn tool_turn_needs_compaction_check(
+    controller: &Option<CompactionController>,
+    tracker: &ContextTracker,
+    messages: &[AgentMessage],
+) -> bool {
+    let Some(ctrl) = controller.as_ref() else {
+        return false;
+    };
+    let config = ctrl.config();
+    if config.context_window == 0 {
+        return false;
+    }
+    let local_estimate =
+        total_tokens(messages).saturating_add(tracker.system_tool_overhead_tokens());
+    local_estimate >= config.trigger_threshold()
+}
+
+/// A tool turn below the threshold still shows the controller its usage: a
+/// compaction suppresses further threshold compactions until usage is seen
+/// back under the line, and without this the next time the context grows to
+/// the threshold the check would be refused as "did not lower usage".
+pub(super) fn note_tool_turn_usage(
+    controller: &mut Option<CompactionController>,
+    config: &AgentLoopConfig,
+    assistant_message: &Message,
+) {
+    let Some(ctrl) = controller.as_mut() else {
+        return;
+    };
+    let Some(usage) = usage_snapshot_from_message(assistant_message) else {
+        return;
+    };
+    let current_model = ModelId {
+        provider: target_provider(config)
+            .unwrap_or(&usage.model.provider)
+            .to_string(),
+        model: config.model.clone(),
+    };
+    ctrl.clear_suppression_if_recovered(&usage, &current_model);
 }
 
 fn target_provider(config: &AgentLoopConfig) -> Option<&str> {
