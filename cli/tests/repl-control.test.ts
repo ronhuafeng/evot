@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { decideReplControl } from '../src/term/app/repl-control.js'
-import { createEditorState, insertText } from '../src/term/input/editor.js'
+import { acceptCompletion, createEditorState, getEditorText, insertText, showCompletions } from '../src/term/input/editor.js'
 import { createSelectorState } from '../src/term/selector.js'
 
 const editor = createEditorState()
@@ -24,16 +24,27 @@ const kinds = (input: Parameters<typeof decideReplControl>[0]) => decideReplCont
 const base = { overlay: none, isLoading: false, hasStream: false, editor, exitHint: false, logMode: false, hasQueuedPrompt: false }
 
 describe('repl control', () => {
-  test('ctrl-c interrupts loading stream', () => {
-    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, isLoading: true, hasStream: true })).toEqual(['interrupt'])
+  test('ctrl-c never interrupts a loading stream; esc owns interrupt', () => {
+    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, isLoading: true, hasStream: true })).toEqual(['show-exit-hint'])
+    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, isLoading: true, hasStream: true, editor: textEditor })).toEqual(['clear-editor'])
   })
 
   test('escape cancels manual compaction without requiring a query stream', () => {
     expect(kinds({ ...base, event: { type: 'escape' }, isLoading: true, isCompacting: true })).toEqual(['interrupt'])
   })
 
-  test('ctrl-c cancels manual compaction before exit handling', () => {
-    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, isLoading: true, isCompacting: true })).toEqual(['interrupt'])
+  test('compaction escape respects modal and completion priority', () => {
+    const compacting = { ...base, event: { type: 'escape' as const }, isLoading: true, isCompacting: true }
+    // A visible layer must consume Esc before confirmation. Otherwise the
+    // host clears confirmation for that layer on every keypress, indefinitely.
+    expect(kinds({ ...compacting, overlay: help })).toEqual(['close-overlay'])
+    expect(kinds({ ...compacting, overlay: selectorWithQuery })).toEqual(['clear-selector-query'])
+    expect(kinds({ ...compacting, editor: completionEditor })).toEqual(['close-completion'])
+    expect(kinds(compacting)).toEqual(['interrupt'])
+  })
+
+  test('ctrl-c during manual compaction follows the normal exit path', () => {
+    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, isLoading: true, isCompacting: true })).toEqual(['show-exit-hint'])
   })
 
   test('ctrl-c shows exit hint on empty editor', () => {
@@ -56,12 +67,10 @@ describe('repl control', () => {
     expect(kinds({ ...base, event: { type: 'escape' }, overlay: askUser, hasStream: true })).toEqual(['cancel-ask'])
   })
 
-  test('ctrl-c during an ask overlay routes to interrupt, not cancel-ask', () => {
-    // Regression guard: an ask/plan-review overlay is only shown while a run is
-    // loading, so Ctrl+C hits the loading-stream interrupt branch before the
-    // overlay checks. Both `interrupt` and `cancel-ask` must resolve the
-    // pending ask promise or the suspended host-tool dispatch hangs the loop.
-    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, overlay: askUser, isLoading: true, hasStream: true })).toEqual(['interrupt'])
+  test('ctrl-c during an ask overlay cancels the ask like escape does', () => {
+    // Regression guard: the pending ask promise must be resolved by whichever
+    // key dismisses it, or the suspended host-tool dispatch hangs the loop.
+    expect(kinds({ ...base, event: { type: 'ctrl', key: 'c' }, overlay: askUser, isLoading: true, hasStream: true })).toEqual(['cancel-ask'])
   })
 
   test('escape clears selector query before closing overlay', () => {
@@ -141,15 +150,15 @@ describe('repl control', () => {
     })).toEqual(['restore-queued'])
   })
 
-  test('ctrl-c still interrupts immediately while work is backgroundable', () => {
-    // Both stop gestures stay unambiguous; only ctrl+b is the soft one.
+  test('ctrl-c does not become a stop gesture while work is backgroundable', () => {
+    // Esc stops, ctrl+b detaches, ctrl+c stays out of the run entirely.
     expect(kinds({
       ...base,
       event: { type: 'ctrl', key: 'c' },
       isLoading: true,
       hasStream: true,
       canReclaimTurn: true,
-    })).toEqual(['interrupt'])
+    })).toEqual(['show-exit-hint'])
   })
 
   test('compaction escape interrupts regardless of waited-on work', () => {
@@ -187,6 +196,43 @@ describe('repl control', () => {
 
   test('ask overlay delegates key', () => {
     expect(kinds({ ...base, event: { type: 'char', char: 'y' }, overlay: askUser })).toEqual(['ask-key'])
+  })
+
+  test('completion confirmation and navigation outrank submission both idle and loading', () => {
+    for (const isLoading of [false, true]) {
+      for (const type of ['enter', 'tab', 'up', 'down'] as const) {
+        expect(kinds({ ...base, isLoading, hasStream: isLoading, editor: completionEditor, event: { type } }))
+          .toEqual(['normal-key'])
+      }
+    }
+  })
+
+  test('enter selects a relative path during a run; only the next enter submits', () => {
+    const draft = 'favicon icon要是 ../evot'
+    const pathEditor = showCompletions(insertText(createEditorState(), draft), [
+      { label: '../evot-site/', value: '../evot-site/' },
+      { label: '../evot/', value: '../evot/' },
+    ], draft.indexOf('../'))
+    const input = { ...base, isLoading: true, hasStream: true, event: { type: 'enter' as const }, editor: pathEditor }
+    expect(kinds(input)).toEqual(['normal-key'])
+    const accepted = acceptCompletion(pathEditor)
+    expect(getEditorText(accepted)).toBe('favicon icon要是 ../evot-site/')
+    expect(accepted.completion).toBeNull()
+    expect(kinds({ ...input, editor: accepted })).toEqual(['loading-enter'])
+  })
+
+  test('empty completion notice does not swallow enter during a run', () => {
+    const editor = showCompletions(textEditor, [], 0, 5, 'No matches')
+    expect(kinds({ ...base, editor, isLoading: true, event: { type: 'enter' } })).toEqual(['loading-enter'])
+  })
+
+  test('overlays retain priority over an editor completion', () => {
+    for (const isLoading of [false, true]) {
+      for (const [overlay, action] of [[help, 'close-overlay'], [selector, 'selector-key'], [askUser, 'ask-key']] as const) {
+        expect(kinds({ ...base, overlay, isLoading, editor: completionEditor, event: { type: 'enter' } }))
+          .toEqual([action])
+      }
+    }
   })
 
   test('loading enter/char/paste have loading actions', () => {

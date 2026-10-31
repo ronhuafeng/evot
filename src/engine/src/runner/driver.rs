@@ -9,13 +9,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::assistant_sanitize::sanitize_assistant_message;
 use super::compaction_check::check_compaction;
 use super::compaction_check::CompactionCheckInput;
 use super::compaction_check::CompactionCheckPhase;
 use super::compaction_check::CompactionRequestShape;
 use super::config::AgentLoopConfig;
 use super::doom_loop::DoomLoopDetector;
+use super::event_sink::EventSink;
 use super::llm_call::stream_assistant_response;
 use super::llm_call::AssistantStreamInput;
 use super::thinking_only_guard::ThinkingOnlyGuard;
@@ -42,7 +42,7 @@ pub async fn agent_loop(
     tx: mpsc::UnboundedSender<AgentEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Vec<AgentMessage> {
-    agent_loop_with_state(prompts, context, config, tx, cancel)
+    agent_loop_with_state(prompts, context, config, tx.into(), cancel)
         .await
         .messages
 }
@@ -51,12 +51,12 @@ pub(crate) async fn agent_loop_with_state(
     prompts: Vec<AgentMessage>,
     context: &mut AgentContext,
     config: &AgentLoopConfig,
-    tx: mpsc::UnboundedSender<AgentEvent>,
+    tx: EventSink,
     cancel: tokio_util::sync::CancellationToken,
 ) -> AgentLoopOutcome {
-    tx.send(AgentEvent::AgentStart).ok();
+    tx.send(AgentEvent::AgentStart).await.ok();
     let mut new_messages = prompts.clone();
-    tx.send(AgentEvent::TurnStart).ok();
+    tx.send(AgentEvent::TurnStart).await.ok();
 
     let compaction_state =
         run_loop(context, &mut new_messages, prompts, config, &tx, &cancel).await;
@@ -64,6 +64,7 @@ pub(crate) async fn agent_loop_with_state(
     tx.send(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
     })
+    .await
     .ok();
     AgentLoopOutcome {
         messages: new_messages,
@@ -78,7 +79,7 @@ pub async fn agent_loop_continue(
     tx: mpsc::UnboundedSender<AgentEvent>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Vec<AgentMessage> {
-    agent_loop_continue_with_state(context, config, tx, cancel)
+    agent_loop_continue_with_state(context, config, tx.into(), cancel)
         .await
         .messages
 }
@@ -86,10 +87,10 @@ pub async fn agent_loop_continue(
 pub(crate) async fn agent_loop_continue_with_state(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
-    tx: mpsc::UnboundedSender<AgentEvent>,
+    tx: EventSink,
     cancel: tokio_util::sync::CancellationToken,
 ) -> AgentLoopOutcome {
-    tx.send(AgentEvent::AgentStart).ok();
+    tx.send(AgentEvent::AgentStart).await.ok();
 
     let invalid_state = if context.messages.is_empty() {
         Some("Cannot continue: no messages in context")
@@ -109,8 +110,11 @@ pub(crate) async fn agent_loop_continue_with_state(
                 message: message.into(),
             },
         })
+        .await
         .ok();
-        tx.send(AgentEvent::AgentEnd { messages: vec![] }).ok();
+        tx.send(AgentEvent::AgentEnd { messages: vec![] })
+            .await
+            .ok();
         return AgentLoopOutcome {
             messages: vec![],
             compaction_state: config.initial_compaction_state.clone(),
@@ -118,7 +122,7 @@ pub(crate) async fn agent_loop_continue_with_state(
     }
 
     let mut new_messages = Vec::new();
-    tx.send(AgentEvent::TurnStart).ok();
+    tx.send(AgentEvent::TurnStart).await.ok();
 
     let compaction_state =
         run_loop(context, &mut new_messages, Vec::new(), config, &tx, &cancel).await;
@@ -126,6 +130,7 @@ pub(crate) async fn agent_loop_continue_with_state(
     tx.send(AgentEvent::AgentEnd {
         messages: new_messages.clone(),
     })
+    .await
     .ok();
     AgentLoopOutcome {
         messages: new_messages,
@@ -142,7 +147,7 @@ async fn run_loop(
     new_messages: &mut Vec<AgentMessage>,
     initial_prompts: Vec<AgentMessage>,
     config: &AgentLoopConfig,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<crate::context::CompactionState> {
     let mut first_turn = true;
@@ -165,15 +170,22 @@ async fn run_loop(
     }
     let mut compaction_controller = config.context_config.as_ref().map(|ctx_cfg| {
         let phase_tx = tx.clone();
-        let observer: crate::context::CompactionObserver = Arc::new(move |phase| {
-            phase_tx
-                .send(AgentEvent::ContextCompactionPhase { phase })
-                .ok();
+        let observer: crate::context::CompactionObserver = Arc::new(move |update| {
+            phase_tx.progress(AgentEvent::ContextCompactionPhase {
+                phase: update.phase,
+                activity: update.activity,
+            });
         });
-        let controller = crate::context::CompactionController::new(
+        let mut controller = crate::context::CompactionController::new(
             crate::context::CompactionConfig::from_context_config(ctx_cfg),
         )
         .with_observer(observer);
+        if let Some(judge) = config.judge.clone() {
+            controller = controller.with_judge(judge);
+        }
+        if let Some(ledger) = config.prune_ledger.clone() {
+            controller = controller.with_prune_ledger(ledger);
+        }
         match config.initial_compaction_state.clone() {
             Some(state) => controller.with_state(state),
             None => controller,
@@ -223,14 +235,36 @@ async fn run_loop(
             tx.send(AgentEvent::MessageStart {
                 message: prompt.clone(),
             })
+            .await
             .ok();
             tx.send(AgentEvent::MessageEnd {
                 message: prompt.clone(),
             })
+            .await
             .ok();
             context.messages.push(prompt);
         }
     }
+
+    // A resumed session reaches its first run with a ledger the judge has
+    // never seen. This boundary costs the same as a run end (the cache is
+    // cold, the prompt is new), so the judge gets its first look here rather
+    // than after the first response has already overflowed.
+    if let Some(controller) = compaction_controller.as_ref() {
+        if controller.prune_pending_first_ask().await {
+            prune_after_run(
+                &mut compaction_controller,
+                &context_tracker,
+                &mut context.messages,
+                cancel.clone(),
+                tx,
+            )
+            .await;
+        }
+    }
+
+    // Tool calls the judge has not reviewed yet; reviewed in windows.
+    let mut review_queue: Vec<crate::judge::relevance::ProposedCall> = Vec::new();
 
     // Check for steering messages at start
     let mut pending: Vec<AgentMessage> = config
@@ -246,9 +280,10 @@ async fn run_loop(
         }
 
         let mut steering_after_tools: Option<Vec<AgentMessage>> = None;
+        let mut turn_settled = false;
 
         if !first_turn {
-            tx.send(AgentEvent::TurnStart).ok();
+            tx.send(AgentEvent::TurnStart).await.ok();
         } else {
             first_turn = false;
         }
@@ -265,10 +300,12 @@ async fn run_loop(
                 tx.send(AgentEvent::MessageStart {
                     message: msg.clone(),
                 })
+                .await
                 .ok();
                 tx.send(AgentEvent::MessageEnd {
                     message: msg.clone(),
                 })
+                .await
                 .ok();
                 context.messages.push(msg.clone());
                 new_messages.push(msg);
@@ -279,6 +316,7 @@ async fn run_loop(
         if let Some(ref tracker) = tracker {
             if let Some(reason) = tracker.check_limits() {
                 let limit_msg = AgentMessage::Llm(Message::User {
+                    provenance: Some(crate::InputProvenance::runtime(1, "execution_limit", None)),
                     content: vec![Content::Text {
                         text: format!("[Agent stopped: {}]", reason),
                     }],
@@ -287,10 +325,12 @@ async fn run_loop(
                 tx.send(AgentEvent::MessageStart {
                     message: limit_msg.clone(),
                 })
+                .await
                 .ok();
                 tx.send(AgentEvent::MessageEnd {
                     message: limit_msg.clone(),
                 })
+                .await
                 .ok();
                 context.messages.push(limit_msg.clone());
                 new_messages.push(limit_msg);
@@ -330,12 +370,7 @@ async fn run_loop(
             .await;
         let message = assistant_result.message;
 
-        // Strip any `<system-reminder>` / `<system>` tags or status-template
-        // preambles the model may have mimicked from reminders it saw in
-        // context. Without this, the fake tags land back in the prompt next
-        // turn and teach the model to keep producing them.
-        let message = sanitize_assistant_message(message);
-
+        // Preserve provider text so finalization cannot erase streamed content.
         let agent_msg: AgentMessage = message.clone().into();
         context.messages.push(agent_msg.clone());
         new_messages.push(agent_msg.clone());
@@ -369,6 +404,7 @@ async fn run_loop(
         tx.send(AgentEvent::MessageEnd {
             message: agent_msg.clone(),
         })
+        .await
         .ok();
 
         // Match pi's message_end lifecycle: every non-error assistant response
@@ -403,6 +439,7 @@ async fn run_loop(
                             message: err_str,
                         },
                     })
+                    .await
                     .ok();
                 }
                 // Call after_turn even on error/abort so callers tracking usage don't miss this turn
@@ -413,6 +450,7 @@ async fn run_loop(
                     message: agent_msg,
                     tool_results: vec![],
                 })
+                .await
                 .ok();
 
                 let should_retry = check_compaction(
@@ -449,7 +487,7 @@ async fn run_loop(
             if let Some(intervention) = doom_detector.check(&tool_calls) {
                 let mut tool_results = Vec::new();
                 for (id, name, args) in &tool_calls {
-                    let result = skip_tool_call_doom_loop(id, name, args, tx);
+                    let result = skip_tool_call_doom_loop(id, name, args, tx).await;
                     let am: AgentMessage = result.clone().into();
                     context.messages.push(am.clone());
                     new_messages.push(am);
@@ -476,6 +514,7 @@ async fn run_loop(
                     message: agent_msg,
                     tool_results,
                 })
+                .await
                 .ok();
                 continue;
             }
@@ -491,8 +530,38 @@ async fn run_loop(
                 // provider JSON repair. They may parse successfully while
                 // still being incomplete, so fail the whole batch and let the
                 // model re-issue it rather than executing corrupted input.
-                tool_results = fail_truncated_tool_calls(&tool_calls, tx);
+                tool_results = fail_truncated_tool_calls(&tool_calls, tx).await;
             } else {
+                // Every REVIEW_WINDOW calls the judge reviews that window in
+                // the background: one request, independent of the main model,
+                // nothing waits for it. The UI speaks up only when the window
+                // looks off-task.
+                if let Some(judge) = config.judge.clone() {
+                    review_queue.extend(tool_calls.iter().cloned());
+                    while review_queue.len() >= crate::judge::relevance::REVIEW_WINDOW {
+                        let window: Vec<_> = review_queue
+                            .drain(..crate::judge::relevance::REVIEW_WINDOW)
+                            .collect();
+                        let state = crate::judge::relevance::relevance_state(&context.messages);
+                        let (judge, review_tx, review_cancel) =
+                            (judge.clone(), tx.clone(), cancel.clone());
+                        tokio::spawn(async move {
+                            if let Some(calls) = crate::judge::relevance::review_window(
+                                judge,
+                                state,
+                                window,
+                                review_cancel,
+                            )
+                            .await
+                            {
+                                review_tx
+                                    .send(AgentEvent::ToolCallsReviewed { calls })
+                                    .await
+                                    .ok();
+                            }
+                        });
+                    }
+                }
                 let idle_clock = tracker.as_ref().map(|t| t.idle_clock());
                 let execution = execute_tool_calls(
                     &context.tools,
@@ -516,6 +585,8 @@ async fn run_loop(
                 tool_results = execution.tool_results;
                 steering_after_tools = execution.steering_messages;
             }
+
+            turn_settled = settles_run(&context.tools, &tool_calls, &tool_results);
 
             for result in &tool_results {
                 let am: AgentMessage = result.clone().into();
@@ -557,7 +628,47 @@ async fn run_loop(
             message: agent_msg,
             tool_results,
         })
+        .await
         .ok();
+
+        // A tool turn that has grown the active context to the summary
+        // threshold compacts here, before the next provider call, instead of
+        // waiting for run end or a provider overflow. Threshold compaction
+        // never asks for a retry; the fresh tool results stay in context.
+        // Below the line the controller only sees the usage, which re-arms
+        // threshold compaction after a previous one.
+        if has_tool_calls && !cancel.is_cancelled() {
+            if super::compaction_check::tool_turn_needs_compaction_check(
+                &compaction_controller,
+                &context_tracker,
+                &context.messages,
+            ) {
+                check_compaction(
+                    &mut compaction_controller,
+                    &mut context_tracker,
+                    &mut context.messages,
+                    CompactionCheckInput {
+                        assistant_message: &message,
+                        config,
+                        request_shape: CompactionRequestShape {
+                            system_prompt: &context.system_prompt,
+                            tools: &tool_defs,
+                            prompt_cache_key: context.prompt_cache_key.as_deref(),
+                        },
+                        phase: CompactionCheckPhase::ToolTurn,
+                    },
+                    cancel.clone(),
+                    tx,
+                )
+                .await;
+            } else {
+                super::compaction_check::note_tool_turn_usage(
+                    &mut compaction_controller,
+                    config,
+                    &message,
+                );
+            }
+        }
 
         // Continue the current run while tool work or steering remains.
         if let Some(steering) = steering_after_tools.take() {
@@ -574,7 +685,7 @@ async fn run_loop(
             .as_ref()
             .map(|f| f())
             .unwrap_or_default();
-        if !pending.is_empty() || has_tool_calls {
+        if !pending.is_empty() || (has_tool_calls && !turn_settled) {
             continue;
         }
 
@@ -621,10 +732,89 @@ async fn run_loop(
             new_messages.pop();
             continue;
         }
+        prune_after_run(
+            &mut compaction_controller,
+            &context_tracker,
+            &mut context.messages,
+            cancel.clone(),
+            tx,
+        )
+        .await;
         break;
     }
 
     compaction_controller
         .map(|controller| controller.state().clone())
         .or_else(|| config.initial_compaction_state.clone())
+}
+
+/// A tool turn settles the run when every call went to an `ends_turn` tool
+/// and none of them failed. The results are recorded but the model is not
+/// asked for a follow-up: there is nothing new for it to act on, and some
+/// providers answer that prompt with an empty completion.
+fn settles_run(
+    tools: &[Box<dyn AgentTool>],
+    tool_calls: &[(String, String, serde_json::Value)],
+    tool_results: &[Message],
+) -> bool {
+    if tool_calls.is_empty() {
+        return false;
+    }
+    let all_end_turn = tool_calls.iter().all(|(_, name, _)| {
+        tools
+            .iter()
+            .find(|t| t.matches_call_name(name))
+            .is_some_and(|t| t.ends_turn())
+    });
+    all_end_turn
+        && tool_results
+            .iter()
+            .all(|r| !matches!(r, Message::ToolResult { is_error: true, .. }))
+}
+
+/// The judge-driven prune branch at run end: the run is over and the next
+/// request is a fresh user prompt, so pending edits land here at the latest.
+async fn prune_after_run(
+    controller: &mut Option<crate::context::CompactionController>,
+    tracker: &ContextTracker,
+    messages: &mut Vec<AgentMessage>,
+    cancel: tokio_util::sync::CancellationToken,
+    tx: &EventSink,
+) {
+    let Some(controller) = controller.as_mut().filter(|c| c.has_judge()) else {
+        return;
+    };
+    let context_tokens = crate::context::tokens::total_tokens(messages)
+        .saturating_add(tracker.system_tool_overhead_tokens());
+    let outcome = controller
+        .prune_step(
+            messages,
+            context_tokens,
+            crate::context::compaction::ApplyTrigger::RunEnd,
+            crate::context::now_ms(),
+            cancel,
+        )
+        .await;
+    emit_context_pruned(controller, messages, outcome, tx).await;
+}
+
+/// The `ContextPruned` event for one prune step, when it did anything.
+pub(crate) async fn emit_context_pruned(
+    controller: &crate::context::CompactionController,
+    messages: &[AgentMessage],
+    outcome: crate::context::compaction::PruneOutcome,
+    tx: &EventSink,
+) {
+    if outcome.decided.is_none() && outcome.applied.is_none() {
+        return;
+    }
+    tx.send(AgentEvent::ContextPruned {
+        decided: outcome.decided,
+        applied: outcome.applied,
+        messages: messages.to_vec(),
+        state: controller.state().clone(),
+        context_window: controller.config().displayed_window(),
+    })
+    .await
+    .ok();
 }

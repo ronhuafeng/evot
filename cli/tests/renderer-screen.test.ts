@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { TermRenderer, CURSOR_MARKER } from '../src/term/renderer.js'
+import { TermRenderer } from '../src/term/renderer.js'
+import { CURSOR_MARKER } from '../src/term/render-frame.js'
 import { ScreenHarness } from './helpers/screen.js'
+import stripAnsi from 'strip-ansi'
 
 async function renderFrame(renderer: TermRenderer): Promise<void> {
   renderer.requestRender()
@@ -14,10 +16,35 @@ async function renderFrame(renderer: TermRenderer): Promise<void> {
  * logical frame".
  *
  * The rule under test: the content above the composer decides where it sits.
- * A short session keeps it high; once output has pushed it to the bottom row it
- * stays there instead of jumping back up when a frame shrinks.
+ * A short session keeps it high; after a visible shrink it follows content up
+ * without clearing native scrollback merely to keep the footer at bottom.
  */
 describe('composer placement on a real screen', () => {
+  test('a wrapped interrupt hint remains visible when its prefix is not rewritten', async () => {
+    const screen = new ScreenHarness(80, 24)
+    const writes: string[] = []
+    const renderer = new TermRenderer({ stdout: screen.stdout, trace: entry => writes.push(...entry.ansiWrites) })
+    let armed = false
+    renderer.init()
+    renderer.setRenderCallback(() => ({
+      lines: ['Connection interrupted · retrying · esc', armed ? 'again to interrupt' : 'twice to interrupt', `> ${CURSOR_MARKER}`],
+    }))
+    try {
+      await renderFrame(renderer)
+      await screen.settle()
+      writes.length = 0
+      armed = true
+      await renderFrame(renderer)
+      await screen.settle()
+      const hint = /esc\s+again\s+to\s+interrupt/
+      expect(stripAnsi(writes.join(''))).not.toMatch(hint)
+      expect(screen.viewport().join('\n')).toMatch(hint)
+    } finally {
+      renderer.destroy()
+      screen.terminal.dispose()
+    }
+  })
+
   test('a fresh short session keeps the composer just below its content', async () => {
     const screen = new ScreenHarness(80, 24)
     const renderer = new TermRenderer({ stdout: screen.stdout })
@@ -130,7 +157,7 @@ describe('composer placement on a real screen', () => {
     renderer.destroy()
   })
 
-  test('a command window over a full transcript closes with the composer still on the bottom row', async () => {
+  test('a command window over a full transcript closes in place without reanchoring', async () => {
     const screen = new ScreenHarness(80, 12)
     const renderer = new TermRenderer({ stdout: screen.stdout })
     renderer.init()
@@ -156,14 +183,14 @@ describe('composer placement on a real screen', () => {
     await renderFrame(renderer)
     await screen.settle()
 
-    // The transcript had already earned the bottom row, so closing the window
-    // neither lifts the composer nor opens a gap: the transcript tail sits
-    // directly above it again.
+    // Clear the six selector rows in place. No clear/replay just to force the
+    // footer back down: it follows history with vacant rows below, not above.
     const viewport = screen.viewport()
-    expect(screen.rowOf('footer row')).toBe(screen.rows - 1)
-    expect(viewport[screen.rows - 2]).toBe('\u276f /mo')
-    expect(viewport[screen.rows - 3]).toBe('history 19')
-    expect(viewport.every(line => line !== '')).toBe(true)
+    const footerRow = screen.rows - 1 - 6
+    expect(screen.rowOf('footer row')).toBe(footerRow)
+    expect(viewport[footerRow - 1]).toBe('\u276f /mo')
+    expect(viewport[footerRow - 2]).toBe('history 19')
+    expect(viewport.slice(footerRow + 1).every(line => line === '')).toBe(true)
     expect(viewport.some(line => line.startsWith('selector '))).toBe(false)
     renderer.destroy()
   })
@@ -186,16 +213,14 @@ describe('composer placement on a real screen', () => {
     renderer.destroy()
   })
 
-  // The reported regression. The transcript is far taller than the viewport, so
-  // the composer has legitimately reached the bottom row. Differential shrink
-  // cleared the vacated rows but left the viewport where the taller frame put
-  // it, lifting the composer by exactly the number of discarded rows: "however
-  // big the last thinking was, that is how far it moves up".
+  // Addressable shrink preserves history. If the caret leaves the physical
+  // viewport, repaint only that viewport instead of replaying native history.
   test.each([1, 3, 8, 12, 30, 80])(
-    'discarding %i rows of thinking does not lift the composer off the bottom row',
+    'discarding %i thinking rows recovers off-screen geometry without replaying history',
     async thinkingRows => {
       const screen = new ScreenHarness(80, 24)
-      const renderer = new TermRenderer({ stdout: screen.stdout })
+      const branches: string[] = []
+      const renderer = new TermRenderer({ stdout: screen.stdout, trace: entry => branches.push(entry.branch) })
       renderer.init()
       const transcript = Array.from({ length: 40 }, (_, i) => `history ${i}`)
       let thinking = Array.from({ length: thinkingRows }, (_, i) => `thinking ${i}`)
@@ -212,15 +237,18 @@ describe('composer placement on a real screen', () => {
       await screen.settle()
 
       const viewport = screen.viewport()
-      expect(screen.rowOf('footer row')).toBe(screen.rows - 1)
-      expect(viewport[screen.rows - 2]).toBe('\u276f')
+      const visibleShrink = thinkingRows <= screen.rows - 2
+      const footerRow = visibleShrink ? screen.rows - 1 - thinkingRows : screen.rows - 1
+      expect(screen.rowOf('footer row')).toBe(footerRow)
+      expect(viewport[footerRow - 1]).toBe('\u276f')
+      expect(branches.at(-1)).toBe(visibleShrink ? 'differential_update' : 'cursor_recovery')
       // No stale thinking rows survive the interrupt.
       expect(viewport.some(line => line.startsWith('thinking '))).toBe(false)
       renderer.destroy()
     },
   )
 
-  test('repeated interrupts keep the composer on the same row', async () => {
+  test('repeated visible interrupts follow content without forcing the composer down', async () => {
     const screen = new ScreenHarness(80, 24)
     const renderer = new TermRenderer({ stdout: screen.stdout })
     renderer.init()
@@ -241,9 +269,9 @@ describe('composer placement on a real screen', () => {
       rows.push(screen.rowOf('footer row'))
     }
 
-    // Every interrupt lands on the same row regardless of how tall the
-    // discarded block was: no drift accumulates across turns.
-    expect(rows).toEqual([23, 23, 23, 23, 23])
+    // Natural placement: new output first uses the vacant rows, then scrolls
+    // when necessary. Removing it does not replay the transcript to reanchor.
+    expect(rows).toEqual([17, 9, 9, 2, 2])
     renderer.destroy()
   })
 
@@ -276,7 +304,7 @@ describe('composer placement on a real screen', () => {
     await screen.settle()
     expect(screen.rowOf('footer row')).toBe(screen.rows - 1)
 
-    // The repaint re-emits the transcript rather than duplicating or losing it.
+    // Recovering the visible tail never wipes the existing transcript history.
     const buffer = screen.terminal.buffer.active
     const allRows: string[] = []
     for (let row = 0; row < buffer.length; row++) {

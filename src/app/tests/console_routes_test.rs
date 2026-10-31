@@ -30,6 +30,42 @@ use tower::ServiceExt;
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
+#[tokio::test]
+async fn setup_endpoint_observes_owning_console_without_exposing_credentials() -> TestResult {
+    let (app, env_path) = router_with_env("setup_observe")?;
+    // Persist the fixture through the real settings writer before observing it.
+    let (status, _, _) = post(
+        app.clone(),
+        "/api/channels/feishu",
+        serde_json::json!({"app_id": ""}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, body) = read(
+        app.clone(),
+        Request::builder()
+            .uri("/api/channels/feishu/setup")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let state: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(state["configured"], false);
+    assert!(state["chats"].is_array());
+    assert!(!body.contains("app_secret"));
+    let (status, _, _) = post(
+        app,
+        "/api/channels/feishu/setup",
+        serde_json::json!({
+            "revision": "stale", "chat_id": "oc_unseen"
+        }),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    std::fs::remove_file(env_path)?;
+    Ok(())
+}
+
 struct BlockingChatProvider {
     started: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -158,6 +194,14 @@ async fn console_pages_are_served() -> TestResult {
         // its own module, or it renders unstyled and inert.
         assert!(body.contains("/ui/app.css"), "{path} missing stylesheet");
         assert!(
+            body.contains("/ui/theme.css"),
+            "{path} missing product palette"
+        );
+        assert!(
+            body.contains("/ui/theme.js"),
+            "{path} missing theme control"
+        );
+        assert!(
             body.contains("type=\"module\""),
             "{path} missing module script"
         );
@@ -175,7 +219,7 @@ async fn console_assets_carry_executable_content_types() -> TestResult {
         content_type.starts_with("text/css"),
         "css was {content_type}"
     );
-    assert!(body.contains("--page"));
+    assert!(body.contains("var(--page)"));
     assert!(body.contains("--font"));
     assert!(body.contains(".load-bar"), "missing the top refresh bar");
     assert!(
@@ -183,7 +227,12 @@ async fn console_assets_carry_executable_content_types() -> TestResult {
         "missing skeleton shimmer"
     );
 
-    for path in ["/ui/app.js", "/ui/models.js", "/ui/feishu.js"] {
+    for path in [
+        "/ui/app.js",
+        "/ui/models.js",
+        "/ui/feishu.js",
+        "/ui/login-errors.js",
+    ] {
         let (status, content_type, body) = get(path).await?;
         assert_eq!(status, StatusCode::OK, "{path} should be reachable");
         assert!(
@@ -199,12 +248,26 @@ async fn console_assets_carry_executable_content_types() -> TestResult {
 async fn page_modules_only_import_served_paths() -> TestResult {
     // The pages are unbundled ES modules, so every import must resolve to a
     // route. A typo would only surface as a blank page in a browser.
-    for path in ["/ui/models.js", "/ui/feishu.js"] {
+    for path in [
+        "/ui/app.js",
+        "/ui/models.js",
+        "/ui/feishu.js",
+        "/ui/chat.js",
+        "/ui/rail.js",
+    ] {
         let (_, _, body) = get(path).await?;
-        assert!(
-            body.contains("from \"./app.js\""),
-            "{path} should import the shared helpers"
-        );
+        for line in body.lines().filter(|line| line.starts_with("import ")) {
+            if let Some((_, suffix)) = line.split_once("from \"./") {
+                let name = suffix.split('"').next().ok_or("missing module name")?;
+                let url = format!("/ui/{name}");
+                let (status, content_type, _) = get(&url).await?;
+                assert_eq!(status, StatusCode::OK, "{path} imports missing {url}");
+                assert!(
+                    content_type.starts_with("text/javascript"),
+                    "{url} is not executable"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -227,8 +290,8 @@ async fn settings_url_redirects_to_models() -> TestResult {
 
 #[test]
 fn models_page_has_only_cloud_and_custom_sections() {
-    let html = include_str!("../src/gateway/channels/http/static/ui/models.html");
-    let js = include_str!("../src/gateway/channels/http/static/ui/models.js");
+    let html = include_str!("../assets/console/ui/models.html");
+    let js = include_str!("../assets/console/ui/models.js");
 
     // These are the only top-level concepts on the page. Global thinking is a
     // compact header control rather than a third configuration section.
@@ -326,6 +389,7 @@ async fn saving_models_leaves_the_channel_alone() -> TestResult {
             "app_id": "cli_app",
             "app_secret": "feishu-secret",
             "mention_only": true,
+            "default_chat_id": "oc_daily_report",
         }),
     )
     .await?;
@@ -360,11 +424,32 @@ async fn saving_models_leaves_the_channel_alone() -> TestResult {
     let channel: serde_json::Value = serde_json::from_str(&channel)?;
     assert_eq!(channel["feishu"]["app_id"], "cli_app");
     assert_eq!(channel["feishu"]["app_secret_set"], true);
+    assert_eq!(channel["feishu"]["default_chat_id"], "oc_daily_report");
 
     let written = std::fs::read_to_string(&env_path)?;
     assert!(written.contains("EVOT_CHANNEL_FEISHU_APP_ID=cli_app"));
+    assert!(written.contains("EVOT_CHANNEL_FEISHU_DEFAULT_CHAT_ID=oc_daily_report"));
     assert!(written.contains("EVOT_LLM_THINKING_LEVEL=high"));
     let _ = std::fs::remove_file(&env_path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn settings_reject_external_changes_instead_of_overwriting_new_secrets() -> TestResult {
+    let (app, env_path) = router_with_env("conflict")?;
+    let update = serde_json::json!({
+        "app_id": "fixture-app", "app_secret": "fixture-secret", "mention_only": true,
+    });
+    let (status, _, body) = post(app.clone(), "/api/channels/feishu", update.clone()).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let edited =
+        std::fs::read_to_string(&env_path)?.replace("fixture-secret", "externally-rotated");
+    std::fs::write(&env_path, &edited)?;
+    let (status, _, body) = post(app, "/api/channels/feishu", update).await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("configuration changed on disk"));
+    assert_eq!(std::fs::read_to_string(&env_path)?, edited);
+    std::fs::remove_file(env_path)?;
     Ok(())
 }
 
@@ -384,9 +469,9 @@ async fn saving_the_channel_leaves_models_alone() -> TestResult {
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "channel save failed: {body}");
-    // Persisting is not enough to run the bot: it is spawned at startup.
+    // The supervisor applies saved transport settings without restarting evot.
     let parsed: serde_json::Value = serde_json::from_str(&body)?;
-    assert_eq!(parsed["restart_required"], true);
+    assert_eq!(parsed["restart_required"], false);
 
     let (_, _, models) = read(
         app,
@@ -546,7 +631,6 @@ async fn chat_page_uses_conversation_layout_and_runtime_controls() -> TestResult
         "id=\"sendBtn\"",
         "id=\"commandBtn\"",
         "id=\"commandMenu\"",
-        "id=\"recentSessions\"",
         "id=\"modelSelect\"",
         "id=\"modelMenu\"",
         "id=\"thinkingSelect\"",
@@ -567,12 +651,29 @@ async fn chat_page_uses_conversation_layout_and_runtime_controls() -> TestResult
         body.contains("IBM+Plex+Mono"),
         "chat page should load the admin typeface"
     );
-    assert!(body.contains("class=\"chat-sidebar\""));
+    // The shared rail renders during parsing (classic script in <head>), so
+    // it is painted before first paint instead of being moved in later.
+    assert!(body.contains("<evot-rail class=\"sidenav\" data-mode=\"chat\"></evot-rail>"));
+    assert!(body.contains("<script src=\"/ui/rail.js\"></script>"));
+    assert!(body.contains("/ui/rail.css"));
+    assert!(!body.contains("/ui/chrome.js"));
+    let rail = include_str!("../assets/console/ui/rail.js");
+    for id in [
+        "id=\"recentSessions\"",
+        "id=\"newChat\"",
+        "id=\"openSearch\"",
+        "id=\"authBox\"",
+    ] {
+        assert!(rail.contains(id), "rail lost {id}");
+    }
+    assert!(!body.contains("class=\"sidebar-links\""));
+    assert!(!body.contains("class=\"chat-brand\""));
     assert!(body.contains("class=\"composer-card\""));
     assert!(body.contains("aria-haspopup=\"listbox\""));
     assert!(body.contains("data-command=\"/clear\""));
     assert!(!body.contains("Attachments are not available yet"));
     assert!(body.contains("/ui/chat.js"), "chat page missing its module");
+    assert!(body.contains("/ui/chat-theme.css"));
     assert!(
         body.contains("/ui/chat.css"),
         "chat page missing its stylesheet"
@@ -586,10 +687,32 @@ async fn chat_page_uses_conversation_layout_and_runtime_controls() -> TestResult
 
 #[tokio::test]
 async fn chat_assets_are_served() -> TestResult {
+    let (status, content_type, theme) = get("/ui/theme.js").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/javascript"));
+    assert!(theme.contains("evot-theme"));
+    for path in ["/ui/theme.css", "/ui/chat-theme.css", "/ui/trace-theme.css"] {
+        let (status, content_type, body) = get(path).await?;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(content_type.starts_with("text/css"));
+        assert!(!body.is_empty());
+    }
+    let (status, content_type, transport) = get("/ui/chat-transport.js").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/javascript"));
+    assert!(transport.contains("export async function streamChat"));
+    assert!(!transport.contains("document."));
+    let (status, content_type, control) = get("/ui/chat-control.js").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/javascript"));
+    assert!(control.contains("export async function requestSteering"));
+    assert!(!control.contains("document."));
+    let chat = include_str!("../assets/console/ui/chat.js");
+    assert!(chat.contains("import { streamChat }"));
+    assert!(!chat.contains("response.body.getReader()"));
     let (status, content_type, body) = get("/ui/chat.css").await?;
     assert_eq!(status, StatusCode::OK);
     assert!(content_type.starts_with("text/css"), "was {content_type}");
-    assert!(body.contains(".chat-sidebar"));
     assert!(body.contains(".composer-card"));
     // Conversation chrome the harness layout depends on.
     assert!(body.contains(".turn-status"));
@@ -619,11 +742,15 @@ async fn chat_assets_are_served() -> TestResult {
     assert!(body.contains("data-pending-steering"));
     // Search results show match context, not just titles.
     assert!(body.contains(".search-snippet"));
-    // Scroll-triggered page loading shows an in-list indicator, not a freeze.
-    assert!(body.contains(".recent-more"));
     assert!(body.contains(".seat-menu"));
     assert!(body.contains(".seat-group-title"));
     assert!(body.contains("mark {"));
+    let (status, content_type, rail) = get("/ui/rail.css").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/css"), "was {content_type}");
+    assert!(rail.contains(".chat-sidebar"));
+    // Scroll-triggered page loading shows an in-list indicator, not a freeze.
+    assert!(rail.contains(".recent-more"));
 
     let (status, content_type, body) = get("/ui/chat.js").await?;
     assert_eq!(status, StatusCode::OK);
@@ -647,7 +774,8 @@ async fn chat_assets_are_served() -> TestResult {
     assert!(body.contains("NOTICE_POLL_MS"));
     assert!(body.contains("visibilitychange"));
     assert!(body.contains("/api/chat/abort"));
-    assert!(body.contains("/api/chat/steer"));
+    assert!(control.contains("/api/chat/steer"));
+    assert!(body.contains("requestSteering(postJson, sessionId, text)"));
     assert!(body.contains("/api/workspace"));
     assert!(body.contains("/api/sessions/"));
     // Sidebar sessions: full-text search plus armed two-step delete.
@@ -662,7 +790,16 @@ async fn chat_assets_are_served() -> TestResult {
     assert!(body.contains("onSearchKeydown"));
     assert!(body.contains("snippetAround"));
     assert!(body.contains("Stop generating"));
-    assert!(body.contains("new AbortController()"));
+    let (status, content_type, state) = get("/ui/chat-state.js").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/javascript"));
+    assert!(state.contains("new AbortController()"));
+    assert!(!state.contains("document."));
+    let (status, content_type, stream_state) = get("/ui/chat-stream-state.js").await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type.starts_with("text/javascript"));
+    assert!(stream_state.contains("class ChatStreamState"));
+    assert!(body.contains("runtime.begin(currentSessionId)"));
     assert!(body.contains("requestAnimationFrame"));
     assert!(body.contains("followOutput = isNearBottom()"));
     assert!(body.contains("thinking_level: thinkingLevel"));
@@ -727,6 +864,8 @@ async fn chat_steer_is_validated_and_reports_no_active_run() -> TestResult {
     for payload in [
         serde_json::json!({ "session_id": "", "message": "hi" }),
         serde_json::json!({ "session_id": "sess-1", "message": "   " }),
+        serde_json::json!({ "session_id": "sess-1", "message": "/compact" }),
+        serde_json::json!({ "session_id": "sess-1", "message": "/unknown" }),
     ] {
         let (status, _, body) = post(app.clone(), "/api/chat/steer", payload).await?;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -850,6 +989,14 @@ async fn chat_options_expose_the_live_configured_model() -> TestResult {
 async fn chat_rejects_unconfigured_runtime_selections_before_starting() -> TestResult {
     let cases = [
         (
+            serde_json::json!({ "message": "hello", "provider": "anthropic" }),
+            "chat model selection requires both provider and model",
+        ),
+        (
+            serde_json::json!({ "message": "hello", "model": "claude-sonnet-4-6" }),
+            "chat model selection requires both provider and model",
+        ),
+        (
             serde_json::json!({
                 "message": "hello",
                 "provider": "ghost",
@@ -886,7 +1033,17 @@ async fn chat_rejects_unconfigured_runtime_selections_before_starting() -> TestR
     ];
 
     for (payload, expected) in cases {
-        let (status, content_type, body) = post(router()?, "/api/chat", payload).await?;
+        let config = test_config();
+        let storage = Arc::new(MemoryStorage::new());
+        let agent = Agent::new_with_provider_for_test(
+            &config,
+            "/work",
+            storage.clone(),
+            evot_engine::provider::MockProvider::text("unexpected run"),
+        )?;
+        let before = agent.llm();
+        let app = Server::new(agent.clone(), config).router();
+        let (status, content_type, body) = post(app, "/api/chat", payload).await?;
         // SSE endpoints keep HTTP 200 and carry run/setup failures as events.
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/event-stream"));
@@ -899,7 +1056,53 @@ async fn chat_rejects_unconfigured_runtime_selections_before_starting() -> TestR
             body.contains("\"type\":\"done\""),
             "stream did not close: {body}"
         );
+        assert_eq!(agent.llm().provider, before.provider);
+        assert_eq!(agent.llm().model, before.model);
+        assert_eq!(agent.llm().thinking_level, before.thinking_level);
+        assert!(agent.sessions().list(0).await?.is_empty());
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn chat_selection_pins_session_effort_and_keeps_legacy_omission_semantics() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let mut config = test_config_at(dir.path().join("not-written.env"));
+    config.storage = evot::conf::StorageConfig::fs(dir.path().to_path_buf());
+    let agent = Agent::new_with_provider_for_test(
+        &config,
+        dir.path().to_string_lossy(),
+        Arc::new(MemoryStorage::new()),
+        evot_engine::provider::MockProvider::text("ok"),
+    )?;
+    let app = Server::new(agent.clone(), config.clone()).router();
+    for payload in [
+        serde_json::json!({
+            "message": "hello", "provider": "anthropic", "model": "claude-sonnet-4-6", "thinking_level": "low",
+        }),
+        // Historical requests with no provider/model use the live snapshot and
+        // ignore a standalone thinking field, even one that would be invalid.
+        serde_json::json!({ "message": "again", "thinking_level": "invalid" }),
+    ] {
+        let (status, content_type, body) = post(app.clone(), "/api/chat", payload).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/event-stream"));
+        assert!(
+            !body.contains("\"type\":\"error\""),
+            "unexpected SSE error: {body}"
+        );
+        assert_eq!(agent.llm().thinking_level, ThinkingLevel::Low);
+    }
+    let sessions = agent.sessions().list(0).await?;
+    assert_eq!(sessions.len(), 2);
+    for session in sessions {
+        assert_eq!(session.model, "claude-sonnet-4-6");
+        assert_eq!(session.thinking_level.as_deref(), Some("low"));
+    }
+    assert!(
+        !config.env_file_path.exists(),
+        "runtime selection must not persist defaults"
+    );
     Ok(())
 }
 
@@ -959,13 +1162,17 @@ async fn trace_page_joins_the_console_shell() -> TestResult {
             "{path} missing the shell styles"
         );
         assert!(
-            body.contains("/ui/chrome.js"),
-            "{path} missing the console chrome"
+            body.contains("<evot-rail class=\"sidenav\"></evot-rail>"),
+            "{path} missing the shared rail"
         );
+        assert!(body.contains("/ui/rail.js"), "{path} missing rail.js");
     }
     let (_, _, body) = get("/sessions/abc123/trace").await?;
+    assert!(body.contains("/ui/theme.css"));
+    assert!(body.contains("/ui/theme.js"));
+    assert!(body.contains("/ui/trace-theme.css"));
     // The page scrolls normally rather than filling the viewport like chat.
-    assert!(body.contains("data-chrome=\"page\""));
+    assert!(body.contains("<div class=\"shell\">"));
     // The iframe height protocol existed only for the SPA shell.
     assert!(
         !body.contains("postHeight"),
@@ -1019,9 +1226,10 @@ async fn models_api_groups_cloud_by_tier_and_chip_pins_a_model() -> TestResult {
     // HOME stays pointed at the hermetic home until every assertion lands:
     // GET /api/models reloads config from disk and would otherwise re-read
     // the real account cache and overwrite the cloud providers.
+    // Keep the env file inside the hermetic home: settings writes are a
+    // transaction against the revision loaded from disk, so pointing the path
+    // elsewhere makes the first POST look like a concurrent edit and fail.
     let config = Config::load()?;
-    let mut config = config;
-    config.env_file_path = std::env::temp_dir().join("models-tier-grouping.env");
 
     let agent = Agent::new(&config, "/work")?;
     let app = Server::new(agent, config).router();
@@ -1213,7 +1421,7 @@ async fn sessions_api_pages_lightweight_rows() -> TestResult {
 
     // A conversation with durable transcript activity shows up without
     // waiting for the final turns/title metadata save.
-    let session = evot::agent::session::Session::new(
+    let session = evot::sessions::Session::new(
         "seed-visible".into(),
         "/work".into(),
         "claude-sonnet-4-6".into(),
@@ -1222,6 +1430,7 @@ async fn sessions_api_pages_lightweight_rows() -> TestResult {
     .await?;
     session
         .write_items(vec![evot::types::TranscriptItem::User {
+            provenance: None,
             text: "seed the listing".into(),
             content: vec![],
         }])
@@ -1307,6 +1516,7 @@ async fn session_detail_replays_transcript_nodes() -> TestResult {
     loaded
         .write_items(vec![
             evot::types::TranscriptItem::User {
+                provenance: None,
                 text: "hello".into(),
                 content: vec![],
             },
@@ -1321,7 +1531,7 @@ async fn session_detail_replays_transcript_nodes() -> TestResult {
                     },
                 ],
                 stop_reason: "stop".into(),
-                usage: evot::types::UsageSummary::default(),
+                usage: evot::observability::UsageSummary::default(),
                 model: "claude-sonnet-4-6".into(),
                 provider: "anthropic".into(),
                 timestamp: 1_700_000_000_000,
@@ -1329,34 +1539,38 @@ async fn session_detail_replays_transcript_nodes() -> TestResult {
             },
             // Stats never replay as nodes, so the readings must be folded
             // server-side from the raw entries instead.
-            evot::types::TranscriptStats::LlmCallCompleted(evot::types::LlmCallCompletedStats {
-                turn: 1,
-                attempt: 1,
-                usage: evot::types::UsageSummary {
-                    input: 900,
-                    output: 300,
-                    cache_read: 100,
-                    cache_write: 0,
+            evot::observability::TranscriptStats::LlmCallCompleted(
+                evot::observability::LlmCallCompletedStats {
+                    turn: 1,
+                    attempt: 1,
+                    usage: evot::observability::UsageSummary {
+                        input: 900,
+                        output: 300,
+                        cache_read: 100,
+                        cache_write: 0,
+                    },
+                    metrics: Some(evot::observability::LlmCallMetrics {
+                        duration_ms: 4_000,
+                        ttfb_ms: 200,
+                        ttft_ms: 400,
+                        streaming_ms: 3_000,
+                        chunk_count: 42,
+                    }),
+                    error: None,
+                    context_window: 10_000,
+                    stop_reason: "stop".into(),
                 },
-                metrics: Some(evot::types::LlmCallMetrics {
-                    duration_ms: 4_000,
-                    ttfb_ms: 200,
-                    ttft_ms: 400,
-                    streaming_ms: 3_000,
-                    chunk_count: 42,
-                }),
-                error: None,
-                context_window: 10_000,
-                stop_reason: "stop".into(),
-            })
+            )
             .to_item(),
-            evot::types::TranscriptStats::ToolFinished(evot::types::ToolFinishedStats {
-                tool_call_id: "tc-1".into(),
-                tool_name: "read".into(),
-                result_tokens: 12,
-                duration_ms: 80,
-                is_error: false,
-            })
+            evot::observability::TranscriptStats::ToolFinished(
+                evot::observability::ToolFinishedStats {
+                    tool_call_id: "tc-1".into(),
+                    tool_name: "read".into(),
+                    result_tokens: 12,
+                    duration_ms: 80,
+                    is_error: false,
+                },
+            )
             .to_item(),
         ])
         .await?;

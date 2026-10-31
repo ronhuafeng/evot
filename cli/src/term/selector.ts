@@ -1,16 +1,40 @@
-import type { Hint } from './app/hint.js'
+import type { Hint } from './design/key-hints.js'
+
+/** Prefix marking a preview body entry as a section label rather than content. */
+export const PREVIEW_SECTION_PREFIX = '# '
+/** Prefix marking a preview body entry as something that went wrong; the pane
+ *  draws it in the alert colour instead of the section's normal contrast. */
+export const PREVIEW_ALERT_PREFIX = '! '
 
 export interface SelectorItem {
+  /** In-flight domain action; disables action hints without parsing display copy. */
+  pendingAction?: boolean
+  renameTitle?: string
   label: string
   detail?: string
+  /** Browse-row status, kept visible independently of title truncation. */
+  status?: { text: string; tone?: 'muted' | 'success' | 'attention' | 'active' }
+  /** Compact provenance label, independent of search match snippets. */
+  badge?: string
+  /** Skill package row; children stay searchable while collapsed. */
+  expanded?: boolean
+  /** Optional subordinate activity line, not a side-pane preview. */
+  activity?: string
   /** Renders as a non-focusable group divider (e.g. a provider name). */
   header?: boolean
   /** Marks the active choice without mixing status into detail text. */
   selected?: boolean
+  /** Marks the account's saved default (the row new sessions start on). */
+  pinned?: boolean
   /** Opaque identifier (e.g. full session id) — not displayed. */
   id?: string
+  /** Stable identity when `id` can change underneath a refresh (e.g. the
+   * model id of a `provider:model` row whose provider group was renamed). */
+  identity?: string
   /** Extra text searched but not displayed (e.g. full session id, cwd). */
   searchText?: string
+  /** The row is a cloud session: deleting it removes the server copy too. */
+  cloud?: boolean
   /** Hidden from the unfiltered list but included when its searchable text
    * matches a query. Resume uses this for sessions from another cwd. */
   searchOnly?: boolean
@@ -21,8 +45,12 @@ export interface SelectorItem {
   group?: string
   /** Prefix retained when full-text filtering replaces detail with a snippet. */
   contextPrefix?: string
-  /** Lines shown in the side pane while this row is focused. First line is the
-   *  heading. Rows without a preview render the list at full width. */
+  /** Lines shown in the side pane while this row is focused. Entries before the
+   *  first blank are the pinned header (first line is the heading); the rest is
+   *  the body. Body entries starting with [`PREVIEW_SECTION_PREFIX`] label a
+   *  section: the first section is pinned, the second is the trimmable list,
+   *  later ones are optional. Rows without a preview render the list at full
+   *  width. */
   preview?: string[]
   /** Footer hints shown while this row is focused, overriding the selector's.
    *  Rows advertise their own gestures so a key that would do nothing on this
@@ -31,9 +59,73 @@ export interface SelectorItem {
   /** Row count for a `header` item. Present headers render as a bold label with
    *  a dim count (`Shells (2)`); absent, they render as a `── label ──` rule. */
   headerCount?: number
+  /** Adjustable tier this row carries alongside its identity (model effort).
+   *  Absent means the row has no such axis, so ←/→ are never offered on it. */
+  effort?: SelectorEffort
+}
+
+/**
+ * An ordered tier ladder attached to a row, adjusted in place with ←/→.
+ *
+ * `levels` are wire names in ascending order, exactly as the source published
+ * them: the ladder is per-row, so a row whose model stops at `high` can never be
+ * pushed to `max` by a gesture. `index` is the chosen tier, always a valid
+ * position in `levels`.
+ */
+export interface SelectorEffort {
+  levels: readonly string[]
+  index: number
+}
+
+/** The chosen tier's wire name, or undefined when the row has no ladder. */
+export function selectorEffortLevel(item: SelectorItem | undefined): string | undefined {
+  const effort = item?.effort
+  return effort?.levels[effort.index]
+}
+
+/**
+ * Move the focused row's tier by `delta`, clamped to the ladder's ends.
+ *
+ * Clamped rather than wrapping: ←/→ are a nudge along a scale a user can see,
+ * and wrapping from `max` straight to `off` would commit the opposite of the
+ * intent on one keypress. Returns the same state when there is no ladder or the
+ * end is already reached, so a caller can treat "unchanged" as "not handled".
+ *
+ * The row is updated in both the visible list and the unfiltered pool, so a
+ * tier survives typing, clearing a query, and async catalog refreshes.
+ */
+export function selectorAdjustEffort(state: SelectorState, delta: number): SelectorState {
+  const focused = state.items[state.focusIndex]
+  const effort = focused?.effort
+  if (!focused || focused.header || !effort || effort.levels.length === 0) return state
+
+  const index = Math.min(Math.max(effort.index + delta, 0), effort.levels.length - 1)
+  if (index === effort.index) return state
+
+  const key = focused.id ?? focused.label
+  const retier = (items: SelectorItem[]) => items.map(item =>
+    (item.id ?? item.label) === key && item.effort
+      ? { ...item, effort: { ...item.effort, index } }
+      : item)
+  return { ...state, items: retier(state.items), allItems: retier(state.allItems) }
+}
+
+export interface SelectorRenameState {
+  sessionId: string
+  text: string
+  cursor: number
+  saving?: boolean
+  error?: string
 }
 
 export interface SelectorState {
+  /** Fixed-height scrollable details, independent of list navigation. */
+  previewPane?: { offset: number; focused?: boolean; confirmDeleteKey?: string }
+  rename?: SelectorRenameState
+  /** Opaque host-owned identity. Generic navigation preserves but never interprets it. */
+  owner?: symbol
+  /** Session source scope, retained across navigation and async refreshes. */
+  sessionScope?: 'all' | 'cloud'
   items: SelectorItem[]
   allItems: SelectorItem[]
   focusIndex: number
@@ -45,13 +137,28 @@ export interface SelectorState {
   subtitle?: string
   /** Model selection and live background output use dedicated editor-replacement
    * presentations instead of the generic titled selector. */
-  presentation?: 'model' | 'background-output'
+  presentation?: 'model' | 'skill' | 'background-list' | 'background-output' | 'browser'
+  /** Browser rows drawn as one line each, `<full id>  <label>`, with no
+   *  details pane. Session lists use it; absent keeps two-line entries. */
+  rowLayout?: 'session-line'
+  /** Lines a `session-line` label may wrap onto; absent means one. Search
+   *  results give their summaries two. */
+  labelLines?: number
+  /** Ephemeral state for an output detail: undefined offset follows the tail. */
+  outputView?: {
+    scrollOffset?: number
+    returnToPrompt?: boolean
+  }
   /** Wraps up/down navigation between the first and last focusable items. */
   circularNavigation?: boolean
   /** Session id armed for deletion, awaiting a confirming second keypress.
    *  Keyed by id rather than index so an async list refresh or reorder cannot
    *  redirect the confirmation onto a different session. */
   pendingDeleteId?: string
+  /** What the armed keypress will do to `pendingDeleteId`. Absent means
+   *  delete; `unshare` removes only the cloud copy of a session. The confirming
+   *  key must match the arming one, so `u` then `d` re-arms rather than confirms. */
+  pendingDeleteKind?: 'delete' | 'unshare'
   /** Footer hints for this selector. When set, they replace the generic
    *  move/select/filter/close line; a focused row's own `hints` win over these. */
   hints?: Hint[]
@@ -66,6 +173,9 @@ export interface SelectorState {
    *  generic "No matching items", which would describe a filter some lists
    *  do not have. */
   emptyMessage?: string
+  /** What the filter searches, for its placeholder: "type to search <this>".
+   *  Absent: the session list's wording. */
+  searchHint?: string
   query: string
 }
 
@@ -204,7 +314,22 @@ export function selectorExpandItems(state: SelectorState, allItems: SelectorItem
       }
   if (!focused || focused.header) return next
   // Keep the row the user was looking at across an async catalog refresh.
-  return selectorFocusOn(next, item => focused.id ? item.id === focused.id : item.label === focused.label)
+  const exact = selectorFocusOn(next, item => focused.id ? item.id === focused.id : item.label === focused.label)
+  if (exact !== next || !focused.identity) return exact
+  // The exact row is gone, but the same thing may be listed under a new id
+  // (a catalog regrouped its providers). Follow it rather than jumping to
+  // the top, where Enter would pick something the user never looked at.
+  return selectorFocusOn(next, item => item.identity === focused.identity)
+}
+
+/** Replace one row in both the visible list and the unfiltered pool. */
+export function selectorReplaceItem(
+  state: SelectorState,
+  id: string,
+  nextItem: SelectorItem,
+): SelectorState {
+  const replace = (items: SelectorItem[]) => items.map(item => item.id === id ? nextItem : item)
+  return { ...state, items: replace(state.items), allItems: replace(state.allItems) }
 }
 
 export function selectorClearQuery(state: SelectorState): SelectorState {
@@ -473,6 +598,7 @@ function restoreGroupHeaders(allItems: SelectorItem[], matched: SelectorItem[]):
   const matchedGroups = new Set(matched.flatMap(item => item.group ? [item.group] : []))
   return allItems.flatMap(item => {
     if (item.header) return item.group && matchedGroups.has(item.group) ? [item] : []
+    if (item.expanded !== undefined && item.group && matchedGroups.has(item.group)) return [item]
     const hit = matchedByKey.get(item.id ?? item.label)
     return hit ? [hit] : []
   })

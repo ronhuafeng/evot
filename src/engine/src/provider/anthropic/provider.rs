@@ -8,8 +8,8 @@ use super::json_fallback;
 use super::request;
 use super::sse_decode;
 use crate::provider::error::*;
-use crate::provider::stream_http::StreamResponseKind;
-use crate::provider::stream_http::{self};
+use crate::provider::stream::http::StreamResponseKind;
+use crate::provider::stream::http::{self};
 use crate::provider::traits::*;
 
 const API_VERSION: &str = "2023-06-01";
@@ -22,6 +22,39 @@ impl StreamProvider for AnthropicProvider {
         &self,
         config: StreamConfig,
         tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.stream_sink(
+            config,
+            crate::provider::stream::sink::StreamSink::Legacy(tx),
+            cancel,
+        )
+        .await
+    }
+
+    async fn stream_bounded(
+        &self,
+        config: StreamConfig,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.stream_sink(
+            config,
+            crate::provider::stream::sink::StreamSink::Bounded {
+                tx,
+                cancel: cancel.clone(),
+            },
+            cancel,
+        )
+        .await
+    }
+}
+
+impl AnthropicProvider {
+    async fn stream_sink(
+        &self,
+        config: StreamConfig,
+        tx: crate::provider::stream::sink::StreamSink,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<StreamOutcome, ProviderError> {
         let is_oauth = config.api_key.contains("sk-ant-oat");
@@ -42,7 +75,7 @@ impl StreamProvider for AnthropicProvider {
             config.model, is_oauth, url
         );
 
-        let client = crate::provider::error::new_client()?;
+        let client = config.http_client()?;
         let mut builder = client.post(&url).header("content-type", "application/json");
 
         // Session identity for observability. Claude CLI carries this inside
@@ -81,23 +114,23 @@ impl StreamProvider for AnthropicProvider {
             }
         }
 
-        let builder = builder.json(&body);
-
-        // Send request and check HTTP status
-        let response = stream_http::send_stream_request(builder).await?;
-        let response = stream_http::check_error_status(response).await?;
+        // Send request (gzipped where the endpoint has said it accepts it) and check HTTP status
+        let response = http::send_json_stream_request(builder, &url, body).await?;
+        let response = http::check_error_status(response).await?;
 
         // Classify response by content-type
-        let kind = stream_http::classify_response(&response);
+        let kind = http::classify_response(&response);
         debug!("Anthropic response kind: {kind:?}");
 
         match kind {
             StreamResponseKind::Streaming => {
                 sse_decode::decode_sse_stream(response, tx, cancel, &config).await
             }
-            StreamResponseKind::Json => json_fallback::handle_json_response(response, tx, &config)
-                .await
-                .map(StreamOutcome::complete),
+            StreamResponseKind::Json => {
+                json_fallback::handle_json_response_sink(response, tx, &config)
+                    .await
+                    .map(StreamOutcome::complete)
+            }
             StreamResponseKind::Other(ct) => Err(ProviderError::Api(format!(
                 "Unexpected content type from Anthropic: {ct}"
             ))),

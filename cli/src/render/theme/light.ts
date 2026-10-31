@@ -23,6 +23,11 @@ export function lightTheme(): Theme {
 
     // Light counterpart of the dark selection fill: a pale periwinkle wash that
     // keeps the brand-hued label readable on a white background.
+    mutedHex: '#777777',
+    // Light mirror of the dark theme's gauge tone: on a light page an empty
+    // cell has to sit *above* muted to stay visible, not below it.
+    subtleHex: '#b8b8b8',
+    effortRampHex: ['#3f9142', '#8a9a1c', '#b07f12', '#d9741f', '#cb4b4b', '#8d4bb8'],
     selectionBgHex: '#dfe3fd',
     selectionMutedHex: '#5b6070',
 
@@ -30,15 +35,25 @@ export function lightTheme(): Theme {
     // The block flips to white text against it.
     cursorHex: '#3f9142',
     cursorFgHex: '#ffffff',
+    // Devin's light `--status-error`: deep enough to hold contrast on white.
+    errorHex: '#cb2431',
 
     // Pale periwinkle panel, a few points off white; diff rows a shade deeper.
     panelBg: '#eceef8',
-    // Pale washes of the same three families as the dark tool fills.
-    toolPendingBg: '#eceef5',
-    toolSuccessBg: '#e4f0eb',
-    toolErrorBg: '#f5e6e9',
+    panelFg: '#252a3a',
+    panelMutedFg: '#5b6070',
+    // One neutral tool fill, a pale wash a step off the panel.
+    toolCardBg: '#eceef5',
     diffAddedBg: '#d3ecdc',
     diffRemovedBg: '#f6d8dc',
+    // See dark.ts: changed tokens get a stronger fill instead of inverse video.
+    // Contrast against row tint / word fill: add 6.49 / 5.16, del 6.88 / 5.08.
+    diffAddedFg: '#0f5c2c',
+    diffRemovedFg: '#8f1424',
+    diffAddedWordBg: '#a9d9bd',
+    diffRemovedWordBg: '#f0b0bc',
+    diffGutterFg: '#7a8092',
+    diffContextFg: '#5b6070',
 
     text: plain,
     // See darkTheme: emphasis needs a hue, darker gold to hold contrast on white.

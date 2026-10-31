@@ -3,8 +3,8 @@
 //! The engine builds one `HostTool` per [`HostToolSpec`] the host registers.
 //! Its `execute` forwards the call over the [`HostBridge`] and maps the
 //! [`HostToolResponse`] back into a [`ToolResult`]. This is the single,
-//! reusable mechanism behind every host-owned tool (ask_user, plan, and any
-//! future domain tool) — the engine holds no tool-specific logic.
+//! reusable mechanism behind every host-owned tool (ask_user and any future
+//! domain tool) — the engine holds no tool-specific logic.
 
 use async_trait::async_trait;
 
@@ -52,6 +52,10 @@ impl AgentTool for HostTool {
         self.spec.name_aliases.clone()
     }
 
+    fn ends_turn(&self) -> bool {
+        self.spec.ends_turn
+    }
+
     async fn execute(
         &self,
         params: serde_json::Value,
@@ -66,7 +70,11 @@ impl AgentTool for HostTool {
         // Idle-clock accounting (excluding this wait from the execution
         // duration limit) is handled uniformly by the loop for every tool, so
         // there is nothing tool-specific to do here.
-        let response = self.host.execute_tool(call).await;
+        let response = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Err(ToolError::Cancelled),
+            response = self.host.execute_tool(call) => response,
+        };
 
         match response {
             Ok(resp) => {

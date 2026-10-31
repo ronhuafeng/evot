@@ -156,11 +156,87 @@ fn same_openai_responses_model_preserves_function_item_metadata() {
 }
 
 #[test]
+fn same_model_keeps_empty_thinking_that_carries_replay_payload() {
+    let details = vec![serde_json::json!({"type": "reasoning.encrypted", "data": "ENC"})];
+    let message = assistant("proxy", "gpt", vec![Content::Thinking {
+        thinking: String::new(),
+        metadata: Some(ThinkingMetadata::OpenAiCompletions {
+            field: ReasoningField::ReasoningContent,
+            details: Some(details.clone()),
+        }),
+    }]);
+
+    let transformed = transform_messages_for_model(
+        vec![message],
+        "proxy",
+        "gpt",
+        ApiProtocol::OpenAiCompletions,
+    );
+
+    assert!(matches!(
+        &transformed[0],
+        Message::Assistant { content, .. }
+            if matches!(&content[..], [Content::Thinking {
+                thinking,
+                metadata: Some(ThinkingMetadata::OpenAiCompletions { details: Some(kept), .. }),
+            }] if thinking.is_empty() && *kept == details)
+    ));
+}
+
+#[test]
+fn same_model_drops_empty_thinking_without_replay_payload() {
+    let message = assistant("proxy", "gpt", vec![Content::Thinking {
+        thinking: "   ".into(),
+        metadata: Some(ThinkingMetadata::completions_text_only(
+            ReasoningField::ReasoningContent,
+        )),
+    }]);
+
+    let transformed = transform_messages_for_model(
+        vec![message],
+        "proxy",
+        "gpt",
+        ApiProtocol::OpenAiCompletions,
+    );
+
+    assert!(matches!(
+        &transformed[0],
+        Message::Assistant { content, .. } if content.is_empty()
+    ));
+}
+
+#[test]
+fn cross_model_encrypted_only_thinking_is_dropped_not_replayed() {
+    let message = assistant("proxy", "old", vec![Content::Thinking {
+        thinking: String::new(),
+        metadata: Some(ThinkingMetadata::OpenAiCompletions {
+            field: ReasoningField::ReasoningContent,
+            details: Some(vec![
+                serde_json::json!({"type": "reasoning.encrypted", "data": "ENC"}),
+            ]),
+        }),
+    }]);
+
+    let transformed = transform_messages_for_model(
+        vec![message],
+        "proxy",
+        "new",
+        ApiProtocol::OpenAiCompletions,
+    );
+
+    assert!(matches!(
+        &transformed[0],
+        Message::Assistant { content, .. } if content.is_empty()
+    ));
+}
+
+#[test]
 fn cross_model_thinking_is_downgraded_to_text() {
     let message = assistant("openai", "old-model", vec![Content::Thinking {
         thinking: "useful plan".into(),
         metadata: Some(ThinkingMetadata::OpenAiCompletions {
             field: ReasoningField::ReasoningContent,
+            details: None,
         }),
     }]);
 
@@ -202,6 +278,49 @@ fn foreign_protocol_metadata_is_downgraded_even_when_names_match() {
 }
 
 #[test]
+fn placeholder_thinking_after_tools_stays_in_history_as_text() {
+    let message = assistant("openai", "gpt-5.6-sol", vec![
+        Content::Text {
+            text: "compare the two renderers".into(),
+        },
+        Content::ToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "rg thinking"}),
+            metadata: None,
+        },
+        Content::Thinking {
+            thinking: "...".into(),
+            metadata: Some(ThinkingMetadata::Anthropic {
+                signature: "sig".into(),
+            }),
+        },
+    ]);
+
+    let transformed = transform_messages_for_model(
+        vec![message],
+        "evot-pro-anthropic",
+        "deepseek-v4.1-flash",
+        ApiProtocol::AnthropicMessages,
+    );
+
+    assert!(matches!(
+        &transformed[0],
+        Message::Assistant { content, .. }
+            if matches!(
+                &content[..],
+                [
+                    Content::Text { text: opening },
+                    Content::ToolCall { id, .. },
+                    Content::Text { text: placeholder },
+                ] if opening == "compare the two renderers"
+                    && id == "call_1"
+                    && placeholder == "..."
+            )
+    ));
+}
+
+#[test]
 fn unsigned_same_model_thinking_is_downgraded_to_text() {
     let message = assistant("anthropic", "claude", vec![Content::Thinking {
         thinking: "plan".into(),
@@ -228,6 +347,7 @@ fn served_alias_does_not_downgrade_same_requested_model_thinking() {
         thinking: "plan".into(),
         metadata: Some(ThinkingMetadata::OpenAiCompletions {
             field: ReasoningField::ReasoningContent,
+            details: None,
         }),
     }]);
 
@@ -245,6 +365,7 @@ fn served_alias_does_not_downgrade_same_requested_model_thinking() {
                 thinking,
                 metadata: Some(ThinkingMetadata::OpenAiCompletions {
                     field: ReasoningField::ReasoningContent,
+                    details: None,
                 }),
             }] if thinking == "plan")
     ));

@@ -8,9 +8,9 @@ fn transcript_round_trip_preserves_ordered_assistant_blocks_and_provider_metadat
         content: vec![
             evot_engine::Content::Thinking {
                 thinking: "plan".into(),
-                metadata: Some(evot_engine::ThinkingMetadata::OpenAiCompletions {
-                    field: evot_engine::types::ReasoningField::Reasoning,
-                }),
+                metadata: Some(evot_engine::ThinkingMetadata::completions_text_only(
+                    evot_engine::types::ReasoningField::Reasoning,
+                )),
             },
             evot_engine::Content::ToolCall {
                 id: "call-1".into(),
@@ -33,10 +33,10 @@ fn transcript_round_trip_preserves_ordered_assistant_blocks_and_provider_metadat
         response_id: None,
     });
 
-    let transcript = evot::agent::run::convert::transcript_from_agent_message(&message);
+    let transcript = evot::conversation::convert::transcript_from_agent_message(&message);
     let serialized = serde_json::to_string(&transcript)?;
     let transcript: TranscriptItem = serde_json::from_str(&serialized)?;
-    let restored = evot::agent::run::convert::agent_message_from_transcript(&transcript);
+    let restored = evot::conversation::convert::agent_message_from_transcript(&transcript);
 
     assert!(matches!(
         restored,
@@ -52,6 +52,7 @@ fn transcript_round_trip_preserves_ordered_assistant_blocks_and_provider_metadat
             ] if thinking == "plan"
                 && matches!(metadata, Some(evot_engine::ThinkingMetadata::OpenAiCompletions {
                     field: evot_engine::types::ReasoningField::Reasoning,
+                    ..
                 }))
                 && id == "call-1"
                 && item_id == "fc-1"
@@ -86,7 +87,7 @@ fn legacy_responses_tool_ids_migrate_at_transcript_load_boundary() {
         },
     ];
 
-    let restored = evot::agent::run::convert::into_agent_messages(&items);
+    let restored = evot::conversation::convert::into_agent_messages(&items);
     assert!(matches!(
         &restored[..],
         [
@@ -480,6 +481,8 @@ fn run_event_deserialize_rejects_missing_fields() {
 
 use evot::gateway::channels::http::stream::map_run_event_json;
 use evot::gateway::channels::http::stream::session_event_json;
+use evot::observability::LlmCallMetrics;
+use evot::observability::UsageSummary;
 
 #[test]
 fn sse_session_event_identifies_follow_up_session() {

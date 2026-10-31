@@ -8,7 +8,7 @@ use super::request;
 use super::sse_decode;
 use crate::provider::error::ProviderError;
 use crate::provider::model::ModelConfig;
-use crate::provider::stream_http;
+use crate::provider::stream::http;
 use crate::provider::traits::*;
 
 pub struct OpenAiResponsesProvider;
@@ -19,6 +19,39 @@ impl StreamProvider for OpenAiResponsesProvider {
         &self,
         config: StreamConfig,
         tx: mpsc::UnboundedSender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.stream_sink(
+            config,
+            crate::provider::stream::sink::StreamSink::Legacy(tx),
+            cancel,
+        )
+        .await
+    }
+
+    async fn stream_bounded(
+        &self,
+        config: StreamConfig,
+        tx: mpsc::Sender<StreamEvent>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<StreamOutcome, ProviderError> {
+        self.stream_sink(
+            config,
+            crate::provider::stream::sink::StreamSink::Bounded {
+                tx,
+                cancel: cancel.clone(),
+            },
+            cancel,
+        )
+        .await
+    }
+}
+
+impl OpenAiResponsesProvider {
+    async fn stream_sink(
+        &self,
+        config: StreamConfig,
+        tx: crate::provider::stream::sink::StreamSink,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<StreamOutcome, ProviderError> {
         let model_config = config.model_config.as_ref().ok_or_else(|| {
@@ -34,7 +67,7 @@ impl StreamProvider for OpenAiResponsesProvider {
             config.model, url
         );
 
-        let mut response = send(&url, model_config, &config.api_key, &body).await?;
+        let mut response = send(&url, model_config, &config, body).await?;
 
         // A native compaction blob can become invalid after an upstream account
         // or compatibility boundary. On semantic client rejection, retry once
@@ -51,21 +84,21 @@ impl StreamProvider for OpenAiResponsesProvider {
                 let mut fallback = config.clone();
                 fallback.messages = messages;
                 let fallback_body = request::build_request_body(&fallback);
-                response = send(&url, model_config, &config.api_key, &fallback_body).await?;
+                response = send(&url, model_config, &fallback, fallback_body).await?;
             }
         }
 
-        let response = stream_http::check_error_status(response).await?;
-        match stream_http::classify_response(&response) {
-            stream_http::StreamResponseKind::Streaming => {
+        let response = http::check_error_status(response).await?;
+        match http::classify_response(&response) {
+            http::StreamResponseKind::Streaming => {
                 sse_decode::decode_sse_stream(response, tx, cancel, &config).await
             }
-            stream_http::StreamResponseKind::Json => Err(ProviderError::Api(
+            http::StreamResponseKind::Json => Err(ProviderError::Api(
                 "OpenAI Responses returned JSON for a streaming request".into(),
             )),
-            stream_http::StreamResponseKind::Other(content_type) => Err(ProviderError::Api(
-                format!("Unexpected content type from OpenAI Responses endpoint: {content_type}"),
-            )),
+            http::StreamResponseKind::Other(content_type) => Err(ProviderError::Api(format!(
+                "Unexpected content type from OpenAI Responses endpoint: {content_type}"
+            ))),
         }
     }
 }
@@ -73,17 +106,23 @@ impl StreamProvider for OpenAiResponsesProvider {
 async fn send(
     url: &str,
     model_config: &ModelConfig,
-    api_key: &str,
-    body: &serde_json::Value,
+    config: &StreamConfig,
+    body: serde_json::Value,
 ) -> Result<reqwest::Response, ProviderError> {
-    let client = crate::provider::error::new_client()?;
+    let client = config.http_client()?;
     let mut builder = client
         .post(url)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .header("authorization", format!("Bearer {api_key}"));
+        .header("authorization", format!("Bearer {}", config.api_key));
+    // Preserve session identity even when the body omits prompt_cache_key.
+    if let Some(session_id) = config.prompt_cache_key.as_deref() {
+        if !session_id.is_empty() {
+            builder = builder.header("session-id", session_id);
+        }
+    }
     for (key, value) in model_config.headers() {
         builder = builder.header(key, value);
     }
-    stream_http::send_stream_request(builder.json(body)).await
+    http::send_json_stream_request(builder, url, body).await
 }

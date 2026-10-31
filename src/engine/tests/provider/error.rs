@@ -148,6 +148,45 @@ fn classify_overloaded_message_without_status() {
 }
 
 #[test]
+fn classify_model_not_found_is_not_retryable() {
+    // A standard model-not-found signal remains fatal even with a retry hint.
+    let message = "HTTP 404: model_not_found: Model not found.";
+    let err = ProviderError::classify_with_hints(404, message, Some(true));
+    assert!(matches!(err, ProviderError::ModelNotFound(_)));
+    assert!(!evotengine::retry::should_retry(&err));
+    assert!(err.to_string().contains("Model not found."));
+}
+
+#[test]
+fn classify_outdated_client_version_is_not_retryable() {
+    // The backend refuses this client version until the proxy is updated; a
+    // retry cannot change either side of that negotiation.
+    let message = "HTTP 400: invalid_request_error: Unsupported operation.";
+    let err = ProviderError::classify(400, message);
+    assert!(matches!(err, ProviderError::Other(_)));
+    assert!(!evotengine::retry::should_retry(&err));
+}
+
+#[test]
+fn configuration_gap_stream_error_is_not_retryable() {
+    // Same semantics when the proxy surfaces the gap inside an accepted (2xx)
+    // stream instead of a non-2xx response.
+    let payload = r#"{"type":"response.failed","response":{"error":{"code":"model_not_found","message":"Not available"}}}"#;
+    let err = classify_sse_error_event(payload);
+    assert!(matches!(err, ProviderError::ModelNotFound(_)));
+    assert!(!evotengine::retry::should_retry(&err));
+}
+
+#[test]
+fn unrelated_503_stays_retryable() {
+    // Carving configuration errors out of 5xx must not swallow genuine
+    // upstream outages, which still recover through the retry budget.
+    let err = ProviderError::classify(503, "upstream temporarily unavailable");
+    assert!(matches!(err, ProviderError::Transient { .. }));
+    assert!(evotengine::retry::should_retry(&err));
+}
+
+#[test]
 fn empty_response_api_error_is_retryable() {
     // Both SSE decoders surface an empty 200 (no content, no usage) as an Api
     // error. It is a transient provider/proxy defect and must retry, matching
@@ -198,9 +237,9 @@ fn kiro_api_error_is_structurally_retryable() {
 #[test]
 fn structured_invalid_request_error_remains_non_retryable() {
     let err = classify_sse_error_event(
-        r#"{"type":"error","error":{"type":"invalid_request_error","message":"missing required field"}}"#,
+        r#"{"type":"error","error":{"type":"invalid_request_error","message":"missing required field; please retry"}}"#,
     );
-    assert!(matches!(err, ProviderError::Api(_)));
+    assert!(matches!(err, ProviderError::InvalidRequest(_)));
     assert!(!evotengine::retry::should_retry(&err));
 }
 
@@ -400,7 +439,7 @@ fn non_overflow_messages() {
 #[test]
 fn classify_404_not_retryable() {
     let err = ProviderError::classify(404, "model not found");
-    assert!(matches!(err, ProviderError::Other(_)));
+    assert!(matches!(err, ProviderError::ModelNotFound(_)));
     assert!(!evotengine::retry::should_retry(&err));
 }
 
@@ -551,4 +590,30 @@ fn transport_detail_strips_docs_rs_reference() {
         detail,
         "peer closed connection without sending TLS close_notify (url: https://example.com/v1/messages)"
     );
+}
+
+#[test]
+fn content_filter_codes_are_refusals_and_plain_invalid_requests_are_not() {
+    use evotengine::provider::stream::http::classify_json_error;
+
+    for value in [
+        serde_json::json!({"error": {"message": "filtered", "code": "content_filter"}}),
+        serde_json::json!({"error": {
+            "message": "filtered",
+            "type": "invalid_request_error",
+            "innererror": {"code": "ResponsibleAIPolicyViolation"}
+        }}),
+    ] {
+        let error = classify_json_error(&value);
+        assert!(is_refusal_message(&error.to_string()), "{value}");
+        assert!(!evotengine::retry::should_retry(&error));
+    }
+
+    // Message wording alone never classifies a refusal.
+    let plain = classify_json_error(&serde_json::json!({"error": {
+        "message": "content_filter mentioned in text",
+        "type": "invalid_request_error"
+    }}));
+    assert!(matches!(plain, ProviderError::InvalidRequest(_)));
+    assert!(!is_refusal_message(&plain.to_string()));
 }

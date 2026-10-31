@@ -11,8 +11,6 @@ use async_trait::async_trait;
 
 use super::Storage;
 use crate::error::Result;
-use crate::search::collect_search_text;
-use crate::search::collect_user_prompts;
 use crate::search::SessionWithText;
 use crate::types::ListSessions;
 use crate::types::ListTranscriptEntries;
@@ -26,7 +24,6 @@ use crate::types::VariableRecord;
 pub struct MemoryStorage {
     sessions: Mutex<HashMap<String, SessionMeta>>,
     entries: Mutex<Vec<TranscriptEntry>>,
-    favorites: Mutex<Vec<String>>,
 }
 
 impl Default for MemoryStorage {
@@ -40,18 +37,54 @@ impl MemoryStorage {
         Self {
             sessions: Mutex::new(HashMap::new()),
             entries: Mutex::new(Vec::new()),
-            favorites: Mutex::new(Vec::new()),
         }
     }
 }
 
 #[async_trait]
 impl Storage for MemoryStorage {
-    async fn save_session(&self, session: SessionMeta) -> Result<()> {
-        if let Ok(mut map) = self.sessions.lock() {
-            map.insert(session.session_id.clone(), session);
+    async fn save_session(&self, mut session: SessionMeta) -> Result<()> {
+        let mut map = self
+            .sessions
+            .lock()
+            .map_err(|e| crate::error::EvotError::Store(e.to_string()))?;
+        if let Some(current) = map.get(&session.session_id) {
+            session.custom_title = current.custom_title.clone();
+            session.cloud = current.cloud.clone();
         }
+        session.schema_version = 1;
+        map.insert(session.session_id.clone(), session);
         Ok(())
+    }
+
+    async fn rename_session(&self, session_id: &str, title: &str) -> Result<SessionMeta> {
+        let title = super::session_title::validate(title)?;
+        let mut map = self
+            .sessions
+            .lock()
+            .map_err(|e| crate::error::EvotError::Store(e.to_string()))?;
+        let session = map
+            .get_mut(session_id)
+            .ok_or_else(|| crate::error::EvotError::Session("session no longer exists".into()))?;
+        session.custom_title = Some(title);
+        session.schema_version = 1;
+        Ok(session.clone())
+    }
+
+    async fn set_session_cloud(
+        &self,
+        session_id: &str,
+        cloud: Option<crate::types::CloudSync>,
+    ) -> Result<SessionMeta> {
+        let mut map = self
+            .sessions
+            .lock()
+            .map_err(|e| crate::error::EvotError::Store(e.to_string()))?;
+        let session = map
+            .get_mut(session_id)
+            .ok_or_else(|| crate::error::EvotError::Session("session no longer exists".into()))?;
+        session.cloud = cloud;
+        Ok(session.clone())
     }
 
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionMeta>> {
@@ -186,22 +219,6 @@ impl Storage for MemoryStorage {
         Ok((false, vec![]))
     }
 
-    async fn load_favorites(&self) -> Result<Vec<String>> {
-        Ok(self
-            .favorites
-            .lock()
-            .ok()
-            .map(|f| f.clone())
-            .unwrap_or_default())
-    }
-
-    async fn save_favorites(&self, ids: Vec<String>) -> Result<()> {
-        if let Ok(mut f) = self.favorites.lock() {
-            *f = ids;
-        }
-        Ok(())
-    }
-
     async fn list_sessions_with_text(&self, limit: usize) -> Result<Vec<SessionWithText>> {
         let sessions = self
             .list_sessions(ListSessions {
@@ -210,34 +227,41 @@ impl Storage for MemoryStorage {
             })
             .await?;
 
-        let entries: Vec<TranscriptEntry> = self
-            .entries
-            .lock()
-            .ok()
-            .map(|e| e.clone())
-            .unwrap_or_default();
-
         let mut result = Vec::new();
         for session in sessions {
-            let session_entries: Vec<_> = entries
-                .iter()
-                .filter(|entry| entry.session_id == session.session_id)
-                .cloned()
-                .collect();
+            let session_entries = self.session_entries(&session.session_id);
             if session.turns == 0 && session.title.is_none() && session_entries.is_empty() {
                 continue;
             }
-            let search_text = collect_search_text(&session, &session_entries);
-            result.push(SessionWithText {
-                session,
-                search_text,
-                user_prompts: collect_user_prompts(&session_entries),
-            });
+            result.push(SessionWithText::extract(session, &session_entries));
             if limit > 0 && result.len() == limit {
                 break;
             }
         }
 
         Ok(result)
+    }
+
+    async fn session_with_text(&self, session_id: &str) -> Result<Option<SessionWithText>> {
+        let Some(session) = self.get_session(session_id).await? else {
+            return Ok(None);
+        };
+        let entries = self.session_entries(session_id);
+        Ok(Some(SessionWithText::extract(session, &entries)))
+    }
+}
+
+impl MemoryStorage {
+    fn session_entries(&self, session_id: &str) -> Vec<TranscriptEntry> {
+        self.entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| entry.session_id == session_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }

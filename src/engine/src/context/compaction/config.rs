@@ -63,6 +63,12 @@ pub struct CompactionConfig {
     pub summary_max_bytes: usize,
 }
 
+/// Share of the window at which the mid-run prune branch becomes active.
+pub const PRUNE_TRIGGER_PERCENT: usize = 60;
+/// Share of the window at which a finished run summarizes proactively. The
+/// user is not waiting at run end, so compacting there hides the summary
+/// latency that a pre-prompt compaction would put in front of the next reply.
+pub const POST_TURN_TRIGGER_PERCENT: usize = 80;
 /// Tokens reserved for output + system prompt + tool defs. This is a fixed
 /// fallback for models without an explicit profile threshold.
 pub const DEFAULT_RESERVE_TOKENS: usize = 16_384;
@@ -162,6 +168,20 @@ impl CompactionConfig {
             .saturating_sub(output_headroom)
             .saturating_mul(ESTIMATED_BYTES_PER_TOKEN)
             .min(SUMMARIZER_INPUT_MAX_BYTES)
+    }
+
+    /// Context size from which the judge is asked mid-run and its pending
+    /// verdicts applied once they pay for the cache miss. Well below the
+    /// summary threshold: a prune is lossless, so there is nothing to gain by
+    /// waiting, and a context kept trimmed here rarely reaches the summary.
+    pub fn prune_trigger_threshold(&self) -> usize {
+        self.context_window / 100 * PRUNE_TRIGGER_PERCENT
+    }
+
+    /// Summary threshold applied when a run has finished: never above the
+    /// mid-run threshold, so an explicit `trigger_tokens` stays authoritative.
+    pub fn post_turn_trigger_threshold(&self) -> usize {
+        (self.context_window / 100 * POST_TURN_TRIGGER_PERCENT).min(self.trigger_threshold())
     }
 
     /// Token threshold that triggers compaction.

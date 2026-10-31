@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use evot::agent::session::Session;
+use evot::observability::UsageSummary;
+use evot::sessions::Session;
 use evot::storage::MemoryStorage;
 use evot::types::ListSessions;
 use evot::types::*;
@@ -32,6 +33,7 @@ fn assistant(text: &str) -> TranscriptItem {
 
 fn user(text: &str) -> TranscriptItem {
     TranscriptItem::User {
+        provenance: None,
         text: text.into(),
         content: vec![],
     }
@@ -52,6 +54,7 @@ async fn search_text_includes_transcript_content() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "how do I configure the retry budget".into(),
                 content: vec![],
             },
@@ -225,29 +228,6 @@ async fn list_sessions_with_text_respects_limit_after_draft_filtering() -> TestR
 }
 
 #[tokio::test]
-async fn favorites_persist_across_storage() -> TestResult {
-    let storage: Arc<dyn evot::storage::Storage> = Arc::new(MemoryStorage::new());
-
-    // Empty by default.
-    assert!(storage.load_favorites().await?.is_empty());
-
-    // Saving a set round-trips.
-    storage
-        .save_favorites(vec!["fav-a".into(), "fav-b".into()])
-        .await?;
-    let ids = storage.load_favorites().await?;
-    assert_eq!(ids.len(), 2);
-    assert!(ids.contains(&"fav-a".to_string()));
-    assert!(ids.contains(&"fav-b".to_string()));
-
-    // Overwrite replaces rather than appends.
-    storage.save_favorites(vec!["fav-c".into()]).await?;
-    let ids = storage.load_favorites().await?;
-    assert_eq!(ids, vec!["fav-c".to_string()]);
-    Ok(())
-}
-
-#[tokio::test]
 async fn delete_session_removes_only_target() -> TestResult {
     let storage: Arc<dyn evot::storage::Storage> = Arc::new(MemoryStorage::new());
 
@@ -287,9 +267,11 @@ async fn delete_session_removes_only_target() -> TestResult {
 /// recent list, armed delete, and highlighted match snippets.
 #[test]
 fn chat_page_embeds_session_navigation() {
-    let html = include_str!("../src/gateway/channels/http/static/index.html");
-    let js = include_str!("../src/gateway/channels/http/static/ui/chat.js");
-    assert!(html.contains("id=\"recentSessions\""));
+    let html = include_str!("../assets/console/index.html");
+    let js = include_str!("../assets/console/ui/chat.js");
+    let rail = include_str!("../assets/console/ui/rail.js");
+    assert!(rail.contains("id=\"recentSessions\""));
+    assert!(html.contains("data-mode=\"chat\""));
     assert!(html.contains("id=\"searchOverlay\""));
     assert!(html.contains("id=\"modelSelect\""));
     assert!(html.contains("id=\"thinkingSelect\""));
@@ -433,5 +415,108 @@ async fn user_prompts_keep_the_latest_turns_of_a_long_session() -> TestResult {
     assert!(row.user_prompts.len() <= 24);
     assert_eq!(row.user_prompts.last().map(String::as_str), Some("turn 79"));
     assert!(!row.user_prompts.iter().any(|p| p == "turn 0"));
+    // The opening ask survives the trim: it is what the session set out to do.
+    assert_eq!(row.first_prompt.as_deref(), Some("turn 0"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_paths_come_from_edit_and_write_calls_in_first_seen_order() -> TestResult {
+    let storage: Arc<dyn evot::storage::Storage> = Arc::new(MemoryStorage::new());
+    let session = Session::new(
+        "prompts-sess-005".into(),
+        "/tmp/proj".into(),
+        "test-model".into(),
+        storage.clone(),
+    )
+    .await?;
+
+    let call = |id: &str, name: &str, input: serde_json::Value| AssistantBlock::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        input,
+        metadata: None,
+    };
+    session
+        .write_items(vec![
+            user("fix the parser"),
+            assistant_with_blocks(vec![
+                call("c1", "read", serde_json::json!({"path": "src/lib.rs"})),
+                call(
+                    "c2",
+                    "edit",
+                    serde_json::json!({"path": "src/parser.rs", "edits": []}),
+                ),
+                call("c3", "bash", serde_json::json!({"command": "cargo test"})),
+            ]),
+            assistant_with_blocks(vec![
+                call(
+                    "c4",
+                    "write",
+                    serde_json::json!({"file_path": "tests/parser.rs", "content": ""}),
+                ),
+                call("c5", "edit", serde_json::json!({"path": "src/parser.rs"})),
+                call("c6", "edit", serde_json::json!({"path": "   "})),
+            ]),
+        ])
+        .await?;
+
+    let rows = storage.list_sessions_with_text(10).await?;
+    let row = rows
+        .iter()
+        .find(|r| r.session.session_id == "prompts-sess-005")
+        .ok_or("session not returned")?;
+
+    // Reads and shell commands are not changes; repeats and blank paths drop out.
+    assert_eq!(row.changed_paths, vec!["src/parser.rs", "tests/parser.rs"]);
+    assert_eq!(row.first_prompt.as_deref(), Some("fix the parser"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn focused_session_text_matches_catalog_for_both_backends() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let stores: Vec<Arc<dyn evot::storage::Storage>> = vec![
+        Arc::new(MemoryStorage::new()),
+        Arc::new(evot::storage::fs::FsStorage::new(dir.path().to_path_buf())),
+    ];
+    for storage in stores {
+        let id = uuid::Uuid::now_v7().to_string();
+        let session = Session::new(
+            id.clone(),
+            "/tmp/proj".into(),
+            "model".into(),
+            storage.clone(),
+        )
+        .await?;
+        session
+            .write_items(vec![
+                user("first ask"),
+                assistant("reply"),
+                user("latest ask"),
+            ])
+            .await?;
+        let focused = storage
+            .session_with_text(&id)
+            .await?
+            .ok_or("missing focused row")?;
+        let catalog = storage.list_sessions_with_text(0).await?;
+        let listed = catalog
+            .iter()
+            .find(|row| row.session.session_id == id)
+            .ok_or("missing listed row")?;
+        // Fs listings derive recency from transcript mtime; direct reads keep
+        // the saved timestamp. Extracted transcript fields must still match.
+        assert_eq!(focused.search_text, listed.search_text);
+        assert_eq!(focused.user_prompts, listed.user_prompts);
+        assert_eq!(focused.first_prompt, listed.first_prompt);
+        assert_eq!(focused.changed_paths, listed.changed_paths);
+        assert_eq!(focused.first_prompt.as_deref(), Some("first ask"));
+        assert_eq!(focused.user_prompts, vec!["first ask", "latest ask"]);
+        assert!(storage
+            .session_with_text(&uuid::Uuid::now_v7().to_string())
+            .await?
+            .is_none());
+    }
     Ok(())
 }

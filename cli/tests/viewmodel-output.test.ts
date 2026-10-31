@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll } from 'bun:test'
-import { buildOutputBlocks } from '../src/term/viewmodel/output.js'
+import { buildOutputBlocks, THINKING_FOLD_ROWS } from '../src/term/viewmodel/output.js'
 import { blocksToLines, styledLineToAnsi, paintBackground, line, colored, dim } from '../src/term/viewmodel/types.js'
-import { buildUserMessage, buildAssistantLines, buildToolCard, type OutputLine } from '../src/render/output.js'
+import { buildUserMessage, buildAssistantLines, buildToolCard, buildEventCard, buildPrivacyCard, buildPrivacyActionCard, buildPrivacyHappeningCard, type OutputLine } from '../src/render/output.js'
 import { getTheme } from '../src/render/theme/index.js'
 import { assistantMessageToOutputLines } from '../src/render/assistant.js'
 import { colorizeUnifiedDiff } from '../src/render/diff.js'
@@ -75,7 +75,7 @@ describe('buildOutputBlocks', () => {
   test('a timestamped user message shows the clock above the text', () => {
     const at = new Date(2026, 7, 31, 18, 11).getTime()
     const rows = contentRows(renderPlain([{ id: 'u1', kind: 'user', text: 'hello', timestamp: at }]))
-    expect(rows[0]).toBe('┃ [06:11 PM]')
+    expect(rows[0]).toBe('┃ [18:11:00]')
     expect(rows[1]).toBe('┃ hello')
   })
 
@@ -85,7 +85,7 @@ describe('buildOutputBlocks', () => {
       [{ id: 'u1', kind: 'user', text: 'a'.repeat(40), timestamp: at }],
       20,
     ).split('\n').slice(1)
-    expect(stripAnsi(rendered[1]!).trimEnd()).toBe('┃ [06:05 AM]')
+    expect(stripAnsi(rendered[1]!).trimEnd()).toBe('┃ [06:05:00]')
     for (const row of rendered) expect(stringWidth(stripAnsi(row))).toBe(20)
   })
 
@@ -126,23 +126,21 @@ describe('buildOutputBlocks', () => {
   test('thinking body is muted, not dim-italic, and sits on the text column', () => {
     const output = assistantMessageToOutputLines([
       { type: 'thinking', contentIndex: 0, text: 'Planning the change' },
-    ])
+    ], false, { streaming: true })
     const rendered = blocksToLines(buildOutputBlocks(output)).join('\n')
     expect(rendered).not.toContain('\x1b[3m')
     expect(rendered).toContain(getTheme().thinkText.paint('Planning the change'))
     expect(stripAnsi(rendered)).toContain('✻ Planning the change')
   })
 
-  test('reasoning is shown in full, never collapsed behind a summary row', () => {
-    const plain = renderPlainWithColumns(assistantMessageToOutputLines([
-      { type: 'thinking', contentIndex: 0, text: 'line one\n\nline two' },
-    ]), 40)
-    expect(plain).toContain('line one')
-    expect(plain).toContain('line two')
-    // No `Thought`/`Thinking…` header row: a sub-second reasoning block reported
-    // a meaningless duration, and the summary row hid the useful part.
-    expect(plain).not.toContain('Thought')
-    expect(plain).not.toContain('Thinking')
+  test('a finished short thought keeps its original row and position', () => {
+    const blocks = [{ type: 'thinking' as const, contentIndex: 0, text: 'line one' }]
+    const live = renderPlainWithColumns(assistantMessageToOutputLines(blocks, false, { streaming: true }), 40)
+    expect(live).toContain('✻ line one')
+    const done = renderPlainWithColumns(assistantMessageToOutputLines(blocks), 40)
+    expect(done).toBe(live)
+    expect(done).not.toContain('ctrl+o')
+    expect(renderPlainWithColumns(assistantMessageToOutputLines(blocks, true), 40)).toBe(done)
   })
 
   test('reasoning leads with an accent ✻ and indents continuations', () => {
@@ -175,23 +173,164 @@ describe('buildOutputBlocks', () => {
     for (const line of lines) expect(stringWidth(line)).toBeLessThanOrEqual(40)
   })
 
-  test('thinking to text transition has the same blank-line boundary before commit', () => {
+  test('once the answer starts, the thought stays and the answer keeps its block margin', () => {
     const output = assistantMessageToOutputLines([
       { type: 'thinking', contentIndex: 0, text: 'Investigating config' },
       { type: 'text', contentIndex: 1, text: 'Visible answer' },
     ])
     const plain = stripAnsi(blocksToLines(buildOutputBlocks(output)).join('\n'))
-
-    expect(plain).toContain('✻ Investigating config\n\n⏺ Visible answer')
+    expect(plain).toBe('\n✻ Investigating config\n\n⏺ Visible answer')
   })
 
-  test('a streaming block renders the same as a finished one', () => {
+  test('a short block stays in full with no fold hint after streaming finishes', () => {
     const blocks = [{ type: 'thinking' as const, contentIndex: 0, text: 'line one\n\nline two' }]
     const live = renderPlainWithColumns(assistantMessageToOutputLines(blocks, false, { streaming: true }), 40)
+    expect(live).toContain('✻ line one')
+    expect(live).toContain('line two')
+    expect(live).not.toContain('ctrl+o')
     const done = renderPlainWithColumns(assistantMessageToOutputLines(blocks), 40)
-    expect(live).toBe(done)
-    expect(done).toContain('✻ line one')
-    expect(done).toContain('line two')
+    expect(done).toBe(live)
+  })
+
+  describe('long reasoning folds', () => {
+    const longText = Array.from({ length: 20 }, (_, i) => `reasoning row ${i + 1}`).join('\n\n')
+    const longBlock = [{ type: 'thinking' as const, contentIndex: 0, text: longText }]
+    const rowsOf = (plain: string) => plain.split('\n').filter(row => row.length > 0)
+
+    test('while streaming, a tail window scrolls in place and stays THINKING_FOLD_ROWS tall', () => {
+      const plain = renderPlainWithColumns(assistantMessageToOutputLines(longBlock, false, { streaming: true }), 80)
+      const rows = rowsOf(plain)
+      expect(rows).toHaveLength(THINKING_FOLD_ROWS)
+      // The header counts what scrolled out; the newest rows stay visible.
+      expect(rows[0]).toMatch(/^✻ ↑ \d+ rows \(ctrl\+o\)$/)
+      expect(plain).toContain('reasoning row 20')
+      expect(plain).not.toContain('reasoning row 1\n')
+
+      // A delta that grows the block does not grow the window.
+      const grown = [{ ...longBlock[0]!, text: `${longText}\n\nreasoning row 21` }]
+      const next = renderPlainWithColumns(assistantMessageToOutputLines(grown, false, { streaming: true }), 80)
+      expect(rowsOf(next)).toHaveLength(THINKING_FOLD_ROWS)
+      expect(next).toContain('reasoning row 21')
+    })
+
+    test('once finished, the exact last window stays visible', () => {
+      const live = renderPlainWithColumns(assistantMessageToOutputLines(longBlock, false, { streaming: true }), 80)
+      const done = renderPlainWithColumns(assistantMessageToOutputLines(longBlock), 80)
+      expect(done).toBe(live)
+      expect(rowsOf(done)).toEqual(['✻ ↑ 18 rows (ctrl+o)', '  reasoning row 19', '  reasoning row 20'])
+    })
+
+    test('the answer follows the retained window on its own block margin', () => {
+      const plain = renderPlainWithColumns(assistantMessageToOutputLines([
+        ...longBlock,
+        { type: 'text' as const, contentIndex: 1, text: 'Visible answer' },
+      ]), 80)
+      const window = renderPlainWithColumns(assistantMessageToOutputLines(longBlock), 80)
+      expect(plain).toBe(`${window}\n\n⏺ Visible answer`)
+    })
+
+    test('ctrl+o (expanded) lifts the fold in both live and finished views', () => {
+      for (const streaming of [true, false]) {
+        const plain = renderPlainWithColumns(assistantMessageToOutputLines(longBlock, true, { streaming }), 80)
+        expect(plain).toContain('reasoning row 1')
+        expect(plain).toContain('reasoning row 20')
+        expect(plain).not.toContain('ctrl+o')
+        expect(plain).not.toContain('Thought')
+        expect(rowsOf(plain).length).toBeGreaterThan(THINKING_FOLD_ROWS)
+      }
+    })
+
+    test('both live and finished folds count visual rows after CJK wrapping and resize', () => {
+      const wide = [{ type: 'thinking' as const, contentIndex: 0, text: '我们需要仔细检查每一个渲染路径的宽度计算以及换行行为'.repeat(4) }]
+      for (const columns of [24, 40, 80]) {
+        const live = rowsOf(renderPlainWithColumns(assistantMessageToOutputLines(wide, false, { streaming: true }), columns))
+        expect(live).toHaveLength(THINKING_FOLD_ROWS)
+        for (const row of live) expect(stringWidth(row)).toBeLessThanOrEqual(columns)
+        const done = rowsOf(renderPlainWithColumns(assistantMessageToOutputLines(wide), columns))
+        expect(done).toEqual(live)
+      }
+    })
+
+    test('both views keep the row budget: at the budget nothing folds, one row over folds', () => {
+      const rowsText = (n: number) => Array.from({ length: n }, (_, i) => `row ${i + 1}`).join('\n\n')
+      for (const streaming of [true, false]) {
+        const atBudget = renderPlainWithColumns(assistantMessageToOutputLines(
+          [{ type: 'thinking', contentIndex: 0, text: rowsText(THINKING_FOLD_ROWS) }], false, { streaming }), 80)
+        expect(rowsOf(atBudget)).toHaveLength(THINKING_FOLD_ROWS)
+        expect(atBudget).not.toContain('ctrl+o')
+        const overBudget = renderPlainWithColumns(assistantMessageToOutputLines(
+          [{ type: 'thinking', contentIndex: 0, text: rowsText(THINKING_FOLD_ROWS + 1) }], false, { streaming }), 80)
+        expect(rowsOf(overBudget)).toHaveLength(THINKING_FOLD_ROWS)
+        expect(overBudget).toContain('ctrl+o')
+      }
+    })
+
+    test('a tool call landing after live reasoning keeps the reasoning window in place', () => {
+      const live = renderPlainWithColumns(assistantMessageToOutputLines(longBlock, false, { streaming: true }), 80)
+      const after = assistantMessageToOutputLines([
+        ...longBlock,
+        { type: 'tool_call', contentIndex: 1, toolCall: { id: 'c', name: 'read', args: { path: 'a' }, status: 'running' } },
+      ], false, { streaming: true })
+      const plain = renderPlainWithColumns(after, 80)
+      expect(plain.startsWith(`${live}\n\n`)).toBe(true)
+      expect(plain).toContain('◫ read')
+    })
+
+    test('real text appends below reasoning, while empty deltas leave its tail untouched', () => {
+      const tight = Array.from({ length: 20 }, (_, i) => `reasoning row ${i + 1}`).join('\n')
+      const heightAndRows = (text: string) => renderPlainWithColumns(assistantMessageToOutputLines([
+        { type: 'thinking' as const, contentIndex: 0, text: tight },
+        { type: 'text' as const, contentIndex: 1, text },
+      ], false, { streaming: true }), 80).split('\n')
+      const live = heightAndRows('')
+      expect(live).toHaveLength(1 + THINKING_FOLD_ROWS)
+      expect(live[1]).toBe('✻ ↑ 18 rows (ctrl+o)')
+
+      expect(heightAndRows('   ')).toEqual(live)
+      const one = heightAndRows('Visible')
+      expect(one).toEqual([...live, '', '⏺ Visible'])
+
+      // Growing the answer never rewrites or removes the reasoning window.
+      const three = heightAndRows('Visible\n\nanswer')
+      expect(three).toEqual([...live, '', '⏺ Visible', '', '  answer'])
+
+      // From here the region only grows.
+      expect(heightAndRows('Visible\n\nanswer\n\nmore').length).toBeGreaterThan(three.length)
+    })
+
+    test('earlier reasoning windows stay visible while later blocks stream', () => {
+      const plain = renderPlainWithColumns(assistantMessageToOutputLines([
+        { type: 'thinking' as const, contentIndex: 0, text: longText },
+        { type: 'text' as const, contentIndex: 1, text: 'first' },
+        { type: 'thinking' as const, contentIndex: 2, text: 'again' },
+        { type: 'text' as const, contentIndex: 3, text: 'second' },
+      ], false, { streaming: true }), 80)
+      expect(plain).toContain('reasoning row 20')
+      expect(plain.indexOf('reasoning row 20')).toBeLessThan(plain.indexOf('⏺ first'))
+      expect(plain.indexOf('⏺ first')).toBeLessThan(plain.indexOf('✻ again'))
+      expect(plain.indexOf('✻ again')).toBeLessThan(plain.indexOf('⏺ second'))
+    })
+
+    test('adjacent reasoning blocks retain independent windows in compact and expanded views', () => {
+      const content = [
+        ...longBlock,
+        { type: 'thinking' as const, contentIndex: 1, text: longText.replaceAll('reasoning', 'next') },
+      ]
+      for (const streaming of [true, false]) {
+        for (const expanded of [true, false]) {
+          const plain = renderPlainWithColumns(assistantMessageToOutputLines(content, expanded, { streaming }), 80)
+          expect(plain).toContain('reasoning row 20')
+          expect(plain).toContain('next row 20')
+          expect(rowsOf(plain).filter(row => row.startsWith('✻ '))).toHaveLength(2)
+          if (expanded) {
+            expect(plain).toContain('reasoning row 1\n')
+            expect(plain).toContain('next row 1\n')
+          } else {
+            expect(rowsOf(plain)).toHaveLength(2 * THINKING_FOLD_ROWS)
+          }
+        }
+      }
+    })
   })
 
   test('ordered renderer preserves thinking tool text positions', () => {
@@ -206,6 +345,7 @@ describe('buildOutputBlocks', () => {
     ])
     const plain = stripAnsi(blocksToLines(buildOutputBlocks(output)).join('\n'))
 
+    expect(plain).toContain('✻ plan')
     expect(plain.indexOf('✻ plan')).toBeLessThan(plain.indexOf('read'))
     expect(plain.indexOf('read')).toBeLessThan(plain.indexOf('⏺ answer'))
   })
@@ -220,6 +360,39 @@ describe('buildOutputBlocks', () => {
     expect(lines[toolIdx - 1]).toBe('')
   })
 
+  test('a privacy card wears the accent rail on every row; a tool card keeps a blank border cell', () => {
+    const { accentHex, toolCardBg } = getTheme()
+    const tool = buildOutputBlocks(buildToolCard({ id: 't', name: 'bash', args: { command: 'ls' }, status: 'running' }), { columns: 60 })
+    for (const l of tool.flatMap(b => b.lines)) expect(l.spans[0]).toEqual({ text: ' ' })
+    const notice = buildOutputBlocks(buildPrivacyHappeningCard({ target: 'llm', reason: 'masked SECRET ×1' }, 1), { columns: 60 })
+    const rows = notice.flatMap(b => b.lines)
+    // Padding rows above and below are railed too, so the slab reads as one.
+    expect(rows.length).toBe(5)
+    for (const l of rows) {
+      expect(l.spans[0]).toEqual({ text: '┃', hex: accentHex })
+      expect(l.bg).toBe(toolCardBg)
+    }
+    // The glyph and status keep the shared scheme: the rail is the signal.
+    expect(rows[1]!.spans[2]).toMatchObject({ text: '⊘', fg: 'cyan' })
+    expect(rows[2]!.spans[2]).toMatchObject({ text: '  ✓', fg: 'green' })
+    // Stops and `/privacy` actions are notices as well.
+    expect(buildPrivacyCard({ kind: 'blocked', target: 'request', kinds: ['API_KEY'] })[0]!.toolCard?.tone).toBe('notice')
+    expect(buildPrivacyActionCard('term x', '  term added: x')[0]!.toolCard?.tone).toBe('notice')
+  })
+
+  test('jev prune card has space above it', () => {
+    const result = renderPlain([
+      { id: 'a1', kind: 'assistant', text: 'text' },
+      ...buildEventCard('[JEV] ✂ · removed 1 · truncated 2 · 26k → 11k (−15k)'),
+    ])
+    const lines = result.split('\n')
+    const pruneIdx = lines.findIndex(l => l.includes('jev prune'))
+    // The card leads with its own padded blank row, like any tool card.
+    expect(lines[pruneIdx - 1]!.trim()).toBe('')
+    expect(lines[pruneIdx]).toContain('✂ jev prune  26k → 11k')
+    expect(lines[pruneIdx + 1]).toContain('✓ · removed 1 · truncated 2')
+  })
+
   test('long tool command wraps instead of truncating', () => {
     const cmd = 'cd /Users/bohu/github/evotai/evot && rg -n "first_line|before_turn|after_turn" src/ --glob "*.rs" | head -20'
     const result = renderPlainWithColumns([{ id: 't1', kind: 'tool', text: `⌘ bash  ${cmd}` }], 72)
@@ -230,19 +403,6 @@ describe('buildOutputBlocks', () => {
     const lines = result.split('\n').filter(l => l.length > 0)
     expect(lines.length).toBeGreaterThan(1)
     expect(lines[1]!.startsWith('        ')).toBe(true)
-  })
-
-  test('streamed write code preview preserves ANSI syntax highlighting', () => {
-    const highlighted = '\x1b[31mconst\x1b[39m value = 1'
-    const result = render([{
-      id: 'write-preview',
-      kind: 'tool',
-      text: `  ${highlighted}`,
-      toolCodePreview: true,
-    }])
-
-    expect(result).toContain(highlighted)
-    expect(result).not.toContain('\x1b[2m')
   })
 
   test('long diff line wraps instead of truncating', () => {
@@ -308,9 +468,12 @@ describe('buildOutputBlocks', () => {
     expect(result).toContain('\x1b[32m')
   })
 
-  test('tool status line fail mark uses red', () => {
+  test('tool status line fail mark uses the themed error ink, not ANSI red', () => {
     const result = render([{ id: 't1', kind: 'tool', text: '  ✗ · exit 1' }])
-    expect(result).toContain('\x1b[31m')
+    expect(result).toContain(chalk.hex(getTheme().errorHex)('  ✗'))
+    expect(result).not.toContain('\x1b[31m')
+    // The metadata after the mark stays muted; the mark alone carries failure.
+    expect(result).toContain(chalk.hex(getTheme().mutedHex)(' · exit 1'))
   })
 
   test('tool status line retry mark uses yellow', () => {
@@ -458,9 +621,26 @@ describe('buildOutputBlocks', () => {
     expect(result).not.toContain('\x1b[38;2;119;119;119m')
   })
 
-  test('error lines are red', () => {
-    const result = render([{ id: 'e1', kind: 'error', text: 'something broke' }])
-    expect(result).toContain('\x1b[31m')
+  test('error body rows carry no colour at all', () => {
+    // Failure ink belongs to the status glyph; the reason reads as plain text.
+    const result = render([{ id: 'e1', kind: 'error', text: '  something broke' }])
+    expect(result).toBe('  something broke')
+  })
+
+  test('a standalone Error row becomes a themed ✗ mark with a plain message', () => {
+    const result = render([{ id: 'e1', kind: 'error', text: 'Error: connection interrupted' }])
+    expect(result).toBe(`${chalk.hex(getTheme().errorHex)('✗ ')}connection interrupted`)
+    expect(result).not.toContain('\x1b[31m')
+    expect(stripAnsi(result)).not.toContain('Error:')
+  })
+
+  test('a wrapped standalone Error row hangs continuations under the message', () => {
+    const msg = `Error: ${'word '.repeat(30).trim()}`
+    const result = renderPlainWithColumns([{ id: 'e1', kind: 'error', text: msg }], 40)
+    const lines = result.split('\n').filter(l => l.length > 0)
+    expect(lines.length).toBeGreaterThan(1)
+    expect(lines[0]!.startsWith('✗ word')).toBe(true)
+    for (const l of lines.slice(1)) expect(l.startsWith('  word')).toBe(true)
   })
 
   test('long error wraps instead of truncating', () => {
@@ -513,7 +693,7 @@ describe('tool cards: lifecycle-tinted slabs', () => {
     const rows = renderWithColumns(buildToolCard(call('done', { result: 'a\nb\nc', durationMs: 3 })), 40).split('\n')
     expect(rows[0]).toBe('')
     const body = rows.slice(1)
-    const fill = bgOpen(getTheme().toolSuccessBg)
+    const fill = bgOpen(getTheme().toolCardBg)
     expect(stripAnsi(body[0]!).trim()).toBe('')
     expect(stripAnsi(body[body.length - 1]!).trim()).toBe('')
     for (const row of body) {
@@ -523,33 +703,40 @@ describe('tool cards: lifecycle-tinted slabs', () => {
     // pi's Box: the border cell stays blank so card content sits on the same
     // column as the rail-led user text. No rail glyph on tool cards.
     expect(stripAnsi(body[1]!).startsWith('  ⌘ bash')).toBe(true)
-    expect(stripAnsi(body[3]!)).toContain('ctrl+o to expand')
+    // Headline, status row (which carries the fold), nothing else.
+    expect(stripAnsi(body[2]!)).toMatch(/3 lines .*\(ctrl\+o\)/)
+    expect(body).toHaveLength(4)
     expect(stripAnsi(rows.join('\n'))).not.toContain('┃')
   })
 
-  test('the fill follows the lifecycle: pending → success / error', () => {
+  test('every lifecycle state shares one neutral fill; the glyph carries the outcome', () => {
     const theme = getTheme()
-    expect(render(buildToolCard(call('queued')))).toContain(bgOpen(theme.toolPendingBg))
-    expect(render(buildToolCard(call('running')))).toContain(bgOpen(theme.toolPendingBg))
-    expect(render(buildToolCard(call('done', { result: 'ok' })))).toContain(bgOpen(theme.toolSuccessBg))
-    expect(render(buildToolCard(call('error', { result: 'boom' })))).toContain(bgOpen(theme.toolErrorBg))
-    // A non-zero exit code is a failure even when the call itself settled.
-    expect(render(buildToolCard(call('done', { result: 'x', details: { exit_code: 1 } }))))
-      .toContain(bgOpen(theme.toolErrorBg))
+    const fill = bgOpen(theme.toolCardBg)
+    for (const card of [
+      buildToolCard(call('queued')),
+      buildToolCard(call('running')),
+      buildToolCard(call('done', { result: 'ok' })),
+      buildToolCard(call('error', { result: 'boom' })),
+      buildToolCard(call('done', { result: 'x', details: { exit_code: 1 } })),
+    ]) {
+      expect(render(card)).toContain(fill)
+    }
+    expect(stripAnsi(render(buildToolCard(call('done', { result: 'ok' }))))).toContain('✓')
+    expect(stripAnsi(render(buildToolCard(call('error', { result: 'boom' }))))).toContain('✗')
   })
 
-  test('the three fills are distinct and none is the user panel', () => {
+  test('the tool fill is distinct from the user panel', () => {
     const theme = getTheme()
-    const fills = new Set([theme.toolPendingBg, theme.toolSuccessBg, theme.toolErrorBg, theme.panelBg])
-    expect(fills.size).toBe(4)
+    expect(theme.toolCardBg).not.toBe(theme.panelBg)
   })
 
-  test('the fill survives a failed body whose rows are red', () => {
+  test('the fill survives a failed card and only the mark is red', () => {
     const rows = renderWithColumns(buildToolCard(call('error', { result: 'not found' })), 40).split('\n').slice(1)
-    const fill = bgOpen(getTheme().toolErrorBg)
+    const fill = bgOpen(getTheme().toolCardBg)
     const bodyRow = rows.find(r => stripAnsi(r).includes('not found'))!
     expect(bodyRow.startsWith(fill)).toBe(true)
-    expect(bodyRow).toContain('\x1b[31m')
+    expect(bodyRow).toContain(chalk.hex(getTheme().errorHex)('  ✗'))
+    expect(bodyRow).not.toContain('\x1b[31m')
     // Padding rows share the card fill, so the slab has no seam.
     expect(rows[0]!.startsWith(fill)).toBe(true)
     expect(rows[rows.length - 1]!.startsWith(fill)).toBe(true)
@@ -565,18 +752,116 @@ describe('tool cards: lifecycle-tinted slabs', () => {
       result: 'ok',
       details: { diff: '@@ -1,3 +1,3 @@\n ctx\n-old\n+new' },
     } as Parameters<typeof buildToolCard>[0]), 40).split('\n')
-    const added = rows.find(r => stripAnsi(r).includes('+new'))!
-    const removed = rows.find(r => stripAnsi(r).includes('-old'))!
+    const added = rows.find(r => /^\s*\d+ new\s*$/.test(stripAnsi(r)))!
+    const removed = rows.find(r => /^\s*\d+ old\s*$/.test(stripAnsi(r)))!
     const context = rows.find(r => stripAnsi(r).includes(' ctx'))!
     expect(added.startsWith(bgOpen(theme.diffAddedBg))).toBe(true)
     expect(removed.startsWith(bgOpen(theme.diffRemovedBg))).toBe(true)
-    expect(context.startsWith(bgOpen(theme.toolSuccessBg))).toBe(true)
+    expect(context.startsWith(bgOpen(theme.toolCardBg))).toBe(true)
     for (const row of [added, removed, context]) expect(stringWidth(stripAnsi(row))).toBe(40)
+  })
+
+  test('completed writes replace retained content with one authoritative diff', () => {
+    for (const name of ['write', 'file_write']) {
+      for (const expanded of [false, true]) {
+        for (const created of [false, true]) {
+          const diff = created ? '@@ -0,0 +1 @@\n+new' : '@@ -1 +1 @@\n-old\n+new'
+          const call = {
+            id: `write-diff-${name}-${expanded}-${created}`, name,
+            args: { path: 'a.txt', content: 'new\n' }, status: 'done' as const,
+            result: 'Wrote 4 bytes to a.txt', details: { created, bytes: 4, diff },
+          }
+          const card = buildToolCard(call, expanded)
+          expect(card.filter(row => row.diffText === diff)).toHaveLength(1)
+          const rows = renderWithColumns(card, 40).split('\n')
+          const added = rows.find(row => /^\s*1 new\s*$/.test(stripAnsi(row))) ?? ''
+          expect(added.startsWith(bgOpen(getTheme().diffAddedBg))).toBe(true)
+          if (!created) {
+            const removed = rows.find(row => /^\s*1 old\s*$/.test(stripAnsi(row))) ?? ''
+            expect(removed.startsWith(bgOpen(getTheme().diffRemovedBg))).toBe(true)
+          }
+          for (const failed of [
+            { ...call, status: 'error' as const },
+            { ...call, details: { ...call.details, error: true } },
+          ]) {
+            // A failed call keeps the streamed body but never claims the
+            // engine's authoritative diff.
+            expect(buildToolCard(failed, expanded).some(row => row.diffText === diff)).toBe(false)
+          }
+        }
+      }
+    }
+  })
+
+  test('streamed write bodies are additions diffs from the first delta', () => {
+    for (const name of ['write', 'file_write']) {
+      const call = {
+        id: `write-stream-${name}`, name, status: 'queued' as const, argsComplete: false,
+        args: { path: 'a.py', content: 'import calc\n\ndef test_add():\n' },
+      }
+      const card = buildToolCard(call)
+      expect(card.map(row => row.diffText).filter(Boolean)).toEqual(['@@ -0,0 +1,3 @@\n+import calc\n+\n+def test_add():'])
+      expect(card.map(row => row.text).join('\n')).toContain('import calc')
+
+      // Model-supplied terminal controls never reach the diff rows.
+      const injected = buildToolCard({
+        ...call,
+        id: `write-controls-${name}`,
+        args: { path: 'a.txt', content: 'safe\x1b]133;A\x07visible' },
+      })
+      const text = injected.map(row => row.text).join('\n') + injected.map(row => row.diffText).join('\n')
+      expect(text).toContain('safe\ufffd]133;A\ufffdvisible')
+      expect(text).not.toContain('\x07')
+      expect(text).not.toContain('\x1b]133')
+    }
+  })
+
+  test('a settling write appends below its body instead of pushing it down', () => {
+    for (const name of ['write', 'file_write']) {
+      const content = 'import calc\n\ndef test_add():\n'
+      const diff = '@@ -0,0 +1,3 @@\n+import calc\n+\n+def test_add():'
+      const args = { path: 'a.py', content }
+      const frames = [
+        { id: `settle-${name}`, name, args, status: 'queued' as const, argsComplete: true },
+        { id: `settle-${name}`, name, args, status: 'running' as const },
+        {
+          id: `settle-${name}`, name, args, status: 'done' as const,
+          result: 'Wrote 28 bytes to a.py', details: { created: true, bytes: 28, diff },
+        },
+      ]
+      // The renderer only appends to native scrollback, so a row that has been
+      // painted can never move. Every frame must keep the body rows at the same
+      // index, with all mutable metadata strictly below them.
+      const bodyRows = ['1 import calc', '2', '3 def test_add():']
+      for (const frame of frames) {
+        const rows = contentRows(renderPlainWithColumns(buildToolCard(frame), 60))
+        const body = rows.map(row => row.trim()).slice(1, 1 + bodyRows.length)
+        expect(body).toEqual(bodyRows)
+        const status = rows.findIndex(row => /[○●✓✗] ·/.test(row))
+        expect(status).toBe(1 + bodyRows.length)
+      }
+    }
+  })
+
+  test('diffs render in full, as the block the engine sent', () => {
+    const patch = ['--- a/a.ts', '+++ b/a.ts', '@@ -0,0 +1,40 @@', ...Array.from({ length: 40 }, (_, i) => `+line ${i}`)].join('\n')
+    const call = {
+      id: 'full-diff', name: 'edit', args: { path: 'a.ts' }, status: 'done' as const,
+      result: 'Updated a.ts.', details: { diff: patch },
+    }
+    for (const expanded of [false, true]) {
+      const card = buildToolCard(call, expanded)
+      expect(card.filter(row => row.diffText === patch)).toHaveLength(1)
+      const text = card.map(row => row.text).join('\n')
+      expect(text).toContain('+line 0')
+      expect(text).toContain('+line 39')
+      expect(text).not.toContain('ctrl+o to expand')
+    }
   })
 
   test('expanding keeps the card on the same fill, only the body grows', () => {
     const c = call('done', { result: 'a\nb\nc', durationMs: 3 })
-    const fill = bgOpen(getTheme().toolSuccessBg)
+    const fill = bgOpen(getTheme().toolCardBg)
     const collapsed = renderWithColumns(buildToolCard(c, false), 40)
     const expandedView = renderWithColumns(buildToolCard(c, true), 40)
     expect(collapsed).toContain(fill)
@@ -589,9 +874,21 @@ describe('tool cards: lifecycle-tinted slabs', () => {
       ...buildToolCard(call('done', { result: 'ok' })),
       ...buildToolCard({ ...call('done', { result: 'ok' }), id: 't2' } as Parameters<typeof buildToolCard>[0]),
     ], 30).split('\n')
-    // margin, pad, head, status, body, pad, margin, pad, ...
+    // margin, pad, head, status, pad, margin, pad, head, status, pad
     const margins = rows.map((r, i) => (r === '' ? i : -1)).filter(i => i >= 0)
-    expect(margins.length).toBe(2)
+    expect(margins).toEqual([0, 5])
+    expect(rows).toHaveLength(10)
+  })
+
+  test('a card after a retained thought opens with its own margin and pad', () => {
+    const rows = renderPlainWithColumns([
+      { id: 'th', kind: 'thinking', text: 'plan', thinkingFold: 'tail' } as OutputLine,
+      ...buildToolCard(call('done', { result: 'ok' })),
+    ], 30).split('\n')
+    expect(rows).toContain('✻ plan')
+    const head = rows.findIndex(r => r.includes('⌘ bash'))
+    expect(rows[head - 1]).toBe(' '.repeat(30))
+    expect(rows[head - 2]).toBe('')
   })
 
   test('bare tool lines without card membership keep the unfilled layout', () => {

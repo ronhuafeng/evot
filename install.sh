@@ -80,12 +80,17 @@ DOWNLOAD_RETRY_BASE_DELAY="${EVOT_DOWNLOAD_RETRY_BASE_DELAY:-1}"
 # progress lines, so those keep the quiet behaviour. `-S` is retained in both
 # cases so a hard error is still reported when the meter is off.
 #
-# curl's default meter is preferred over its `-#` bar because it reports rate and
-# time remaining, not just percentage. wget only shows a meter under `-q` when
+# curl's `-#` progress bar is used so the percentage is always visible. The
+# same output is forwarded by `evot update`, which keeps direct installs and
+# in-app updates visually consistent. wget only shows a meter under `-q` when
 # --show-progress is passed, and that flag landed in wget 1.16, so it is probed
 # rather than assumed.
-if [ -t 2 ]; then
+if [ -t 2 ] || [ "${EVOT_INSTALL_PROGRESS:-}" = 1 ]; then
+  # Use curl's progress-bar mode rather than its verbose transfer meter. It
+  # gives both the standalone installer and the in-app updater a compact,
+  # percentage-based progress signal that can be redrawn in place.
   CURL_QUIET=""
+  CURL_PROGRESS="-#"
   WGET_PROGRESS="--show-progress"
   if [ "$DOWNLOADER" = "wget" ] \
     && ! wget --help 2>&1 | grep -q -- '--show-progress'; then
@@ -93,6 +98,7 @@ if [ -t 2 ]; then
   fi
 else
   CURL_QUIET="-s"
+  CURL_PROGRESS=""
   WGET_PROGRESS=""
 fi
 
@@ -128,17 +134,18 @@ download() {
   _url="$1"; _output="$2"; _resume="${3:-yes}"
   if [ "$DOWNLOADER" = "curl" ]; then
     if [ "$_resume" = "yes" ]; then
-      curl -fL $CURL_QUIET -S --connect-timeout 20 \
+      curl -fL $CURL_QUIET -S $CURL_PROGRESS --connect-timeout 20 \
         --speed-limit "$STALL_MIN_BYTES_PER_SEC" --speed-time "$STALL_WINDOW_SECONDS" \
         --continue-at - -o "$_output" "$_url"
     else
-      curl -fL $CURL_QUIET -S --connect-timeout 20 \
+      curl -fL $CURL_QUIET -S $CURL_PROGRESS --connect-timeout 20 \
         --speed-limit "$STALL_MIN_BYTES_PER_SEC" --speed-time "$STALL_WINDOW_SECONDS" \
         -o "$_output" "$_url"
     fi
   else
     # wget's --timeout already covers reads as well as DNS and connect, so a
-    # stalled transfer is bounded without an extra flag.
+    # stalled transfer is bounded without an extra flag. Its progress output
+    # follows the same percentage-based convention as curl's `-#` bar.
     if [ "$_resume" = "yes" ]; then
       wget -q $WGET_PROGRESS --tries=1 --timeout="$STALL_WINDOW_SECONDS" \
         --continue -O "$_output" "$_url"
@@ -434,6 +441,24 @@ CANDIDATE_VERSION="$(EVOT_HOME="$PACKAGE_DIR" "$PACKAGE_DIR/bin/$BINARY" --versi
 [ "$CANDIDATE_VERSION" = "evot v$VERSION" ] \
   || error "Downloaded version mismatch (expected evot v$VERSION, got $CANDIDATE_VERSION)"
 
+# Stage-only API marker checked by hosts before executing an old release script.
+# EVOT_INSTALLER_STAGE_API=1
+
+# Stage-only uses the identical download, checksum and candidate validation
+# path above, but never touches the live installation.
+if [ -n "${EVOT_STAGE_DIR:-}" ]; then
+  mkdir -p "$EVOT_STAGE_DIR"
+  cp "$TMP/$ASSET" "$EVOT_STAGE_DIR/.$ASSET.new.$$"
+  mv -f "$EVOT_STAGE_DIR/.$ASSET.new.$$" "$EVOT_STAGE_DIR/$ASSET"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$EVOT_STAGE_DIR/$ASSET" > "$EVOT_STAGE_DIR/$ASSET.sha256"
+  else
+    shasum -a 256 "$EVOT_STAGE_DIR/$ASSET" > "$EVOT_STAGE_DIR/$ASSET.sha256"
+  fi
+  log "staged v$VERSION"
+  exit 0
+fi
+
 # --- Install ---
 
 mkdir -p "$INSTALL_DIR"
@@ -542,7 +567,22 @@ STATE_BACKUP=""
 
 log "installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
 
-# --- PATH guidance ---
+# --- PATH setup ---
+# A child process cannot change the calling terminal's PATH. Persist the
+# setting for future shells and print the exact command for the current one.
+# EVOT_NO_MODIFY_PATH=1 leaves shell configuration under the caller's control.
+
+add_path_to_profile() {
+  if grep -Fqx -- "$PATH_LINE" "$1" 2>/dev/null; then
+    return 0
+  fi
+  if (mkdir -p "$(dirname "$1")" && printf '\n# evot\n%s\n' "$PATH_LINE" >> "$1"); then
+    log "configured PATH in $1"
+  else
+    warn "could not configure $1; add the command below manually"
+    return 1
+  fi
+}
 
 case ":$PATH:" in
   *":$INSTALL_DIR:"*)
@@ -555,22 +595,50 @@ case ":$PATH:" in
     ;;
   *)
     SHELL_NAME="$(basename "${SHELL:-/bin/sh}")"
+    # Single-quote literal paths, including spaces, dollar signs and quotes.
+    QUOTED_INSTALL_DIR="'$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
+    PATH_LINE="export PATH=$QUOTED_INSTALL_DIR:\"\$PATH\""
     case "$SHELL_NAME" in
-      zsh)  RC="$HOME/.zshrc" ;;
+      zsh)  RC="${ZDOTDIR:-$HOME}/.zshrc" ;;
       bash) RC="$HOME/.bashrc" ;;
-      fish) RC="$HOME/.config/fish/config.fish" ;;
-      *)    RC="$HOME/.profile" ;;
+      fish)
+        RC="${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/evot.fish"
+        # Unlike POSIX sh, fish interprets escaped backslashes in single quotes.
+        QUOTED_INSTALL_DIR="'$(printf '%s' "$INSTALL_DIR" | sed 's/\\/\\\\/g' | sed "s/'/'\\\\''/g")'"
+        PATH_LINE="contains -- $QUOTED_INSTALL_DIR \$PATH; or set -gx PATH $QUOTED_INSTALL_DIR \$PATH"
+        ;;
+      *) RC="$HOME/.profile" ;;
     esac
 
-    warn "${INSTALL_DIR} is not in your PATH"
-    echo "  add it to your shell config:"
     echo ""
-    if [ "$SHELL_NAME" = "fish" ]; then
-      echo "    set -Ux fish_user_paths $INSTALL_DIR \$fish_user_paths"
-    else
-      echo "    echo 'export PATH=\"$INSTALL_DIR:\$PATH\"' >> $RC"
-      echo "    source $RC"
+    PATH_CONFIGURED=no
+    if [ "${EVOT_NO_MODIFY_PATH:-0}" = 1 ]; then
+      warn "skipped shell configuration (EVOT_NO_MODIFY_PATH=1)"
+    elif add_path_to_profile "$RC"; then
+      PATH_CONFIGURED=yes
+      # Login bash reads the first existing login profile, not .bashrc.
+      if [ "$SHELL_NAME" = bash ]; then
+        LOGIN_RC="$HOME/.profile"
+        for PROFILE in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+          if [ -f "$PROFILE" ]; then
+            LOGIN_RC="$PROFILE"
+            break
+          fi
+        done
+        if ! add_path_to_profile "$LOGIN_RC"; then
+          RC="$LOGIN_RC"
+          PATH_CONFIGURED=no
+        fi
+      fi
     fi
-    echo ""
+
+    if [ "$PATH_CONFIGURED" = yes ]; then
+      log "open a new terminal, or run this command in the current terminal:"
+    else
+      warn "${INSTALL_DIR} is not in your PATH"
+      printf '  Add this command to %s and run it in the current terminal:\n' "$RC"
+    fi
+    printf '\n    %s\n\n' "$PATH_LINE"
+    printf '  Then log in:\n\n    evot login\n\n'
     ;;
 esac

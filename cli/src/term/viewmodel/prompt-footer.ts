@@ -8,9 +8,13 @@
  */
 
 import stringWidth from 'string-width'
+import { confirmationHint } from './confirmation-hint.js'
 import { line, block, plain, dim, colored, type ViewBlock, type StyledLine, type StyledSpan } from './types.js'
-import { finiteSize, spansWidth, truncateTailToWidth } from './width.js'
-import { BACKGROUND_PANEL_HINT_CHORD, BACKGROUND_PANEL_SHORTCUT_HINT } from '../app/background-panel.js'
+import { finiteSize, spansWidth, truncateTailToWidth, truncateToWidth } from './width.js'
+import { BACKGROUND_PANEL_HINT_CHORD } from '../app/background-panel.js'
+import { FORK_GLYPH, formatForkTrail } from './fork-trail.js'
+import { GAUGE_CELL, effortCellHex, effortLabel } from './model-effort.js'
+import { getTheme } from '../../render/theme/index.js'
 
 /** The subset of prompt state the footer reads. */
 export interface PromptFooterVM {
@@ -18,14 +22,21 @@ export interface PromptFooterVM {
   model: string
   provider: string
   thinkingLevel: string
-  planning: boolean
+  /** The active model's effort ladder; with it the footer draws a gauge. */
+  thinkingLevels?: readonly string[]
   logMode: boolean
   dashboardUrl: string | null
   cwd: string
+  /** Fork ancestry titles, root → current; empty or absent for non-forks. */
+  forkTrail?: string[]
+  /** `☁` / `🌐` while the session is on the cloud; leads the location. */
+  cloudBadge?: string
   gitBranch: string | null
   contextTokens: number
   contextWindow: number
   backgroundProcessCount: number
+  backgroundStopHint?: string
+  backgroundStopPending?: boolean
   /**
    * True when ↓ at the prompt opens the background panel.
    *
@@ -38,7 +49,7 @@ export interface PromptFooterVM {
 export interface PromptFooterOptions {
   /**
    * True when the composer border above already names the input mode. The
-   * footer then drops its `[plan]` prefix rather than repeating the same word
+   * footer then drops its `[log]` prefix rather than repeating the same word
    * two rows apart. It stays authoritative whenever nothing above it carries
    * the mode: overlays replace the composer, and short terminals drop the
    * border entirely.
@@ -55,13 +66,45 @@ export function buildPromptFooterBlocks(
     input.backgroundProcessCount,
     input.backgroundPanelDownAvailable,
     finiteSize(input.columns, 80),
+    input.backgroundStopHint,
+    input.backgroundStopPending,
   )
   if (chip) blocks.push(block([chip]))
-  blocks.push(
-    buildFooter(input, finiteSize(input.columns, 80), options.modeShownAbove ?? false),
-    block([line(plain(''))]),
-  )
+  blocks.push(buildFooter(input, finiteSize(input.columns, 80), options.modeShownAbove ?? false))
+  const trail = buildForkTrail(input.forkTrail ?? [], finiteSize(input.columns, 80))
+  if (trail) blocks.push(block([trail]))
+  blocks.push(block([line(plain(''))]))
   return blocks
+}
+
+/**
+ * The fork row under the status line: `└─ fork of <parent>`.
+ *
+ * It only exists for forked sessions and says just two things: this is a
+ * fork, and what it hangs off. The edge glyph is the one the `/sessions`
+ * graph uses, so the row reads in the same language as the tree there.
+ */
+function buildForkTrail(trail: readonly string[], columns: number): StyledLine | null {
+  const prefix = `${FORK_GLYPH} `
+  const text = formatForkTrail(trail, Math.max(1, columns - stringWidth(prefix)))
+  if (!text) return null
+  return line(colored(FORK_GLYPH, 'cyan'), dim(` ${text}`))
+}
+
+/**
+ * The footer speaks in three tones and nothing else:
+ *
+ *   dim      facts that rarely change: cwd, model, context figures, dashboard
+ *   runtime  things evot itself is doing right now: loop wait, background
+ *            shells. One hue, the brand, so they read as one family
+ *   warn     what needs the user: context pressure (yellow/red), loop about to
+ *            wake (yellow)
+ *
+ * Anything else would be a fourth colour competing for the eye on a line that
+ * is meant to be glanced at, not read.
+ */
+function runtime(text: string): StyledSpan {
+  return { text, hex: getTheme().brandHex }
 }
 
 /**
@@ -77,7 +120,7 @@ export function buildPromptFooterBlocks(
  *
  * ↓ is advertised whenever it is live, because it sits one key away from the
  * cursor. With text in the composer ↓ still moves the caret, so the chip falls
- * back to naming Ctrl+T rather than a key that would do something else.
+ * back to the count alone. Ctrl+T remains an unadvertised alternate shortcut.
  *
  * Narrowing sheds words in order of expendability: the gesture first, then the
  * word "background", and only then characters. Truncating the long label
@@ -88,25 +131,42 @@ function buildBackgroundChip(
   count: number,
   downAvailable: boolean,
   columns: number,
+  stopHint?: string,
+  stopPending = false,
 ): StyledLine | null {
   if (count <= 0) return null
   const noun = count === 1 ? 'shell' : 'shells'
   const label = `${count} background ${noun} running`
   const shortLabel = `${count} ${noun} running`
-  const chord = downAvailable ? BACKGROUND_PANEL_HINT_CHORD : BACKGROUND_PANEL_SHORTCUT_HINT
-  const hint = `${chord} to manage`
-  if (stringWidth(`${label} · ${hint}`) <= columns) {
-    return line(colored(label, 'cyan'), dim(' · '), dim(hint))
+  const hint = `${BACKGROUND_PANEL_HINT_CHORD} to manage`
+  if (stopHint) {
+    const manage = downAvailable ? ` · ${hint}` : ''
+    const full = `${label} · ${stopHint}${manage}`
+    const compact = `${count} bg · ${stopHint}`
+    const text = stringWidth(full) <= columns ? full : stringWidth(`${label} · ${stopHint}`) <= columns
+      ? `${label} · ${stopHint}` : compact
+    const clipped = truncateToWidth(text, columns)
+    const start = clipped.indexOf(stopHint)
+    if (start < 0) return line(confirmationHint(truncateToWidth(stopHint, columns), stopPending))
+    return line(
+      runtime(clipped.slice(0, start)),
+      confirmationHint(stopHint, stopPending),
+      dim(clipped.slice(start + stopHint.length)),
+    )
   }
-  if (stringWidth(label) <= columns) return line(colored(label, 'cyan'))
-  if (stringWidth(shortLabel) <= columns) return line(colored(shortLabel, 'cyan'))
-  return line(colored(truncateTailToWidth(shortLabel, columns), 'cyan'))
+  if (downAvailable && stringWidth(`${label} · ${hint}`) <= columns) {
+    return line(runtime(label), dim(' · '), dim(hint))
+  }
+  if (stringWidth(label) <= columns) return line(runtime(label))
+  if (stringWidth(shortLabel) <= columns) return line(runtime(shortLabel))
+  return line(runtime(truncateTailToWidth(shortLabel, columns)))
 }
 
+
 function buildFooter(input: PromptFooterVM, columns: number, modeShownAbove: boolean): ViewBlock {
-  const mode = modeShownAbove
-    ? ''
-    : `${input.logMode ? '[log] ' : ''}${input.planning ? '[plan] ' : ''}`
+  const cloud = input.cloudBadge ? `${input.cloudBadge} ` : ''
+  const modeWords = !modeShownAbove && input.logMode ? '[log] ' : ''
+  const mode = `${cloud}${modeWords}`
   const cwd = compactCwd(input.cwd)
   const contextPercent = input.contextWindow > 0
     ? input.contextTokens / input.contextWindow * 100
@@ -123,9 +183,8 @@ function buildFooter(input: PromptFooterVM, columns: number, modeShownAbove: boo
 type FooterContextDetail = 'full' | 'compact' | 'hidden'
 
 interface FooterLayout {
-  dashboard: boolean
+  dashboard: 'full' | 'port' | false
   context: FooterContextDetail
-  provider: boolean
   branch: boolean
   thinking: boolean
   model: boolean
@@ -134,14 +193,14 @@ interface FooterLayout {
 
 /** Widest first: the first entry that fits wins, so detail sheds in this order. */
 const FOOTER_LAYOUTS: FooterLayout[] = [
-  { dashboard: true, context: 'full', provider: true, branch: true, thinking: true, model: true, truncateCwd: false },
-  { dashboard: false, context: 'full', provider: true, branch: true, thinking: true, model: true, truncateCwd: false },
-  { dashboard: false, context: 'compact', provider: true, branch: true, thinking: true, model: true, truncateCwd: false },
-  { dashboard: false, context: 'compact', provider: false, branch: true, thinking: true, model: true, truncateCwd: false },
-  { dashboard: false, context: 'compact', provider: false, branch: false, thinking: true, model: true, truncateCwd: false },
-  { dashboard: false, context: 'hidden', provider: false, branch: false, thinking: true, model: true, truncateCwd: true },
-  { dashboard: false, context: 'hidden', provider: false, branch: false, thinking: false, model: true, truncateCwd: true },
-  { dashboard: false, context: 'hidden', provider: false, branch: false, thinking: false, model: false, truncateCwd: true },
+  { dashboard: 'full', context: 'full', branch: true, thinking: true, model: true, truncateCwd: false },
+  { dashboard: 'port', context: 'full', branch: true, thinking: true, model: true, truncateCwd: false },
+  { dashboard: 'port', context: 'compact', branch: true, thinking: true, model: true, truncateCwd: false },
+  { dashboard: 'port', context: 'compact', branch: false, thinking: true, model: true, truncateCwd: true },
+  { dashboard: 'port', context: 'hidden', branch: false, thinking: true, model: true, truncateCwd: true },
+  { dashboard: 'port', context: 'hidden', branch: false, thinking: false, model: true, truncateCwd: true },
+  { dashboard: 'port', context: 'hidden', branch: false, thinking: false, model: false, truncateCwd: true },
+  { dashboard: false, context: 'hidden', branch: false, thinking: false, model: false, truncateCwd: true },
 ]
 
 interface FooterCandidate {
@@ -160,7 +219,7 @@ function buildFooterCandidate(
   const dashboard = layout.dashboard && input.dashboardUrl
     ? [
         { text: 'dashboard ', dim: true } satisfies StyledSpan,
-        { text: input.dashboardUrl, dim: true, link: input.dashboardUrl } satisfies StyledSpan,
+        { text: layout.dashboard === 'port' ? dashboardPort(input.dashboardUrl) : input.dashboardUrl, dim: true, link: input.dashboardUrl } satisfies StyledSpan,
       ]
     : null
 
@@ -168,10 +227,8 @@ function buildFooterCandidate(
     const groups: StyledSpan[][] = [[dim(location)]]
     if (layout.model && input.model) {
       const identity: StyledSpan[] = [dim(input.model)]
-      if (layout.provider && input.provider) identity.push(dim(`@${input.provider}`))
       if (layout.thinking && input.thinkingLevel) {
-        const thinking = input.thinkingLevel === 'off' ? 'thinking off' : input.thinkingLevel
-        identity.push(dim(` • ${thinking}`))
+        identity.push(dim(' • '), ...thinkingBadge(input.thinkingLevel, input.thinkingLevels))
       }
       groups.push(identity)
     }
@@ -181,6 +238,9 @@ function buildFooterCandidate(
         ? ` (${formatContextTokens(input.contextTokens)}/${formatContextTokens(input.contextWindow)})`
         : ''
       const text = `context: ${contextPercent.toFixed(1)}%${detail}${warning}`
+      // No badge for judge pruning: the catalog keeps it on permanently, so a
+      // badge would say nothing, and each prune already lands as a card in
+      // the transcript when it happens.
       groups.push([
         contextPercent > 90
           ? colored(text, 'red')
@@ -205,6 +265,25 @@ function buildFooterCandidate(
   return candidate
 }
 
+/** `◼◼◼◼ medium`: the same ramp-lit ladder as the /model picker, so shift+tab
+ *  shows its effect at a glance. The ladder keeps the ramp because it is the
+ *  picker's signature; the tier word is a fact like the model name beside it
+ *  and stays dim, so the only saturated ink on the left is the few gauge
+ *  cells. Without a ladder, just the tier name. */
+function thinkingBadge(level: string, levels: readonly string[] | undefined): StyledSpan[] {
+  const index = levels?.indexOf(level) ?? -1
+  if (!levels || index < 0) return [dim(level === 'off' ? 'thinking off' : level)]
+  const { subtleHex } = getTheme()
+  const lit: StyledSpan[] = Array.from({ length: index + 1 }, (_, at) =>
+    ({ text: GAUGE_CELL, hex: effortCellHex(at, levels.length) }))
+  const empty = GAUGE_CELL.repeat(levels.length - lit.length)
+  return [
+    ...lit,
+    ...(empty ? [{ text: empty, hex: subtleHex }] : []),
+    dim(` ${effortLabel(level).toLowerCase()}`),
+  ]
+}
+
 function footerCandidateWidth(candidate: FooterCandidate): number {
   const left = spansWidth(candidate.left)
   return candidate.dashboard ? left + 2 + spansWidth(candidate.dashboard) : left
@@ -214,6 +293,15 @@ function renderFooterCandidate(candidate: FooterCandidate, columns: number): Sty
   if (!candidate.dashboard) return line(...candidate.left)
   const padding = columns - spansWidth(candidate.left) - spansWidth(candidate.dashboard)
   return line(...candidate.left, plain(' '.repeat(Math.max(2, padding))), ...candidate.dashboard)
+}
+
+function dashboardPort(address: string): string {
+  try {
+    const url = new URL(address)
+    return `:${url.port || (url.protocol === 'https:' ? '443' : '80')}`
+  } catch {
+    return address
+  }
 }
 
 function compactCwd(cwd: string): string {

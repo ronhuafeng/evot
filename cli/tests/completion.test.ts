@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test'
-import { complete, getGhostHint } from '../src/commands/completion.js'
+import { complete, fileCompletionTarget, getGhostHint } from '../src/commands/completion.js'
 
 describe('slash command completion', () => {
   test('completes single match with trailing space', () => {
@@ -8,6 +8,12 @@ describe('slash command completion', () => {
     expect(result!.replacement).toBe('/help ')
     expect(result!.candidates).toEqual(['/help'])
     expect(result!.wordStart).toBe(0)
+  })
+
+  test('completes uppercase input the same way', () => {
+    const result = complete('/HE', 3)
+    expect(result).not.toBeNull()
+    expect(result!.replacement).toBe('/help ')
   })
 
   test('completes common prefix for multiple matches', () => {
@@ -66,6 +72,26 @@ describe('slash command completion', () => {
 })
 
 describe('file path completion', () => {
+  test('path routing is independent of filesystem matches and shared with suggestion routing', () => {
+    for (const word of ['../evot/xx', './src/missing', '~/projects/none', '/tmp/missing', '/etc', 'nested/file.ts']) {
+      const text = `inspect ${word}`
+      expect(fileCompletionTarget(text, text.length)).toMatchObject({ word, wordStart: 'inspect '.length })
+    }
+    const text = '/loop check ../evot/xx then report'
+    const cursor = '/loop check ../evot/xx'.length
+    expect(fileCompletionTarget(text, cursor)).toMatchObject({ word: '../evot/xx', wordStart: '/loop check '.length })
+    for (const text of ['plain prose', '/lo', '/loop', '/model', '/_dump', '/loop 5m run tests']) {
+      expect(fileCompletionTarget(text, text.length)).toBeNull()
+    }
+  })
+
+  test('paths also complete inside slash-command arguments', () => {
+    const text = '/loop inspect ./tests'
+    const result = complete(text, text.length)
+    expect(result).not.toBeNull()
+    expect(result!.wordStart).toBe('/loop inspect '.length)
+    expect(result!.replacement).toBe('./tests/')
+  })
   test('completes paths starting with ./', () => {
     const result = complete('./', 2)
     expect(result).not.toBeNull()
@@ -109,9 +135,8 @@ describe('file path completion', () => {
   })
 
   test('extracts path glued to CJK text without space', () => {
-    // "看下./tests" — a path appended directly to CJK characters with no
-    // separating whitespace. Tab should still recognise the path segment.
-    const line = '看下./tests'
+    // A path appended directly to non-Latin text still has its own start.
+    const line = '\u770b\u4e0b./tests'
     const result = complete(line, line.length)
     expect(result).not.toBeNull()
     expect(result!.replacement.startsWith('./tests')).toBe(true)
@@ -141,6 +166,23 @@ describe('ghost hints', () => {
     expect(hint).not.toContain('restart')
   })
 
+  test('bare slash offers back only once the session has a fork parent', () => {
+    expect(getGhostHint('/', 1)).not.toContain('back')
+    expect(getGhostHint('/', 1, { forked: false })).not.toContain('back')
+    expect(getGhostHint('/', 1, { forked: true })).toContain('fork  back  model')
+  })
+
+  test('removed plan mode is absent from hints and prefix completion', () => {
+    expect(getGhostHint('/', 1)).not.toContain('plan')
+    expect(getGhostHint('/pl', 3)).toBe('')
+    expect(complete('/pl', 3)).toBeNull()
+  })
+
+  test('back stays prefix-completable in a root session', () => {
+    expect(getGhostHint('/ba', 3)).toContain('ck')
+    expect(getGhostHint('/back ', 6)).toContain('<levels>')
+  })
+
   test('short resume prefixes do not advertise hidden restart', () => {
     for (const prefix of ['/re', '/res']) {
       const hint = getGhostHint(prefix, prefix.length)
@@ -165,7 +207,8 @@ describe('ghost hints', () => {
     // Typing an alias must feel like typing the real name: same description on
     // the name, same argument hints after the space.
     expect(getGhostHint('/sessions', 9)).toContain('<id>')
-    expect(getGhostHint('/sessions ', 10)).toContain('<query>')
+    expect(getGhostHint('/sessions ', 10)).toContain('<request>')
+    expect(getGhostHint('/SESSIONS ', 10)).toContain('<request>')
   })
 })
 
@@ -175,5 +218,74 @@ describe('alias completion', () => {
     expect(result).not.toBeNull()
     expect(result!.replacement).toBe('/sessions ')
     expect(result!.candidates).toEqual(['/sessions'])
+  })
+})
+
+describe('sub-command completion', () => {
+  test('completes the sub-command under the cursor', () => {
+    // The reported bug: `/harden chan` showed a `ges` ghost hint, but Tab
+    // refused to apply it because completion stopped at the command name.
+    const result = complete('/harden chan', 12)
+    expect(result).not.toBeNull()
+    expect(result!.replacement).toBe('changes ')
+    expect(result!.candidates).toEqual(['changes'])
+    // Splices the argument, leaving `/harden ` intact.
+    expect(result!.wordStart).toBe(8)
+  })
+
+  test('applies to every command with literal sub-commands', () => {
+    for (const [input, expected] of [
+      ['/skill inst', 'install '],
+      ['/log sh', 'shot '],
+      ['/env li', 'list '],
+      ['/clip a', 'all '],
+      ['/help mo', 'model '],
+    ] as const) {
+      const result = complete(input, input.length)
+      expect(result, input).not.toBeNull()
+      expect(result!.replacement, input).toBe(expected)
+    }
+  })
+
+  test('never completes a placeholder as literal text', () => {
+    // `<name>` / `<query>` describe what to type; inserting them verbatim would
+    // put angle brackets into the prompt.
+    for (const input of ['/model ', '/resume ', '/sessions ', '/share x']) {
+      expect(complete(input, input.length), input).toBeNull()
+    }
+  })
+
+  test('declines an ambiguous prefix rather than applying nothing', () => {
+    // `/env l` matches list+load; the common prefix adds no characters, so Tab
+    // must report "not handled" instead of consuming the key for a no-op.
+    expect(complete('/env l', 6)).toBeNull()
+    // One more character disambiguates it.
+    expect(complete('/env lo', 7)!.replacement).toBe('load ')
+  })
+
+  test('leaves free-form prompt text past the first argument alone', () => {
+    expect(complete('/harden changes and more', 24)).toBeNull()
+    expect(complete('harden chan', 11)).toBeNull()
+    expect(complete('/nonexist foo', 13)).toBeNull()
+  })
+
+  test('a literal ghost hint is always applicable by Tab', () => {
+    // The invariant that broke: the hint advertised a completion Tab could not
+    // deliver. Anything the hint offers as literal text must be appliable.
+    for (const input of [
+      '/harden chan', '/harden pl', '/harden a', '/skill re',
+      '/log sh', '/env lo', '/clip a', '/help mo',
+    ]) {
+      const hint = getGhostHint(input, input.length)
+      // A literal hint has no bracketed candidate list.
+      expect(hint, input).not.toBe('')
+      expect(hint.startsWith('  ['), input).toBe(false)
+
+      const result = complete(input, input.length)
+      expect(result, input).not.toBeNull()
+      // Applying the completion yields exactly what the hint promised.
+      const partial = input.slice(result!.wordStart)
+      expect(result!.replacement, input).toBe(`${partial}${hint.trimEnd()} `)
+    }
   })
 })

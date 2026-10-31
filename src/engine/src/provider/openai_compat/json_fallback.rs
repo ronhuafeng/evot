@@ -7,11 +7,12 @@
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use super::reasoning_details;
 use super::types::*;
 use crate::provider::error::ProviderError;
 use crate::provider::route::OpenAiCompat;
-use crate::provider::stream_fallback::FallbackEmitter;
-use crate::provider::stream_http;
+use crate::provider::stream::fallback::FallbackEmitter;
+use crate::provider::stream::http;
 use crate::provider::traits::StreamConfig;
 use crate::provider::traits::StreamEvent;
 use crate::types::*;
@@ -26,12 +27,12 @@ pub(crate) async fn handle_json_response(
     config: &StreamConfig,
     compat: &OpenAiCompat,
 ) -> Result<Message, ProviderError> {
-    let value = stream_http::read_json_body(response).await?;
+    let value = http::read_json_body(response).await?;
 
     // Check for error-shaped JSON first
     if value.get("error").is_some() {
         debug!("OpenAI-compat JSON fallback: error response detected");
-        return Err(stream_http::classify_json_error(&value));
+        return Err(http::classify_json_error(&value));
     }
 
     debug!("OpenAI-compat JSON fallback: parsing as success completion");
@@ -69,11 +70,26 @@ fn parse_success_response(
                 .filter(|value| !value.is_empty())
                 .map(|value| (field, value))
         });
-        if let Some((field, thinking)) = reasoning {
-            emitter.emit_thinking(
-                thinking,
-                Some(ThinkingMetadata::OpenAiCompletions { field }),
-            );
+        let details = msg
+            .reasoning_details
+            .clone()
+            .and_then(reasoning_details::sanitize);
+        match (reasoning, details) {
+            (Some((field, thinking)), details) => {
+                emitter.emit_thinking(
+                    thinking,
+                    Some(ThinkingMetadata::OpenAiCompletions { field, details }),
+                );
+            }
+            // Encrypted-only reasoning: no visible text, but the opaque state
+            // still has to be replayed on the next turn.
+            (None, Some(details)) => {
+                emitter.emit_replay_only_thinking(ThinkingMetadata::OpenAiCompletions {
+                    field: ReasoningField::ReasoningContent,
+                    details: Some(details),
+                });
+            }
+            (None, None) => {}
         }
 
         // Text content
@@ -93,6 +109,13 @@ fn parse_success_response(
 
         // Stop reason
         let stop_reason = match choice.finish_reason.as_deref() {
+            // Same contract as the SSE path: a content-filter stop is a
+            // refusal error, never a normal completion.
+            Some(reason) if crate::provider::error::is_content_filter_reason(reason) => {
+                return Err(ProviderError::Api(crate::provider::error::refusal_message(
+                    reason,
+                )));
+            }
             Some("stop") => StopReason::Stop,
             Some("length") => StopReason::Length,
             Some("tool_calls") => StopReason::ToolUse,
@@ -138,4 +161,19 @@ fn parse_success_response(
         .unwrap_or_else(|| "openai".into());
 
     Ok(emitter.finalize(&config.model, &provider))
+}
+
+/// JSON fallback is one finite response, not an unbounded streaming producer.
+pub(crate) async fn handle_json_response_sink(
+    response: reqwest::Response,
+    tx: crate::provider::stream::sink::StreamSink,
+    config: &StreamConfig,
+    compat: &OpenAiCompat,
+) -> Result<Message, ProviderError> {
+    let (legacy_tx, mut rx) = mpsc::unbounded_channel();
+    let message = handle_json_response(response, legacy_tx, config, compat).await?;
+    while let Some(event) = rx.recv().await {
+        tx.send(event).await.map_err(|_| ProviderError::Cancelled)?;
+    }
+    Ok(message)
 }

@@ -17,9 +17,6 @@ use super::process::PROGRESS_INTERVAL;
 use super::process::UPDATE_INTERVAL;
 use crate::types::*;
 
-/// Type alias for command confirmation callback.
-pub type ConfirmFn = Box<dyn Fn(&str) -> bool + Send + Sync>;
-
 /// Max lines to include in the final tool result.
 const MAX_DISPLAY_LINES: usize = 2000;
 /// Max bytes to include in the final tool result.
@@ -54,8 +51,6 @@ pub struct BashTool {
     pub max_output_bytes: usize,
     /// Commands/patterns that are always blocked.
     pub deny_patterns: Vec<String>,
-    /// Optional callback for confirming dangerous commands.
-    pub confirm_fn: Option<ConfirmFn>,
     /// Environment variables injected into every bash subprocess.
     pub envs: Vec<(String, String)>,
     /// Directories the OS sandbox allows the child process to access.
@@ -79,7 +74,6 @@ impl Default for BashTool {
                 "dd if=".into(),
                 ":(){:|:&};:".into(),
             ],
-            confirm_fn: None,
             envs: Vec::new(),
             sandbox_dirs: None,
             process_manager: Arc::new(ProcessManager::new()),
@@ -106,16 +100,6 @@ impl BashTool {
 
     pub fn with_max_timeout(mut self, max_timeout: Duration) -> Self {
         self.max_timeout = max_timeout;
-        self
-    }
-
-    pub fn with_deny_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.deny_patterns = patterns;
-        self
-    }
-
-    pub fn with_confirm(mut self, f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
-        self.confirm_fn = Some(Box::new(f));
         self
     }
 
@@ -161,7 +145,9 @@ impl AgentTool for BashTool {
     }
 
     fn description(&self) -> &str {
-        if self.background_enabled {
+        if self.background_enabled && self.foreground_wait.is_some() {
+            "Execute a bash command. Commands start in the foreground and move to the background when the host's foreground-wait limit or timeout elapses, or the user requests it. They keep running. Use run_in_background only for intentionally independent work. Use {{task_stop}} to actually stop a task."
+        } else if self.background_enabled {
             // `{{task_stop}}` resolves here because descriptions pass through
             // `resolve_tool_refs`. The schema below and BACKGROUND_GUIDANCE do
             // not, so those must keep literal names or the model would be shown
@@ -191,7 +177,13 @@ impl AgentTool for BashTool {
             // Code's stance that blocking is a misuse; it is not, it is what the
             // tool exists for.
             vec![
-                "For long-running commands that can continue independently, use `run_in_background: true`; read the returned output path to check progress, or call {{task_output}} once to wait when a later step needs the result. Never poll a task with sleep loops or repeated {{task_output}} calls.",
+                "Start ordinary commands in the foreground. Reserve `run_in_background: true` for explicitly independent work, not merely commands expected to take time. Read the returned output path to check progress, or call {{task_output}} once to wait when a later step needs the result. Never poll a task with sleep loops or repeated {{task_output}} calls.",
+                "Describe each command's subject and purpose in `description`. Background <task-notification> events report results, not new user requests. Match them to existing work using their task ID and description, while respecting the user's current request.",
+                // A notification often arrives as the only input of its turn.
+                // Without this, a model reads it as something to acknowledge,
+                // replies "received", and ends the turn with the original task
+                // half done; the user then has to type "continue" to restart it.
+                "A turn that opens with a <task-notification> is the original task resuming, not a prompt to acknowledge. Read the result and carry the task through its remaining steps right away. Stop only when the whole task is done or genuinely blocked, and say so; never end the turn with a bare acknowledgement while work remains.",
             ]
         } else {
             Vec::new()
@@ -203,6 +195,10 @@ impl AgentTool for BashTool {
             "command": {
                 "type": "string",
                 "description": "Bash command to execute"
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional short description naming the task or subject and purpose of this command. Saved at launch and included in background completion notices; use it to distinguish concurrent work. If omitted, the command itself identifies the task."
             },
             "timeout": {
                 "type": "number",
@@ -260,13 +256,6 @@ impl AgentTool for BashTool {
                 )));
             }
         }
-        if let Some(confirm) = &self.confirm_fn {
-            if !confirm(command_text) {
-                return Err(ToolError::Failed(
-                    "Command was not confirmed by the user.".into(),
-                ));
-            }
-        }
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
@@ -320,6 +309,7 @@ impl AgentTool for BashTool {
             .start(StartProcess {
                 command,
                 command_text: command_text.to_string(),
+                description: params["description"].as_str().map(str::to_string),
                 tool_call_id: ctx.tool_call_id.clone(),
                 cwd,
                 timeout,
@@ -347,6 +337,7 @@ impl AgentTool for BashTool {
         let started = Instant::now();
         let mut last_progress = Instant::now();
         let mut last_update = Instant::now();
+        let mut last_background_countdown = None;
         loop {
             if ctx.cancel.is_cancelled() {
                 if let Some(snapshot) = self.process_manager.stop(&task_id).await {
@@ -393,7 +384,17 @@ impl AgentTool for BashTool {
                 );
             }
 
-            if elapsed >= PROGRESS_INTERVAL && last_progress.elapsed() >= PROGRESS_INTERVAL {
+            if let Some(limit) = yield_time.map(|limit| limit.min(timeout)) {
+                let remaining = limit.saturating_sub(elapsed).as_secs_f64().ceil() as u64;
+                if last_background_countdown != Some(remaining) {
+                    if let Some(on_progress) = &ctx.on_progress {
+                        on_progress(format!(
+                            "Moves to background in {remaining}s; command keeps running."
+                        ));
+                    }
+                    last_background_countdown = Some(remaining);
+                }
+            } else if elapsed >= PROGRESS_INTERVAL && last_progress.elapsed() >= PROGRESS_INTERVAL {
                 if let Some(on_progress) = &ctx.on_progress {
                     on_progress(format!("Running... {}s", elapsed.as_secs()));
                 }
@@ -453,9 +454,15 @@ fn background_result(
     let snapshot = manager
         .snapshot(task_id)
         .ok_or_else(|| ToolError::Failed(format!("Process task disappeared: {task_id}")))?;
+    let purpose = snapshot
+        .description
+        .as_deref()
+        .map(|description| format!("Task: {description}\n"))
+        .unwrap_or_default();
     let text = format!(
-        "{}\nTask ID: {}\nOutput: {}\n{}",
+        "{}\n{}Task ID: {}\nOutput: {}\n{}",
         background_lede(reason, waited),
+        purpose,
         snapshot.task_id,
         snapshot.output_path.display(),
         BACKGROUND_GUIDANCE,

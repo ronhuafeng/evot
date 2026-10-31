@@ -7,7 +7,8 @@
  */
 
 import type { BackgroundProcess } from '../../native/index.js'
-import { BACKGROUND_PANEL_SHORTCUT_HINT, formatCommandLabel } from './background-panel.js'
+import { truncateHeadTail } from '../../render/format.js'
+import { BACKGROUND_PANEL_SHORTCUT_HINT, formatCommandLabel, sanitizeTerminalOutput } from './background-panel.js'
 
 /** Terminal states, i.e. the task will never produce output again. */
 function isSettled(status: BackgroundProcess['status']): boolean {
@@ -37,6 +38,47 @@ export function settledNoticeMessage(process: BackgroundProcess): string {
   }
   const outcome = process.status === 'failed' ? '✗ failed' : '✓ completed'
   return `  ${outcome} in background${exit} · ${id}  ${command}`
+}
+
+/** Output lines kept when a watched task's live view closes on completion. */
+export const SETTLED_SNAPSHOT_TAIL_LINES = 20
+
+/**
+ * Columns kept per snapshot line. Same cap as a foreground tool result: a
+ * line budget alone does not bound the block, since one minified JSON or
+ * extracted-page line can run to thousands of characters and wrap across
+ * dozens of rows. The full output stays in the file whose path follows.
+ */
+export const SETTLED_SNAPSHOT_LINE_WIDTH = 256
+
+/**
+ * Transcript block for a task that finished while its live output view was
+ * open.
+ *
+ * The view closes on completion so the prompt comes back by itself, but the
+ * management list only shows live tasks: once the view is gone, the output the
+ * user was watching has no other way back on screen. The settled notice is
+ * therefore followed by the last lines of output and the file path, so nothing
+ * the user was reading disappears with the overlay.
+ */
+export function settledOutputSnapshot(
+  process: BackgroundProcess,
+  output: string,
+  tailLines = SETTLED_SNAPSHOT_TAIL_LINES,
+): string {
+  const normalized = sanitizeTerminalOutput(output).replace(/\n$/, '')
+  const all = normalized.length === 0 ? [] : normalized.split('\n')
+  const visible = all
+    .slice(-tailLines)
+    .map(line => (line.length <= SETTLED_SNAPSHOT_LINE_WIDTH ? line : truncateHeadTail(line, SETTLED_SNAPSHOT_LINE_WIDTH)))
+  const hidden = all.length - visible.length
+  return [
+    settledNoticeMessage(process),
+    ...(visible.length === 0 ? ['    (no output)'] : []),
+    ...(hidden > 0 ? [`    … ${hidden} earlier ${hidden === 1 ? 'line' : 'lines'}`] : []),
+    ...visible.map(line => `    ${line}`),
+    `    ${sanitizeTerminalOutput(process.output_path)}`,
+  ].join('\n')
 }
 
 /**
@@ -82,6 +124,12 @@ export function newlySettled(
  *   submit, and they outrank a synthetic turn.
  * - A modal overlay means the agent is waiting on the user, so seizing the turn
  *   would answer a question the user has not answered yet.
+ * - After the user interrupts, leftover notices from already-finished work
+ *   must not open a new turn by themselves. A background task that just
+ *   settled is the one case that still needs a wake, because its completion
+ *   is the next step of the same instruction. Checking `runningBackground`
+ *   would miss that moment: by the time the notice is queued, the task is
+ *   already off the live list.
  */
 export function shouldWakeForNotifications(input: {
   pending: number

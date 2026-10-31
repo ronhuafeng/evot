@@ -1,8 +1,9 @@
-use evot::agent::session::Session;
 use evot::agent::*;
 use evot::conf::Protocol;
 use evot::conf::ProviderProfile;
 use evot::conf::StorageConfig;
+use evot::observability::UsageSummary;
+use evot::sessions::Session;
 use evot::storage::open_storage;
 use evot::types::*;
 use tempfile::TempDir;
@@ -70,7 +71,7 @@ async fn write_test_compact(
     } = &mut item
     {
         *messages = new_context.clone();
-        *engine_messages = evot::agent::run::convert::into_agent_messages(&new_context);
+        *engine_messages = evot::conversation::convert::into_agent_messages(&new_context);
     }
     session
         .write_compact(item, new_context, expected_seq)
@@ -179,15 +180,16 @@ async fn agent_create_session_keeps_empty_draft_out_of_lists() -> TestResult {
     assert_eq!(meta.turns, 0);
 
     let loaded = agent
-        .find_session(&meta.session_id)
+        .sessions()
+        .find(&meta.session_id)
         .await?
         .ok_or_else(|| missing_error("missing created session"))?;
     assert_eq!(loaded.session_id, meta.session_id);
 
-    let transcript = agent.load_transcript(&meta.session_id).await?;
+    let transcript = agent.sessions().transcript(&meta.session_id).await?;
     assert!(transcript.is_empty());
 
-    let sessions = agent.list_sessions(0).await?;
+    let sessions = agent.sessions().list(0).await?;
     assert!(!sessions.iter().any(|s| s.session_id == meta.session_id));
 
     // A run can persist transcript activity before its final metadata save.
@@ -199,11 +201,12 @@ async fn agent_create_session_keeps_empty_draft_out_of_lists() -> TestResult {
         .ok_or_else(|| missing_error("missing created session"))?;
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "first prompt".into(),
             content: vec![],
         }])
         .await?;
-    let sessions = agent.list_sessions(0).await?;
+    let sessions = agent.sessions().list(0).await?;
     assert!(sessions.iter().any(|s| s.session_id == meta.session_id));
     Ok(())
 }
@@ -252,7 +255,8 @@ async fn new_session_binds_requested_workspace_and_resume_keeps_it() -> TestResu
     while run.next().await.is_some() {}
 
     let created = agent
-        .find_session(&session_id)
+        .sessions()
+        .find(&session_id)
         .await?
         .ok_or_else(|| missing_error("missing workspace session"))?;
     let expected = std::fs::canonicalize(&workspace)?;
@@ -274,7 +278,8 @@ async fn new_session_binds_requested_workspace_and_resume_keeps_it() -> TestResu
     };
     while follow_run.next().await.is_some() {}
     let resumed = agent
-        .find_session(&session_id)
+        .sessions()
+        .find(&session_id)
         .await?
         .ok_or_else(|| missing_error("missing resumed session"))?;
     assert_eq!(resumed.cwd, created.cwd);
@@ -309,10 +314,12 @@ async fn resume_transcript_replays_retained_messages_with_lightweight_compact_ca
     let context = vec![
         evot::compact::context_view::compact_summary_item("summary"),
         TranscriptItem::User {
+            provenance: None,
             text: legitimate_user.into(),
             content: vec![],
         },
         TranscriptItem::User {
+            provenance: None,
             text: "retained".into(),
             content: vec![],
         },
@@ -332,7 +339,7 @@ async fn resume_transcript_replays_retained_messages_with_lightweight_compact_ca
         }])
         .await?;
 
-    let resumed = agent.load_resume_transcript(&meta.session_id).await?;
+    let resumed = agent.sessions().resume_transcript(&meta.session_id).await?;
 
     assert_eq!(resumed.len(), 4);
     assert!(matches!(
@@ -494,6 +501,7 @@ async fn round_trip_session_with_transcript() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "hello".into(),
                 content: vec![],
             },
@@ -532,6 +540,7 @@ async fn resume_session_appends_transcript() -> TestResult {
 
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "first".into(),
             content: vec![],
         }])
@@ -544,6 +553,7 @@ async fn resume_session_appends_transcript() -> TestResult {
     resumed
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "second".into(),
                 content: vec![],
             },
@@ -585,6 +595,7 @@ async fn session_title_comes_from_first_user_message() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "summarize the quarterly numbers for the infra team".into(),
                 content: vec![],
             },
@@ -632,6 +643,7 @@ async fn session_title_skips_compact_summary_user_message() -> TestResult {
     // Seed a real first turn so the session already has a good title.
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "debug the flaky auth integration test".into(),
             content: vec![],
         }])
@@ -643,6 +655,7 @@ async fn session_title_skips_compact_summary_user_message() -> TestResult {
     let summary_item =
         evot::compact::context_view::compact_summary_item("auth suite was flaky on CI");
     let real_user = TranscriptItem::User {
+        provenance: None,
         text: "re-run the suite after the fix".into(),
         content: vec![],
     };
@@ -786,6 +799,7 @@ async fn save_and_load_transcript() -> TestResult {
             1,
             0,
             TranscriptItem::User {
+                provenance: None,
                 text: "hello".into(),
                 content: vec![],
             },
@@ -843,6 +857,7 @@ async fn open_resumes_from_last_compact_entry() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "old message 1".into(),
                 content: vec![],
             },
@@ -858,6 +873,7 @@ async fn open_resumes_from_last_compact_entry() -> TestResult {
                 error_message: None,
             },
             TranscriptItem::User {
+                provenance: None,
                 text: "old message 2".into(),
                 content: vec![],
             },
@@ -879,6 +895,7 @@ async fn open_resumes_from_last_compact_entry() -> TestResult {
     write_test_compact(&session, "summary of prior context", vec![
         evot::compact::context_view::compact_summary_item("summary of prior context"),
         TranscriptItem::User {
+            provenance: None,
             text: "old message 2".into(),
             content: vec![],
         },
@@ -900,6 +917,7 @@ async fn open_resumes_from_last_compact_entry() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "new message after compact".into(),
                 content: vec![],
             },
@@ -958,6 +976,7 @@ async fn write_compact_bounds_summary_without_touching_retained_user() -> TestRe
     let replacement = vec![
         evot::compact::context_view::compact_summary_item(&summary),
         TranscriptItem::User {
+            provenance: None,
             text: retained_user.clone(),
             content: vec![],
         },
@@ -970,7 +989,7 @@ async fn write_compact_bounds_summary_without_touching_retained_user() -> TestRe
     } = &mut item
     {
         *messages = replacement.clone();
-        *engine_messages = evot::agent::run::convert::into_agent_messages(&replacement);
+        *engine_messages = evot::conversation::convert::into_agent_messages(&replacement);
     }
 
     session.write_compact(item, replacement, 0).await?;
@@ -1059,7 +1078,7 @@ async fn open_bounds_legacy_poisoned_summary_without_touching_live_user() -> Tes
     } = &mut item
     {
         *messages = compact_context.clone();
-        *engine_messages = evot::agent::run::convert::into_agent_messages(&compact_context);
+        *engine_messages = evot::conversation::convert::into_agent_messages(&compact_context);
     }
     // Bypass Session::write_compact to emulate a poisoned item persisted by an
     // older release before write-time bounds existed.
@@ -1067,6 +1086,7 @@ async fn open_bounds_legacy_poisoned_summary_without_touching_live_user() -> Tes
         .append_entries(vec![
             TranscriptEntry::new(session_id.into(), None, 1, 0, item),
             TranscriptEntry::new(session_id.into(), None, 2, 0, TranscriptItem::User {
+                provenance: None,
                 text: live_user.clone(),
                 content: vec![],
             }),
@@ -1238,7 +1258,7 @@ async fn compaction_seed_updates_restores_and_clear_breaks_chain() -> TestResult
         *messages = vec![evot::compact::context_view::compact_summary_item(
             "summary-v1",
         )];
-        *engine_messages = evot::agent::run::convert::into_agent_messages(messages);
+        *engine_messages = evot::conversation::convert::into_agent_messages(messages);
     }
     session
         .write_compact(
@@ -1309,6 +1329,7 @@ async fn open_without_compact_returns_all_entries() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "hello".into(),
                 content: vec![],
             },
@@ -1351,6 +1372,7 @@ async fn write_items_is_append_only() -> TestResult {
 
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "first".into(),
             content: vec![],
         }])
@@ -1405,6 +1427,7 @@ async fn failed_batch_does_not_publish_session_state_or_advance_sequence() -> Te
     std::fs::remove_dir(&transcript_path)?;
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "first durable item".into(),
             content: vec![],
         }])
@@ -1438,10 +1461,12 @@ async fn concurrent_batches_receive_contiguous_non_interleaved_sequences() -> Te
             session
                 .write_items(vec![
                     TranscriptItem::User {
+                        provenance: None,
                         text: "left-1".into(),
                         content: vec![],
                     },
                     TranscriptItem::User {
+                        provenance: None,
                         text: "left-2".into(),
                         content: vec![],
                     },
@@ -1455,10 +1480,12 @@ async fn concurrent_batches_receive_contiguous_non_interleaved_sequences() -> Te
             session
                 .write_items(vec![
                     TranscriptItem::User {
+                        provenance: None,
                         text: "right-1".into(),
                         content: vec![],
                     },
                     TranscriptItem::User {
+                        provenance: None,
                         text: "right-2".into(),
                         content: vec![],
                     },
@@ -1508,6 +1535,7 @@ async fn independent_storage_handles_cannot_duplicate_sequences() -> TestResult 
     let first = tokio::spawn(async move {
         created
             .write_items(vec![TranscriptItem::User {
+                provenance: None,
                 text: "first writer".into(),
                 content: vec![],
             }])
@@ -1516,6 +1544,7 @@ async fn independent_storage_handles_cannot_duplicate_sequences() -> TestResult 
     let second = tokio::spawn(async move {
         reopened
             .write_items(vec![TranscriptItem::User {
+                provenance: None,
                 text: "second writer".into(),
                 content: vec![],
             }])
@@ -1559,20 +1588,26 @@ async fn turn_write_rebases_after_external_advancement_without_losing_messages()
 
     second
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "external".into(),
             content: vec![],
         }])
         .await?;
-    let resulting_seq = first
+    let append = first
         .write_items_at(
             vec![TranscriptItem::User {
+                provenance: None,
                 text: "stale run".into(),
                 content: vec![],
             }],
             expected_seq,
         )
         .await?;
-    assert_eq!(resulting_seq, 2);
+    assert_eq!(append.next_seq, 2);
+    assert_eq!(
+        append.interleaved_context_items, 1,
+        "an external user message is context the run never saw"
+    );
 
     let entries = first_storage
         .list_entries(ListTranscriptEntries {
@@ -1598,6 +1633,121 @@ async fn turn_write_rebases_after_external_advancement_without_losing_messages()
     Ok(())
 }
 
+/// A background-task notice (or any stats item) written by the same process
+/// during a run advances the sequence but is not conversation content. The
+/// turn write must land after it and report zero interleaved context items so
+/// the run's compaction is still persisted.
+#[tokio::test]
+async fn turn_write_after_stats_notice_reports_no_interleaved_context() -> TestResult {
+    let dir = TempDir::new()?;
+    let storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
+    let session = Session::new(
+        "sess-notice-during-run".into(),
+        "/tmp".into(),
+        "model".into(),
+        storage.clone(),
+    )
+    .await?;
+    let (_, _, expected_seq) = session.context_snapshot().await;
+
+    // Same Session handle, as the CLI's ui_notice path does mid-run.
+    session
+        .write_items(vec![TranscriptItem::Stats {
+            kind: "ui_notice".into(),
+            data: serde_json::json!({ "text": "completed in background" }),
+        }])
+        .await?;
+    let append = session
+        .write_items_at(
+            vec![TranscriptItem::User {
+                provenance: None,
+                text: "turn prompt".into(),
+                content: vec![],
+            }],
+            expected_seq,
+        )
+        .await?;
+    assert_eq!(append.next_seq, 2);
+    assert_eq!(append.interleaved_context_items, 0);
+
+    // Now the compaction planned against the advanced generation is accepted.
+    session
+        .write_compact(
+            compact_item("summary", 1),
+            vec![TranscriptItem::User {
+                provenance: None,
+                text: "summary".into(),
+                content: vec![],
+            }],
+            append.next_seq,
+        )
+        .await?;
+    let entries = storage
+        .list_entries(ListTranscriptEntries {
+            session_id: "sess-notice-during-run".into(),
+            run_id: None,
+            after_seq: None,
+            limit: None,
+        })
+        .await?;
+    assert!(matches!(
+        entries.last().map(|entry| &entry.item),
+        Some(TranscriptItem::Compact { .. })
+    ));
+    Ok(())
+}
+
+/// External context and a stats item interleaved together: only the context
+/// item is counted.
+#[tokio::test]
+async fn turn_write_counts_only_context_items_among_interleaved_writes() -> TestResult {
+    let dir = TempDir::new()?;
+    let first_storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
+    let first = Session::new(
+        "sess-mixed-interleave".into(),
+        "/tmp".into(),
+        "model".into(),
+        first_storage,
+    )
+    .await?;
+    let second_storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
+    let second = Session::open("sess-mixed-interleave", second_storage)
+        .await?
+        .ok_or_else(|| missing_error("missing second session handle"))?;
+    let (_, _, expected_seq) = first.context_snapshot().await;
+
+    second
+        .write_items(vec![
+            TranscriptItem::Stats {
+                kind: "ui_notice".into(),
+                data: serde_json::json!({}),
+            },
+            TranscriptItem::User {
+                provenance: None,
+                text: "external".into(),
+                content: vec![],
+            },
+            TranscriptItem::Stats {
+                kind: "ui_notice".into(),
+                data: serde_json::json!({}),
+            },
+        ])
+        .await?;
+    let append = first
+        .write_items_at(
+            vec![TranscriptItem::User {
+                provenance: None,
+                text: "run prompt".into(),
+                content: vec![],
+            }],
+            expected_seq,
+        )
+        .await?;
+    assert_eq!(append.next_seq, 4);
+    assert_eq!(append.interleaved_context_items, 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn stale_compaction_plan_is_rejected_before_persistence() -> TestResult {
     let dir = TempDir::new()?;
@@ -1612,6 +1762,7 @@ async fn stale_compaction_plan_is_rejected_before_persistence() -> TestResult {
 
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "planned history".into(),
             content: vec![],
         }])
@@ -1619,6 +1770,7 @@ async fn stale_compaction_plan_is_rejected_before_persistence() -> TestResult {
     let expected_seq = 1;
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "concurrent write".into(),
             content: vec![],
         }])
@@ -1628,6 +1780,7 @@ async fn stale_compaction_plan_is_rejected_before_persistence() -> TestResult {
         .write_compact(
             compact_item("stale summary", 1),
             vec![TranscriptItem::User {
+                provenance: None,
                 text: "stale replacement".into(),
                 content: vec![],
             }],
@@ -1666,6 +1819,7 @@ async fn multiple_compactions_uses_last() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "msg1".into(),
                 content: vec![],
             },
@@ -1687,6 +1841,7 @@ async fn multiple_compactions_uses_last() -> TestResult {
     write_test_compact(&session, "compact-v1", vec![
         evot::compact::context_view::compact_summary_item("compact-v1"),
         TranscriptItem::User {
+            provenance: None,
             text: "msg1".into(),
             content: vec![],
         },
@@ -1696,6 +1851,7 @@ async fn multiple_compactions_uses_last() -> TestResult {
     // More messages
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "msg2".into(),
             content: vec![],
         }])
@@ -1705,6 +1861,7 @@ async fn multiple_compactions_uses_last() -> TestResult {
     write_test_compact(&session, "compact-v2", vec![
         evot::compact::context_view::compact_summary_item("compact-v2"),
         TranscriptItem::User {
+            provenance: None,
             text: "msg2".into(),
             content: vec![],
         },
@@ -1714,6 +1871,7 @@ async fn multiple_compactions_uses_last() -> TestResult {
     // One more message after second compaction
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "msg3".into(),
             content: vec![],
         }])
@@ -1752,11 +1910,11 @@ async fn stats_items_persisted_but_filtered_on_resume() -> TestResult {
     .await?;
 
     // Write a mix of conversation items and stats
-    let stats_item =
-        evot::types::TranscriptStats::LlmCallCompleted(evot::types::LlmCallCompletedStats {
+    let stats_item = evot::observability::TranscriptStats::LlmCallCompleted(
+        evot::observability::LlmCallCompletedStats {
             turn: 1,
             attempt: 0,
-            usage: evot::types::UsageSummary {
+            usage: evot::observability::UsageSummary {
                 input: 100,
                 output: 50,
                 cache_read: 0,
@@ -1766,12 +1924,14 @@ async fn stats_items_persisted_but_filtered_on_resume() -> TestResult {
             error: None,
             context_window: 0,
             stop_reason: "stop".into(),
-        })
-        .to_item();
+        },
+    )
+    .to_item();
 
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "hello".into(),
                 content: vec![],
             },
@@ -1832,6 +1992,7 @@ async fn stats_after_compact_filtered_on_resume() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "old msg".into(),
                 content: vec![],
             },
@@ -1850,10 +2011,10 @@ async fn stats_after_compact_filtered_on_resume() -> TestResult {
         .await?;
 
     // Write compact + stats + new message
-    let compact_stats = evot::types::TranscriptStats::ContextCompactionCompleted(
-        evot::types::ContextCompactionCompletedStats {
+    let compact_stats = evot::observability::TranscriptStats::ContextCompactionCompleted(
+        evot::observability::ContextCompactionCompletedStats {
             reason: evot::types::CompactReason::Threshold,
-            result: evot::types::CompactionResult::Compacted {
+            result: evot::observability::CompactionResult::Compacted {
                 before_message_count: 10,
                 after_message_count: 4,
                 before_tokens: 30000,
@@ -1876,6 +2037,7 @@ async fn stats_after_compact_filtered_on_resume() -> TestResult {
     .await?;
     session
         .write_items(vec![compact_stats, TranscriptItem::User {
+            provenance: None,
             text: "new msg".into(),
             content: vec![],
         }])
@@ -1895,81 +2057,31 @@ async fn stats_after_compact_filtered_on_resume() -> TestResult {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Planning mode — user input must not be polluted by planning prompt
-// ---------------------------------------------------------------------------
-
-/// The old bug: planning prompt was prepended to user input and stored as a
-/// single User transcript item. `first_user_title` then picked up the planning
-/// prompt as the session title. This test reproduces the old bug scenario and
-/// proves that a polluted User message yields a wrong title.
-#[tokio::test]
-async fn title_is_wrong_when_planning_prompt_pollutes_user_message() -> TestResult {
-    let dir = TempDir::new()?;
-    let storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
-
-    let session = Session::new(
-        "sess-old-bug".into(),
-        "/tmp".into(),
-        "claude-sonnet".into(),
-        storage.clone(),
-    )
-    .await?;
-
-    // Reproduce the OLD behavior: planning prompt + user input in one message.
-    let polluted = format!(
-        "You are in planning mode\n\nUser task:\n{}",
-        "refactor the auth module to use JWT"
-    );
-    session
-        .write_items(vec![TranscriptItem::User {
-            text: polluted,
-            content: vec![],
-        }])
-        .await?;
-    session.save().await?;
-
-    let loaded = Session::open("sess-old-bug", storage.clone())
-        .await?
-        .ok_or_else(|| missing_error("missing session"))?;
-    let title = loaded
-        .meta()
-        .await
-        .title
-        .ok_or_else(|| missing_error("missing title"))?;
-
-    // Title starts with planning prompt — this is the bug we fixed.
-    assert!(title.starts_with("You are in planning mode"));
-    assert_ne!(title, "refactor the auth module to use JWT");
-    Ok(())
-}
-
-/// After the fix, planning prompt lives in system_prompt, not in the user
-/// message. When run_loop stores only the raw user input, `first_user_title`
-/// derives the correct title.
+/// Session titles come from raw user input, not assistant commentary.
 #[tokio::test]
 async fn title_is_correct_when_user_message_is_clean() -> TestResult {
     let dir = TempDir::new()?;
     let storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
 
     let session = Session::new(
-        "sess-plan".into(),
+        "sess-clean-title".into(),
         "/tmp".into(),
         "claude-sonnet".into(),
         storage.clone(),
     )
     .await?;
 
-    // The NEW behavior: only raw user input in the transcript.
+    // Store only raw user input in the transcript.
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "refactor the auth module to use JWT".into(),
                 content: vec![],
             },
             TranscriptItem::Assistant {
                 content: vec![AssistantBlock::Text {
-                    text: "planning".into(),
+                    text: "I will inspect the auth module.".into(),
                 }],
                 stop_reason: "stop".into(),
                 usage: UsageSummary::default(),
@@ -1982,9 +2094,9 @@ async fn title_is_correct_when_user_message_is_clean() -> TestResult {
         .await?;
     session.save().await?;
 
-    let loaded = Session::open("sess-plan", storage.clone())
+    let loaded = Session::open("sess-clean-title", storage.clone())
         .await?
-        .ok_or_else(|| missing_error("missing planning session"))?;
+        .ok_or_else(|| missing_error("missing session"))?;
     let title = loaded
         .meta()
         .await
@@ -2015,6 +2127,7 @@ async fn clear_marker_resets_context() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "msg1".into(),
                 content: vec![],
             },
@@ -2040,6 +2153,7 @@ async fn clear_marker_resets_context() -> TestResult {
     // New messages after clear
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "fresh start".into(),
             content: vec![],
         }])
@@ -2071,6 +2185,7 @@ async fn structured_compact_entry_rebuilds_context() -> TestResult {
     session
         .write_items(vec![
             TranscriptItem::User {
+                provenance: None,
                 text: "old".into(),
                 content: vec![],
             },
@@ -2089,6 +2204,7 @@ async fn structured_compact_entry_rebuilds_context() -> TestResult {
         .await?;
 
     let replacement = vec![TranscriptItem::User {
+        provenance: None,
         text: "compacted summary".into(),
         content: vec![],
     }];
@@ -2100,12 +2216,13 @@ async fn structured_compact_entry_rebuilds_context() -> TestResult {
     } = &mut item
     {
         *messages = replacement.clone();
-        *engine_messages = evot::agent::run::convert::into_agent_messages(&replacement);
+        *engine_messages = evot::conversation::convert::into_agent_messages(&replacement);
     }
     session.write_compact(item, replacement, 2).await?;
 
     session
         .write_items(vec![TranscriptItem::User {
+            provenance: None,
             text: "after compact".into(),
             content: vec![],
         }])
@@ -2138,7 +2255,7 @@ fn marker_item_is_not_context() {
 // ---------------------------------------------------------------------------
 
 fn llm_started_item(prompt: &str) -> TranscriptItem {
-    use evot::types::observability::*;
+    use evot::observability::*;
     TranscriptStats::LlmCallStarted(LlmCallStartedStats {
         turn: 1,
         attempt: 0,
@@ -2156,7 +2273,7 @@ fn llm_started_item(prompt: &str) -> TranscriptItem {
 
 #[tokio::test]
 async fn llm_request_payload_is_delta_persisted() -> TestResult {
-    use evot::types::observability::TranscriptStats;
+    use evot::observability::TranscriptStats;
 
     let dir = TempDir::new()?;
     let storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
@@ -2202,5 +2319,48 @@ async fn llm_request_payload_is_delta_persisted() -> TestResult {
         (String::new(), 0),
         ("prompt v2".to_string(), 1),
     ]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_title_uses_typed_line_of_expanded_command() -> TestResult {
+    let dir = TempDir::new()?;
+    let storage = open_storage(&StorageConfig::fs(dir.path().to_path_buf()))?;
+    let session = Session::new(
+        "sess-command-title".into(),
+        "/tmp".into(),
+        "claude-sonnet".into(),
+        storage.clone(),
+    )
+    .await?;
+    session
+        .write_items(vec![
+            TranscriptItem::User {
+                provenance: None,
+                text: evot::command::command_prompt(
+                    "loop",
+                    "/loop 5m watch the CI run",
+                    "You are running a recurring loop.\n\nRules:\n- never busy-poll",
+                ),
+                content: vec![],
+            },
+            TranscriptItem::User {
+                provenance: None,
+                text: evot::command::command_prompt("loop-wakeup", "loop wakeup #1", "Continue"),
+                content: vec![],
+            },
+        ])
+        .await?;
+    session.save().await?;
+
+    let loaded = Session::open("sess-command-title", storage.clone())
+        .await?
+        .ok_or_else(|| missing_error("missing titled session"))?;
+    let title = loaded
+        .meta()
+        .await
+        .title
+        .ok_or_else(|| missing_error("missing session title"))?;
+    assert_eq!(title, "/loop 5m watch the CI run");
     Ok(())
 }

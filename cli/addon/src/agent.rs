@@ -1,18 +1,19 @@
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use evot::agent::Agent;
-use evot::agent::BackgroundReason;
-use evot::agent::ForkRequest;
-use evot::agent::HostTools;
-use evot::agent::QueryRequest;
-use evot::agent::ToolMode;
+use evot::api::Agent;
+use evot::api::BackgroundReason;
+use evot::api::ForkRequest;
+use evot::api::HostTools;
+use evot::api::ModelSelection;
+use evot::api::QueryRequest;
+use evot::api::SelectionReload;
+use evot::api::ToolMode;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::compaction::NapiCompaction;
 use crate::convert::parse_content_blocks;
@@ -26,8 +27,9 @@ use crate::tracing::init_tracing;
 
 #[napi]
 pub struct NapiAgent {
-    agent: Arc<Agent>,
+    pub(crate) agent: Arc<Agent>,
     env_file_path: String,
+    startup_warning: Option<String>,
 }
 
 #[napi]
@@ -37,20 +39,28 @@ impl NapiAgent {
     pub async fn create(model: Option<String>, env_file: Option<String>) -> Result<Self> {
         init_tracing();
 
-        let config = evot::conf::Config::load_with_env_file(env_file.as_deref())
+        // A stale `--model` (removed from the catalog, typo) must not exit the
+        // process: the fixes (/login, model picker) live behind this startup.
+        let (config, startup_warning) = evot::api::Config::load_with_env_file(env_file.as_deref())
             .map_err(|e| Error::from_reason(format!("config load failed: {e}")))?
-            .with_model(model)
-            .map_err(|e| Error::from_reason(format!("config model: {e}")))?;
+            .with_model_or_fallback(model);
 
         let env_file_path = config.env_file_path.to_string_lossy().to_string();
-        let agent = evot::gateway::service::build_agent(&config)
+        let agent = evot::api::build_agent(&config)
             .await
             .map_err(|e| Error::from_reason(format!("agent init: {e}")))?;
 
         Ok(Self {
             agent,
             env_file_path,
+            startup_warning,
         })
+    }
+
+    /// Non-fatal startup diagnostic (e.g. an ignored `--model`), if any.
+    #[napi(getter)]
+    pub fn startup_warning(&self) -> Option<String> {
+        self.startup_warning.clone()
     }
 
     /// Current model name.
@@ -78,7 +88,7 @@ impl NapiAgent {
     /// Send a prompt and get a stream of events.
     ///
     /// `host_specs_json` is a JSON array of host tool specs the TS side
-    /// registered (ask_user, plan, extension tools). When present and the mode
+    /// registered (ask_user, extension tools). When present and the mode
     /// permits, these are attached to the run and their execution is delegated
     /// back to JS via `host_tool_call` events.
     #[napi]
@@ -90,26 +100,24 @@ impl NapiAgent {
         content_json: Option<String>,
         host_specs_json: Option<String>,
     ) -> Result<NapiSubmitOutcome> {
-        let (host_event_tx, host_event_rx) = tokio_mpsc::unbounded_channel::<String>();
+        let (host_event_tx, host_event_rx) = tokio_mpsc::channel::<String>(32);
         let host_responders: HostResponders =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let mode = match tool_mode.as_deref() {
-            Some("interactive") | Some("planning_interactive") => {
-                if tool_mode.as_deref() == Some("planning_interactive") {
-                    ToolMode::Planning
-                } else {
-                    ToolMode::Interactive
-                }
+            Some("interactive") => ToolMode::Interactive,
+            Some("planning" | "planning_interactive") => {
+                return Err(Error::from_reason(
+                    "Planning mode has been removed. Use interactive mode instead.",
+                ));
             }
-            Some("planning") => ToolMode::Planning,
             Some("readonly") => ToolMode::Readonly,
             _ => ToolMode::Headless,
         };
 
         // Assemble host tools from the registered specs. Readonly runs carry no
-        // host bridge (matches ToolMode::allows_host_tools).
-        let host_tools = if mode.allows_host_tools() {
+        // host bridge (as required by the resolved preset policy).
+        let host_tools = if mode.policy().host_tools {
             let specs =
                 parse_host_tool_specs(host_specs_json.as_deref()).map_err(Error::from_reason)?;
             if specs.is_empty() {
@@ -149,12 +157,12 @@ impl NapiAgent {
             .map_err(|e| Error::from_reason(format!("query failed: {e}")))?;
 
         match outcome {
-            evot::agent::SubmitOutcome::Command(msg) => Ok(NapiSubmitOutcome {
+            evot::api::SubmitOutcome::Command(msg) => Ok(NapiSubmitOutcome {
                 kind: "command".into(),
                 run: std::sync::Mutex::new(None),
                 message: Some(msg),
             }),
-            evot::agent::SubmitOutcome::Run(run) => {
+            evot::api::SubmitOutcome::Run(run) => {
                 let sid = run.session_id.clone();
                 let handle = run.handle();
 
@@ -164,8 +172,7 @@ impl NapiAgent {
                         inner: Mutex::new(run),
                         handle,
                         cached_session_id: sid,
-                        aborted: Arc::new(AtomicBool::new(false)),
-                        abort_notify: Arc::new(Notify::new()),
+                        abort_signal: CancellationToken::new(),
                         host_event_rx: Mutex::new(Some(host_event_rx)),
                         host_responders,
                     })),
@@ -190,7 +197,8 @@ impl NapiAgent {
     pub async fn list_sessions(&self, limit: Option<u32>) -> Result<String> {
         let sessions = self
             .agent
-            .list_sessions(limit.unwrap_or(20) as usize)
+            .sessions()
+            .list(limit.unwrap_or(20) as usize)
             .await
             .map_err(|e| Error::from_reason(format!("list sessions: {e}")))?;
 
@@ -201,10 +209,62 @@ impl NapiAgent {
     pub async fn list_sessions_with_text(&self, limit: Option<u32>) -> Result<String> {
         let items = self
             .agent
-            .list_sessions_with_text(limit.unwrap_or(0) as usize)
+            .sessions()
+            .list_with_text(limit.unwrap_or(0) as usize)
             .await
             .map_err(|e| Error::from_reason(format!("list sessions with text: {e}")))?;
         serde_json::to_string(&items).map_err(|e| Error::from_reason(format!("serialize: {e}")))
+    }
+
+    /// One session's text, for the resume pane's focused row. Returns `null`
+    /// when the session is gone.
+    #[napi]
+    pub async fn session_with_text(&self, session_id: String) -> Result<Option<String>> {
+        let item = self
+            .agent
+            .sessions()
+            .with_text(&session_id)
+            .await
+            .map_err(|e| Error::from_reason(format!("session with text: {e}")))?;
+        match item {
+            Some(item) => serde_json::to_string(&item)
+                .map(Some)
+                .map_err(|e| Error::from_reason(format!("serialize: {e}"))),
+            None => Ok(None),
+        }
+    }
+
+    #[napi]
+    pub async fn rename_session(&self, session_id: String, title: String) -> Result<String> {
+        let session = self
+            .agent
+            .rename_session(&session_id, &title)
+            .await
+            .map_err(|e| Error::from_reason(format!("rename session: {e}")))?;
+        serde_json::to_string(&session).map_err(|e| Error::from_reason(format!("serialize: {e}")))
+    }
+
+    /// Fork `source_id` into a new persistent session inheriting its context.
+    #[napi]
+    pub async fn fork_session(&self, source_id: String, title: Option<String>) -> Result<String> {
+        let meta = self
+            .agent
+            .fork_session(&source_id, title.as_deref())
+            .await
+            .map_err(|e| Error::from_reason(format!("fork session: {e}")))?;
+        serde_json::to_string(&meta).map_err(|e| Error::from_reason(format!("serialize: {e}")))
+    }
+
+    /// Fork ancestry, root first and `session_id` last. Empty when unknown.
+    #[napi]
+    pub async fn session_lineage(&self, session_id: String) -> Result<String> {
+        let chain = self
+            .agent
+            .sessions()
+            .lineage(&session_id)
+            .await
+            .map_err(|e| Error::from_reason(format!("session lineage: {e}")))?;
+        serde_json::to_string(&chain).map_err(|e| Error::from_reason(format!("serialize: {e}")))
     }
 
     #[napi]
@@ -282,6 +342,11 @@ impl NapiAgent {
     }
 
     #[napi]
+    pub fn pending_process_wake_notifications(&self, session_id: String) -> u32 {
+        self.agent.pending_process_wake_notifications(&session_id) as u32
+    }
+
+    #[napi]
     pub async fn stop_all_background_processes(&self, session_id: String) -> Result<String> {
         serialize_process_summaries(self.agent.stop_all_background_processes(&session_id).await)
     }
@@ -298,11 +363,13 @@ impl NapiAgent {
     pub async fn load_transcript(&self, session_id: String) -> Result<String> {
         let items = self
             .agent
-            .load_transcript(&session_id)
+            .sessions()
+            .transcript(&session_id)
             .await
             .map_err(|e| Error::from_reason(format!("load transcript: {e}")))?;
 
-        serde_json::to_string(&items).map_err(|e| Error::from_reason(format!("serialize: {e}")))
+        serde_json::to_string(&evot::conversation::input::transcript_views(&items))
+            .map_err(|e| Error::from_reason(format!("serialize: {e}")))
     }
 
     /// Load the effective context transcript for a session, after control markers.
@@ -310,11 +377,13 @@ impl NapiAgent {
     pub async fn load_context_transcript(&self, session_id: String) -> Result<String> {
         let items = self
             .agent
-            .load_context_transcript(&session_id)
+            .sessions()
+            .context_transcript(&session_id)
             .await
             .map_err(|e| Error::from_reason(format!("load context transcript: {e}")))?;
 
-        serde_json::to_string(&items).map_err(|e| Error::from_reason(format!("serialize: {e}")))
+        serde_json::to_string(&evot::conversation::input::transcript_views(&items))
+            .map_err(|e| Error::from_reason(format!("serialize: {e}")))
     }
 
     /// Load a bounded resume view without superseded history or Engine-only
@@ -323,11 +392,13 @@ impl NapiAgent {
     pub async fn load_resume_transcript(&self, session_id: String) -> Result<String> {
         let items = self
             .agent
-            .load_resume_transcript(&session_id)
+            .sessions()
+            .resume_transcript(&session_id)
             .await
             .map_err(|e| Error::from_reason(format!("load resume transcript: {e}")))?;
 
-        serde_json::to_string(&items).map_err(|e| Error::from_reason(format!("serialize: {e}")))
+        serde_json::to_string(&evot::conversation::input::transcript_views(&items))
+            .map_err(|e| Error::from_reason(format!("serialize: {e}")))
     }
 
     /// Find a single session by ID.
@@ -335,7 +406,8 @@ impl NapiAgent {
     pub async fn find_session(&self, session_id: String) -> Result<Option<String>> {
         let meta = self
             .agent
-            .find_session(&session_id)
+            .sessions()
+            .find(&session_id)
             .await
             .map_err(|e| Error::from_reason(format!("find session: {e}")))?;
         match meta {
@@ -414,16 +486,18 @@ impl NapiAgent {
         let env_path = config.env_file_path.to_string_lossy().to_string();
         let has_api_key = !llm.api_key.is_empty();
         let available = self.collect_models(&config);
-        let thinking_level = display_thinking_level(&llm);
-        let info = serde_json::json!({
-            "provider": provider,
-            "protocol": llm.protocol.to_string(),
-            "envPath": env_path,
-            "hasApiKey": has_api_key,
-            "baseUrl": llm.base_url,
-            "availableModels": available,
-            "thinkingLevel": thinking_level,
-        });
+        let thinking_level = ModelSelection::display_thinking_level_for(&llm);
+        let info = evot::api::ConfigInfo {
+            provider,
+            protocol: llm.protocol.to_string(),
+            env_path,
+            has_api_key,
+            base_url: Some(llm.base_url),
+            available_models: available,
+            thinking_level,
+            judge: config.judge.as_ref().map(|judge| judge.model.clone()),
+            default_model: config.cloud_default_model.clone(),
+        };
         serde_json::to_string(&info).map_err(|e| Error::from_reason(format!("serialize: {e}")))
     }
 
@@ -440,71 +514,18 @@ impl NapiAgent {
             .collect())
     }
 
-    fn load_config(&self) -> Result<evot::conf::Config> {
-        evot::conf::Config::load_with_env_file(Some(&self.env_file_path))
+    fn load_config(&self) -> Result<evot::api::Config> {
+        evot::api::Config::load_with_env_file(Some(&self.env_file_path))
             .map_err(|e| Error::from_reason(format!("config reload failed: {e}")))
     }
 
-    fn collect_models(&self, config: &evot::conf::Config) -> Vec<serde_json::Value> {
-        let llm = self.agent.llm();
-        let free_meta = crate::cloud_model_meta();
-        // The server names and orders its own groups; membership decides which
-        // providers are cloud, so no name is hardcoded here.
-        let cloud_groups = crate::cloud_provider_groups();
-        let mut models = Vec::new();
-        for (provider, profile) in &config.providers {
-            for model in &profile.models {
-                let model = model.trim();
-                if !model.is_empty() {
-                    let mut entry = serde_json::json!({
-                        "provider": provider,
-                        "protocol": profile.protocol.to_string(),
-                        "model": model,
-                        "spec": format!("{provider}:{model}"),
-                    });
-                    if let Some((label, order)) = cloud_groups.get(provider) {
-                        entry["group_label"] = serde_json::json!(label);
-                        entry["group_order"] = serde_json::json!(order);
-                        // Catalog rank inside the tier: higher shows earlier
-                        // when the picker merges protocol providers.
-                        entry["sort_order"] = serde_json::json!(config
-                            .cloud_model_sorts
-                            .get(model)
-                            .copied()
-                            .unwrap_or(0));
-                        if let Some(meta) = free_meta.get(model) {
-                            entry["free"] = serde_json::json!({
-                                "display_name": meta.display_name,
-                                "tagline": meta.tagline,
-                                "is_new": meta.is_new,
-                                "tier": meta.tier,
-                            });
-                        } else {
-                            entry["free"] = serde_json::json!({});
-                        }
-                    }
-                    models.push(entry);
-                }
-            }
-        }
-        let current_is_listed = config.providers.get(&llm.provider).is_some_and(|profile| {
-            profile
-                .models
-                .iter()
-                .any(|model| model.trim() == llm.model.trim())
-        });
-        if !llm.model.trim().is_empty()
-            && !current_is_listed
-            && config.providers.contains_key(&llm.provider)
-        {
-            models.push(serde_json::json!({
-                "provider": llm.provider,
-                "protocol": llm.protocol.to_string(),
-                "model": llm.model,
-                "spec": format!("{}:{}", llm.provider, llm.model),
-            }));
-        }
-        models
+    fn collect_models(&self, config: &evot::api::Config) -> Vec<serde_json::Value> {
+        evot::api::model_catalog(
+            config,
+            &self.agent.llm(),
+            &crate::cloud_model_meta(),
+            &crate::cloud_provider_groups(),
+        )
     }
 
     /// Switch the active provider by model spec.
@@ -512,7 +533,7 @@ impl NapiAgent {
     pub fn set_provider(&self, provider: String) -> Result<()> {
         let config = self.load_config()?;
         self.agent
-            .set_provider_by_spec(&config, &provider)
+            .set_model_by_spec(&config, &provider)
             .map_err(|e| Error::from_reason(format!("invalid provider: {e}")))
     }
 
@@ -523,6 +544,22 @@ impl NapiAgent {
     pub fn reload_selection(&self) -> Result<bool> {
         let config = self.load_config()?;
         Ok(self.agent.reload_selection(&config).has_model())
+    }
+
+    /// Like `reload_selection`, but reports where the selection landed:
+    /// `kept`, `followed` (same model id, new provider), `switched`
+    /// (different model), or `unconfigured`. Lets the UI announce only real
+    /// movement instead of diffing display state.
+    #[napi]
+    pub fn reload_selection_outcome(&self) -> Result<String> {
+        let config = self.load_config()?;
+        let outcome = match self.agent.reload_selection(&config) {
+            SelectionReload::Kept => "kept",
+            SelectionReload::Followed => "followed",
+            SelectionReload::Switched => "switched",
+            SelectionReload::Unconfigured => "unconfigured",
+        };
+        Ok(outcome.to_string())
     }
 
     /// Reload provider/model selection from disk for session resume. Unlike an
@@ -544,14 +581,36 @@ impl NapiAgent {
     /// selectable reasoning levels.
     #[napi]
     pub fn cycle_thinking_level(&self) -> Option<String> {
-        let level = self.agent.cycle_thinking_level()?;
-        // Best-effort: the live session keeps the new level even when the
-        // config write fails; the default then falls back on next start.
-        if let Ok(mut config) = self.load_config() {
-            let provider = self.agent.llm().provider.clone();
-            let _ = evot::conf::persist_default_thinking_level(&mut config, &provider, level);
+        evot::api::cycle_thinking_level(&self.agent, &self.env_file_path)
+    }
+
+    /// Apply a named thinking level and persist it as the default, the same
+    /// double write `cycle_thinking_level` performs. Unlike `cycle`, the caller
+    /// names the tier, so the model picker can commit a model and its effort in
+    /// one gesture. Returns the new display label, or `null` when the level is
+    /// unknown or the active model does not offer it — the caller then leaves
+    /// the live selection untouched rather than silently clamping.
+    #[napi]
+    pub fn set_thinking_level(&self, level: String) -> Option<String> {
+        evot::api::set_thinking_level(&self.agent, &self.env_file_path, &level)
+    }
+
+    /// Make a cloud model the account's default for future sessions, on this
+    /// and every other machine, without touching the live selection. Returns
+    /// the pinned model id, or `null` when the model is BYOK / nobody is
+    /// logged in (local config already remembers those). Errors when the
+    /// server refuses the pin.
+    #[napi]
+    pub async fn pin_default_model(
+        &self,
+        provider: String,
+        model: String,
+    ) -> Result<Option<String>> {
+        match evot::api::pin_default_model(&self.env_file_path, &provider, &model).await {
+            Ok(evot::api::PinOutcome::Pinned(model)) => Ok(Some(model)),
+            Ok(evot::api::PinOutcome::NotCloud) => Ok(None),
+            Err(e) => Err(Error::from_reason(format!("pin default model: {e}"))),
         }
-        Some(display_thinking_level(&self.agent.llm()))
     }
 
     /// Apply a named thinking level when supported by the active model.
@@ -625,6 +684,20 @@ impl NapiAgent {
         NapiCompaction::start(self.agent.clone(), session_id, custom_instructions)
     }
 
+    /// Start a disposable suggestion with the current model snapshot as the
+    /// fallback when no dedicated service is published. Never touches the run.
+    #[napi]
+    pub fn suggest_next_prompt(
+        &self,
+        context_json: String,
+    ) -> Result<crate::suggestion::NapiSuggestion> {
+        let request = evot::suggestion::parse_request(&context_json).map_err(Error::from_reason)?;
+        Ok(crate::suggestion::NapiSuggestion::start(
+            request,
+            self.agent.llm(),
+        ))
+    }
+
     /// Send a steering message into a running session.
     #[napi]
     pub fn steer(&self, session_id: String, text: String, content_json: Option<String>) {
@@ -661,6 +734,9 @@ fn process_summary_json(summary: &evot_engine::tools::ProcessSummary) -> serde_j
     serde_json::json!({
         "task_id": summary.task_id,
         "command": summary.command,
+        "description": summary.description,
+        "recent_output": summary.recent_output,
+        "quiet_for_ms": summary.quiet_for.as_millis(),
         "cwd": summary.cwd,
         "output_path": summary.output_path,
         "status": summary.status.as_str(),
@@ -685,21 +761,4 @@ fn serialize_process_summaries(
         .collect::<Vec<_>>();
     serde_json::to_string(&values)
         .map_err(|e| Error::from_reason(format!("serialize background processes: {e}")))
-}
-
-/// Footer label for the active reasoning effort, mirroring pi's footer:
-/// the abstract level name (`off`/`low`/`medium`/`high`/`xhigh`/`max`) is shown
-/// verbatim — it is never translated through the model's
-/// `thinking_level_map`.
-///
-/// Returns an empty string when the model honors no selectable reasoning
-/// effort (e.g. an OpenAI-compatible provider without the reasoning-effort
-/// capability), which tells the footer to omit the indicator — the same gate
-/// pi applies via `model.reasoning`.
-fn display_thinking_level(llm: &evot::conf::LlmConfig) -> String {
-    let model_config = &llm.model_config;
-    if !model_config.reasoning() || model_config.supported_thinking_levels().is_empty() {
-        return String::new();
-    }
-    llm.thinking_level.as_str().to_string()
 }

@@ -14,9 +14,14 @@ pub const DEFAULT_SERVER_URL: &str = "https://auto.evot.ai";
 #[derive(Debug, Clone)]
 pub enum PollOutcome {
     Pending,
-    Success { user: AuthState },
+    Success {
+        user: AuthState,
+    },
     Expired,
-    Denied,
+    Denied {
+        reason: Option<String>,
+        reason_code: Option<String>,
+    },
 }
 
 /// Result of one authenticated catalog read.
@@ -41,7 +46,11 @@ pub async fn fetch_catalog(state: &AuthState) -> CatalogOutcome {
         "{}/v1/config/models",
         state.server_base_url.trim_end_matches('/')
     );
-    let sent = reqwest::Client::new()
+    let client = match crate::http::client() {
+        Ok(client) => client,
+        Err(error) => return CatalogOutcome::Unavailable(format!("sync models: {error}")),
+    };
+    let sent = client
         .get(&url)
         .bearer_auth(&state.cli_token)
         .timeout(Duration::from_secs(30))
@@ -77,7 +86,7 @@ pub async fn poll_status(base_url: &str, code: &str, expires_at: i64) -> Result<
         urlencode(code),
         expires_at
     );
-    let response = http_json(reqwest::Client::new().get(&url)).await?;
+    let response = http_json(crate::http::client()?.get(&url)).await?;
     let status = response
         .get("status")
         .and_then(|value| value.as_str())
@@ -96,14 +105,23 @@ pub async fn poll_status(base_url: &str, code: &str, expires_at: i64) -> Result<
             Ok(PollOutcome::Success { user })
         }
         "expired" => Ok(PollOutcome::Expired),
-        "denied" => Ok(PollOutcome::Denied),
+        "denied" => Ok(PollOutcome::Denied {
+            reason: response
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .map(String::from),
+            reason_code: response
+                .get("reason_code")
+                .and_then(|value| value.as_str())
+                .map(String::from),
+        }),
         _ => Ok(PollOutcome::Pending),
     }
 }
 
 pub async fn sync_notices(base_url: &str) -> Result<Vec<Notice>> {
     let url = [base_url.trim_end_matches('/'), "/v1/notices"].concat();
-    let response = reqwest::Client::new()
+    let response = crate::http::client()?
         .get(&url)
         .timeout(Duration::from_secs(30))
         .send()
@@ -126,8 +144,7 @@ pub async fn sync_models(state: &AuthState) -> Result<ModelsResponse> {
         "{}/v1/config/models",
         state.server_base_url.trim_end_matches('/')
     );
-    let client = reqwest::Client::new();
-    let response = client
+    let response = crate::http::client()?
         .get(&url)
         .bearer_auth(&state.cli_token)
         .timeout(Duration::from_secs(30))
@@ -146,13 +163,37 @@ pub async fn sync_models(state: &AuthState) -> Result<ModelsResponse> {
         .map_err(|error| EvotError::Conf(format!("decode: {error}")))
 }
 
+/// Pin (or, with an empty `model`, clear) the account's landing model on the
+/// server. The server rejects models this account cannot use right now.
+pub async fn set_default_model(state: &AuthState, model: &str) -> Result<()> {
+    let url = format!(
+        "{}/v1/config/default-model",
+        state.server_base_url.trim_end_matches('/')
+    );
+    let response = crate::http::client()?
+        .put(&url)
+        .bearer_auth(&state.cli_token)
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| EvotError::Conf(format!("set default model: {error}")))?;
+    if !response.status().is_success() {
+        return Err(EvotError::Conf(format!(
+            "set default model: server returned {}",
+            response.status()
+        )));
+    }
+    Ok(())
+}
+
 async fn post_json<T: DeserializeOwned>(
     base_url: &str,
     path: &str,
     body: &serde_json::Value,
 ) -> Result<T> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    let client = reqwest::Client::new();
+    let client = crate::http::client()?;
     let response = client
         .post(&url)
         .json(body)

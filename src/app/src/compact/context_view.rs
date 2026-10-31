@@ -22,6 +22,7 @@ pub fn is_compact_summary_text(text: &str) -> bool {
 
 pub fn compact_summary_item(summary: &str) -> TranscriptItem {
     TranscriptItem::User {
+        provenance: None,
         text: compact_summary_text(summary),
         content: vec![],
     }
@@ -106,7 +107,7 @@ pub fn resolve_engine_context_with_state(
                 (messages, Some(state))
             }
             TranscriptItem::Marker { messages, .. } => (
-                crate::agent::run::convert::into_agent_messages(messages),
+                crate::conversation::convert::into_agent_messages(messages),
                 None,
             ),
             _ => (Vec::new(), None),
@@ -116,7 +117,7 @@ pub fn resolve_engine_context_with_state(
     let start = last_control
         .map(|index| index.saturating_add(1))
         .unwrap_or(0);
-    messages.extend(crate::agent::run::convert::into_agent_messages(
+    messages.extend(crate::conversation::convert::into_agent_messages(
         &entries[start..]
             .iter()
             .filter(|entry| entry.item.is_context_item())
@@ -125,11 +126,6 @@ pub fn resolve_engine_context_with_state(
     ));
     evot_engine::migrate_legacy_responses_tool_ids(&mut messages);
     (messages, state)
-}
-
-/// Resolve only the Engine context at the latest control point.
-pub fn resolve_engine_context(entries: &[TranscriptEntry]) -> Vec<evot_engine::AgentMessage> {
-    resolve_engine_context_with_state(entries).0
 }
 
 /// Enforce compaction summary bounds before an atomic compact item is persisted
@@ -156,7 +152,7 @@ pub(crate) fn normalize_compact_item(
 }
 
 fn normalize_transcript_summary_boundary(summary: &str, messages: &mut [TranscriptItem]) {
-    let Some(TranscriptItem::User { text, content }) = messages.first_mut() else {
+    let Some(TranscriptItem::User { text, content, .. }) = messages.first_mut() else {
         return;
     };
     if !is_summary_boundary_text(text, summary) {

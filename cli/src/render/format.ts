@@ -17,30 +17,81 @@ function repeatCount(n: number): number {
 /** Standards-backed grapheme segmentation for safe Unicode truncation. */
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
 
+const CLUSTER_SENSITIVE = /[\p{Mark}\p{Extended_Pictographic}\p{Regional_Indicator}\p{Default_Ignorable_Code_Point}\p{Control}\p{Format}\p{Surrogate}\u200d\u1100-\u11ff\ufe00-\ufe0f]/v
+
+const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x3000, 0x3029],
+  [0x3030, 0x303e],
+  [0x3041, 0x3096],
+  [0x30a0, 0x30ff],
+  [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff],
+  [0xac00, 0xd7a3],
+  [0xf900, 0xfaff],
+  [0xff01, 0xff60],
+  [0xffe0, 0xffe6],
+]
+
+const NARROW_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x0020, 0x007e],
+  [0x00a1, 0x00ac],
+  [0x00ae, 0x00ff],
+  [0x0100, 0x017f],
+  [0x2010, 0x2029],
+  [0x202f, 0x205e],
+]
+
+function inRanges(cp: number, ranges: ReadonlyArray<readonly [number, number]>): boolean {
+  for (const [lo, hi] of ranges) {
+    if (cp < lo) return false
+    if (cp <= hi) return true
+  }
+  return false
+}
+
+function simpleCodePointWidth(cp: number): number | null {
+  if (cp >= 0x20 && cp <= 0x7e) return 1
+  if (inRanges(cp, WIDE_RANGES)) return 2
+  if (inRanges(cp, NARROW_RANGES)) return 1
+  return null
+}
+
+export function displayWidth(s: string): number {
+  if (CLUSTER_SENSITIVE.test(s)) return stringWidth(s)
+  let width = 0
+  for (const char of s) {
+    const cp = char.codePointAt(0)
+    if (cp === undefined) return stringWidth(s)
+    const w = simpleCodePointWidth(cp)
+    if (w === null) return stringWidth(s)
+    width += w
+  }
+  return width
+}
+
+function truncateToWidth(s: string, budget: number): string {
+  let out = ''
+  let used = 0
+  for (const { segment } of graphemeSegmenter.segment(s)) {
+    const size = displayWidth(segment)
+    if (used + size > budget) break
+    out += segment
+    used += size
+  }
+  return out
+}
+
 export function padRight(s: string, n: number): string {
   n = repeatCount(n)
 
-  // Session rows are overwhelmingly ASCII. Keep that path allocation-free,
-  // and delegate every other script to string-width rather than maintaining a
-  // partial Unicode table that mismeasures Indic and decomposed Hangul text.
   if (/^[\x20-\x7e]*$/.test(s)) {
     if (s.length <= n) return s + ' '.repeat(n - s.length)
     return s.slice(0, Math.max(0, n - 1)) + '…'
   }
 
-  const width = stringWidth(s)
+  const width = displayWidth(s)
   if (width <= n) return s + ' '.repeat(n - width)
-
-  const budget = n - 1
-  let truncated = ''
-  let truncatedWidth = 0
-  for (const { segment } of graphemeSegmenter.segment(s)) {
-    const segmentWidth = stringWidth(segment)
-    if (truncatedWidth + segmentWidth > budget) break
-    truncated += segment
-    truncatedWidth += segmentWidth
-  }
-  return truncated + '…'
+  return truncateToWidth(s, n - 1) + '…'
 }
 
 export function relativeTime(iso: string): string {
@@ -89,217 +140,17 @@ export function formatElapsed(ms: number): string {
   return restMinutes === 0 ? `${hours}h` : `${hours}h ${restMinutes}m`
 }
 
-export function renderBar(value: number, max: number, width: number): string {
-  width = repeatCount(width)
+export function formatWallClock(timestamp: number): string {
+  const at = new Date(timestamp)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(at.getHours())}:${pad(at.getMinutes())}:${pad(at.getSeconds())}`
+}
+
+export function renderBar(value: number, max: number, width: number): string {  width = repeatCount(width)
   if (width === 0) return ''
   if (max <= 0 || !Number.isFinite(max) || !Number.isFinite(value)) return '░'.repeat(width)
   const filled = repeatCount(Math.round((value / max) * width))
   return '█'.repeat(Math.min(filled, width)) + '░'.repeat(Math.max(0, width - filled))
-}
-
-/**
- * Position bar character mapping for compaction methods.
- *
- *   · — Unchanged / kept
- *   O — Outline (tree-sitter structural extraction)
- *   H — HeadTail (head + tail truncation)
- *   S — Summarized (turn summarized)
- *   D — Dropped (messages evicted)
- *   L — LifecycleReclaimed (current-run result reclaimed after use)
- *   A — AgeCleared (old result cleared by age policy)
- *   X — OversizeCapped (oversized result capped)
- *   I — ImageStripped (old image stripped under severe pressure)
- *   T — TurnCollapsed (assistant/tool turn collapsed into summary)
- *   E — MessagesEvicted (messages evicted)
- */
-const COMPACTION_METHOD_CHARS: Record<string, string> = {
-  Outline: 'O',
-  HeadTail: 'H',
-  Summarized: 'T',
-  TurnCollapsed: 'T',
-  Dropped: 'E',
-  MessagesEvicted: 'E',
-  LifecycleCleared: 'L',
-  LifecycleReclaimed: 'L',
-  AgeCleared: 'A',
-  OversizeCapped: 'X',
-  ImageStripped: 'I',
-}
-
-const COMPACTION_METHOD_LEGEND: Record<string, string> = {
-  O: 'Outline',
-  H: 'HeadTail',
-  T: 'TurnCollapsed',
-  E: 'MessagesEvicted',
-  L: 'LifecycleReclaimed',
-  A: 'AgeCleared',
-  X: 'OversizeCapped',
-  I: 'ImageStripped',
-}
-
-/**
- * Render a position bar showing which messages were affected by compaction,
- * plus a legend line listing only the characters that actually appear.
- *
- * When beforeCount > WIDTH, large action blocks are sqrt-compressed so kept
- * ranges get enough slots to show their approximate position.
- *
- * Returns `{ bar, legend }` so the caller can place them independently.
- */
-export interface CompactionAction {
-  index?: number
-  end_index?: number
-  method?: string
-  before_tokens?: number
-  after_tokens?: number
-  related_count?: number
-  tool_name?: string
-}
-
-export function renderPositionBar(beforeCount: number, sortedActions: CompactionAction[], _level: number): { bar: string; legend: string } {
-  const WIDTH = 40
-  if (beforeCount === 0) return { bar: `[${'·'.repeat(WIDTH)}]`, legend: '·=unchanged/kept' }
-
-  const slotCount = Math.min(WIDTH, beforeCount)
-  const slots = new Array(slotCount).fill('·')
-
-  if (beforeCount <= WIDTH) {
-    // 1:1 mapping — each message gets its own slot
-    for (const a of sortedActions) {
-      const start = a.index ?? 0
-      const end = a.end_index ?? start
-      const method = a.method ?? ''
-      const ch = COMPACTION_METHOD_CHARS[method] ?? '?'
-      for (let i = start; i <= Math.min(end, slotCount - 1); i++) slots[i] = ch
-    }
-  } else {
-    // Segment-based allocation: sqrt-compress action blocks, keep '·' linear
-    // so kept ranges are clearly visible at their approximate position.
-    type Seg = { ch: string; count: number }
-
-    // Sort actions by index, build segments with gaps as kept ranges
-    const byIdx = [...sortedActions]
-      .map(a => ({
-        s: a.index ?? 0,
-        e: a.end_index ?? a.index ?? 0,
-        ch: COMPACTION_METHOD_CHARS[a.method ?? ''] ?? '?',
-      }))
-      .sort((a, b) => a.s - b.s)
-
-    const raw: Seg[] = []
-    let cursor = 0
-    for (const a of byIdx) {
-      if (a.s > cursor) raw.push({ ch: '·', count: a.s - cursor })
-      if (a.e >= cursor) {
-        const start = Math.max(a.s, cursor)
-        raw.push({ ch: a.ch, count: a.e - start + 1 })
-        cursor = a.e + 1
-      }
-    }
-    if (cursor < beforeCount) raw.push({ ch: '·', count: beforeCount - cursor })
-
-    // Merge adjacent segments with same char
-    const segs: Seg[] = []
-    for (const s of raw) {
-      const last = segs.length > 0 ? segs[segs.length - 1]! : null
-      if (last && last.ch === s.ch) last.count += s.count
-      else segs.push({ ...s })
-    }
-
-    // Weight: kept = linear count, action = sqrt (compresses large blocks)
-    const weights = segs.map(s => s.ch === '·' ? s.count : Math.max(1, Math.ceil(Math.sqrt(s.count))))
-    const totalWeight = weights.reduce((a, b) => a + b, 0)
-
-    // Allocate slots proportionally (min 1 per segment)
-    const alloc = weights.map(w => Math.max(1, Math.round(w / totalWeight * slotCount)))
-    let sum = alloc.reduce((a, b) => a + b, 0)
-
-    // Adjust to exactly slotCount
-    const MAX_ADJUST = slotCount
-    for (let iter = 0; iter < MAX_ADJUST && sum !== slotCount; iter++) {
-      if (sum > slotCount) {
-        // Shrink largest action segment (prefer non-kept, skip segments at 1)
-        let best = -1
-        for (let i = 0; i < alloc.length; i++) {
-          if (alloc[i]! <= 1) continue
-          if (best === -1) { best = i; continue }
-          // Prefer shrinking action over kept
-          if (segs[best]!.ch === '·' && segs[i]!.ch !== '·') { best = i; continue }
-          if (segs[best]!.ch !== '·' && segs[i]!.ch === '·') continue
-          if (alloc[i]! > alloc[best]!) best = i
-        }
-        if (best === -1) break
-        alloc[best]!--
-        sum--
-      } else {
-        // Grow: prefer kept segments
-        let best = 0
-        for (let i = 1; i < alloc.length; i++) {
-          if (segs[i]!.ch === '·' && segs[best]!.ch !== '·') { best = i; continue }
-          if (segs[i]!.ch !== '·' && segs[best]!.ch === '·') continue
-          if (alloc[i]! > alloc[best]!) best = i
-        }
-        alloc[best]!++
-        sum++
-      }
-    }
-
-    // Fill bar from segments, embedding [N..] labels in large action blocks
-    const barChars: string[] = []
-    const usedChars = new Set<string>()
-    let hasKept = false
-
-    for (let i = 0; i < segs.length; i++) {
-      const seg = segs[i]!
-      const width = alloc[i]!
-
-      if (seg.ch === '·') {
-        hasKept = true
-        for (let j = 0; j < width; j++) barChars.push('·')
-        continue
-      }
-
-      usedChars.add(seg.ch)
-      const label = `─${seg.count}─`
-      const minWidth = label.length + 2 // at least 1 action char on each side
-
-      if (seg.count > width && width >= minWidth) {
-        const remaining = width - label.length
-        const left = Math.ceil(remaining / 2)
-        const right = remaining - left
-        for (let j = 0; j < left; j++) barChars.push(seg.ch)
-        for (const c of label) barChars.push(c)
-        for (let j = 0; j < right; j++) barChars.push(seg.ch)
-      } else {
-        for (let j = 0; j < width; j++) barChars.push(seg.ch)
-      }
-    }
-
-    const bar = `[${barChars.join('')}]`
-
-    // Build legend from segments
-    const legendParts: string[] = []
-    if (hasKept) legendParts.push('·=unchanged/kept')
-    for (const [ch, method] of Object.entries(COMPACTION_METHOD_LEGEND)) {
-      if (usedChars.has(ch)) legendParts.push(`${ch}=${method}`)
-    }
-    const legend = legendParts.join('  ')
-
-    return { bar, legend }
-  }
-
-  const bar = `[${slots.join('')}]`
-
-  // Build legend from chars that actually appear in the bar
-  const seen = new Set(slots)
-  const legendParts: string[] = []
-  if (seen.has('·')) legendParts.push('·=unchanged/kept')
-  for (const [ch, method] of Object.entries(COMPACTION_METHOD_LEGEND)) {
-    if (seen.has(ch)) legendParts.push(`${ch}=${method}`)
-  }
-  const legend = legendParts.join('  ')
-
-  return { bar, legend }
 }
 
 export function truncate(s: string, max: number): string {
@@ -322,12 +173,24 @@ export function summarizeInline(value: string, maxChars: number): string {
   return truncate(collapsed, maxChars)
 }
 
+export function clipDisplayText(text: string, columns: number): string {
+  const width = Math.max(0, Math.floor(columns))
+  if (displayWidth(text) <= width) return text
+  if (width === 0) return ''
+  return truncateToWidth(text, width - 1) + '…'
+}
+
 /** Max visible columns for the first line of a collapsed bash command. */
 const BASH_CMD_FIRST_LINE_MAX = 120
 
-/** Shared expand/collapse copy for bash commands, tool results, and progress. */
+/**
+ * Shared expand/collapse copy. The expand hint is short because it rides on
+ * a row that already carries the line count (a tool status row, a progress
+ * header, a thinking summary); it never gets a row of its own.
+ */
+export const EXPAND_HINT = '(ctrl+o)'
 export function expandLinesHint(n: number): string {
-  return `(+${n} lines, ctrl+o to expand)`
+  return `+${n} lines ${EXPAND_HINT}`
 }
 
 export const COLLAPSE_HINT = '(ctrl+o to collapse)'
@@ -348,7 +211,8 @@ export interface BashCommandDisplay {
  * Expanded: multi-line commands are shown in full under the header (newlines
  * preserved), matching readable shell transcript style rather than flattening.
  */
-export function formatBashCommandDisplay(command: string, expanded = false): BashCommandDisplay {
+export function formatBashCommandDisplay(command: unknown, expanded = false, fitToCard = false): BashCommandDisplay {
+  if (typeof command !== 'string') return { headline: '', detailLines: [] }
   const normalized = command.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
   const trimmed = normalized.replace(/\n+$/, '')
   if (!trimmed) return { headline: '', detailLines: [] }
@@ -367,16 +231,12 @@ export function formatBashCommandDisplay(command: string, expanded = false): Bas
 
   if (!multi) {
     const one = first.trim()
-    if (one.length <= BASH_CMD_FIRST_LINE_MAX) return { headline: one, detailLines: [] }
-    return { headline: `${one.slice(0, BASH_CMD_FIRST_LINE_MAX - 1)}…`, detailLines: [] }
+    return { headline: expanded || fitToCard ? one : clipDisplayText(one, BASH_CMD_FIRST_LINE_MAX), detailLines: [] }
   }
 
   // Collapsed multi-line: first non-empty-ish line + shared expand hint.
   const headRaw = first.trim() || lines.find((l) => l.trim())?.trim() || ''
-  const head =
-    headRaw.length <= BASH_CMD_FIRST_LINE_MAX
-      ? headRaw
-      : `${headRaw.slice(0, BASH_CMD_FIRST_LINE_MAX - 1)}…`
+  const head = fitToCard ? headRaw : clipDisplayText(headRaw, BASH_CMD_FIRST_LINE_MAX)
   return { headline: `${head} … ${expandLinesHint(lines.length)}`, detailLines: [] }
 }
 

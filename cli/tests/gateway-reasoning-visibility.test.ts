@@ -6,9 +6,9 @@ import type { UIAssistantBlock } from '../src/term/app/types.js'
 import { buildOutputBlocks } from '../src/term/viewmodel/output.js'
 import { blocksToLines } from '../src/term/viewmodel/types.js'
 
-function render(content: UIAssistantBlock[], streaming: boolean): string {
+function render(content: UIAssistantBlock[], streaming: boolean, expanded = false): string {
   return stripAnsi(blocksToLines(buildOutputBlocks(
-    assistantMessageToOutputLines(content, false, { streaming }),
+    assistantMessageToOutputLines(content, expanded, { streaming }),
     { columns: 80 },
   )).join('\n'))
 }
@@ -49,19 +49,21 @@ describe('gateway reasoning visibility', () => {
     const live = render(updated, true)
     expect(live).toContain('检查协议转换是否丢失摘要。')
     expect(live.indexOf('read')).toBeLessThan(live.indexOf('✻'))
+    // Finishing the block retains the visible original text in compact view.
     expect(render(updated, false)).toBe(live)
+    expect(render(updated, false, true)).toContain('检查协议转换是否丢失摘要。')
   })
 
-  test('the fifth turn summary from the reported session survives completion', () => {
+  test('the fifth turn summary from the reported session survives completion in compact and expanded views', () => {
     const text = '**Analyzing git diff and streaming behavior**\n\n**Detailing theme and interface redesign changes**\n\n'
     const streamed = appendAssistantDelta([], {
       content_index: 0, content_type: 'thinking', delta: text,
     })
     const completed = completedAssistantContent([{ type: 'thinking', text }], streamed)
-    for (const [content, streaming] of [[streamed, true], [completed, false]] as const) {
-      const visible = render(content, streaming)
+    for (const visible of [render(streamed, true), render(completed, false), render(completed, false, true)]) {
       expect(visible).toContain('Analyzing git diff and streaming behavior')
       expect(visible).toContain('Detailing theme and interface redesign changes')
     }
+    expect(render(completed, false)).toBe(render(streamed, true))
   })
 })

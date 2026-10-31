@@ -1,4 +1,4 @@
-import { complete, getGhostHint } from '../../commands/completion.js'
+import { complete, getGhostHint, type GhostHintContext } from '../../commands/completion.js'
 import { COMMANDS, HIDDEN_COMMANDS } from '../../commands/index.js'
 import { needsContinuation } from './continuation.js'
 import {
@@ -66,6 +66,21 @@ export function createEditorState(): EditorState {
 
 export function getEditorText(state: EditorState): string {
   return state.lines.join('\n')
+}
+
+/** UTF-16 offset in the complete draft, snapped to a user-perceived boundary. */
+export function editorCursorOffset(state: EditorState): number {
+  const line = state.lines[state.cursorLine] ?? ''
+  const col = snapToSegmentBoundary(line, state.cursorCol)
+  return state.lines.slice(0, state.cursorLine).reduce((offset, text) => offset + text.length + 1, 0) + col
+}
+
+/** Replace the entire suffix without changing anything before the cursor. */
+export function replaceAfterCursor(state: EditorState, text: string): EditorState {
+  const line = state.lines[state.cursorLine] ?? ''
+  const col = snapToSegmentBoundary(line, state.cursorCol)
+  const lines = [...state.lines.slice(0, state.cursorLine), line.slice(0, col)]
+  return insertText({ ...state, lines, cursorCol: col }, text)
 }
 
 export function isEditorEmpty(state: EditorState): boolean {
@@ -213,7 +228,8 @@ export function applyCompletion(state: EditorState): CompletionApplyResult {
   if (!result) return { state, applied: false }
 
   const before = currentLine.slice(0, result.wordStart)
-  const after = currentLine.slice(state.cursorCol)
+  const suffix = currentLine.slice(result.wordEnd ?? state.cursorCol)
+  const after = result.replacement.endsWith('/') && suffix.startsWith('/') ? suffix.slice(1) : suffix
   const newLines = [...state.lines]
   newLines[state.cursorLine] = before + result.replacement + after
   const cursorCol = before.length + result.replacement.length
@@ -263,7 +279,9 @@ export function acceptCompletion(state: EditorState): EditorState {
   if (!menu || !item) return state
   const currentLine = state.lines[state.cursorLine]!
   const newLines = [...state.lines]
-  newLines[state.cursorLine] = currentLine.slice(0, menu.replaceStart) + item.value + currentLine.slice(menu.replaceEnd)
+  const suffix = currentLine.slice(menu.replaceEnd)
+  const after = item.value.endsWith('/') && suffix.startsWith('/') ? suffix.slice(1) : suffix
+  newLines[state.cursorLine] = currentLine.slice(0, menu.replaceStart) + item.value + after
   return {
     ...state,
     lines: newLines,
@@ -289,11 +307,23 @@ function completionCandidate(value: string): CompletionCandidate {
   }
 }
 
+/**
+ * Session facts the ghost hint depends on. The editor is a pure state
+ * machine fed by keystrokes; the REPL sets this when the session or its fork
+ * ancestry changes so the next refresh picks it up without threading a
+ * context through every mutator.
+ */
+let ghostHintContext: GhostHintContext = { forked: false }
+
+export function setGhostHintContext(context: GhostHintContext): void {
+  ghostHintContext = context
+}
+
 export function refreshGhostHint(state: EditorState): EditorState {
   const currentLine = state.lines[state.cursorLine]!
   return {
     ...state,
-    ghostHint: getGhostHint(currentLine, state.cursorCol) ?? '',
+    ghostHint: getGhostHint(currentLine, state.cursorCol, ghostHintContext) ?? '',
   }
 }
 
@@ -473,55 +503,51 @@ export function insertContinuationNewline(state: EditorState): EditorState {
 // ---------------------------------------------------------------------------
 
 export function moveUp(state: EditorState, width = Number.POSITIVE_INFINITY): EditorState {
-  const current = visualCursor(state, width)
-  const target = current.rowIndex > 0
-    ? current.rows[current.rowIndex - 1]
-    : state.cursorLine > 0
-      ? visualRows(state.lines[state.cursorLine - 1]!, state.cursorLine - 1, width).at(-1)
-      : undefined
-  if (!target) return state
-
-  const preferredVisualCol = state.preferredVisualCol ?? current.visualCol
-  return withoutGhost({
-    ...state,
-    cursorLine: target.lineIndex,
-    cursorCol: cursorAtVisualColumn(state.lines[target.lineIndex]!, target, preferredVisualCol),
-    preferredVisualCol,
-  }, true)
+  return moveVertically(state, width, -1)
 }
 
 export function moveDown(state: EditorState, width = Number.POSITIVE_INFINITY): EditorState {
-  const current = visualCursor(state, width)
-  const target = current.rowIndex < current.rows.length - 1
-    ? current.rows[current.rowIndex + 1]
-    : state.cursorLine < state.lines.length - 1
-      ? visualRows(state.lines[state.cursorLine + 1]!, state.cursorLine + 1, width)[0]
-      : undefined
-  if (!target) return state
+  return moveVertically(state, width, 1)
+}
 
+function moveVertically(state: EditorState, width: number, direction: -1 | 1): EditorState {
+  const current = visualCursor(state, width)
   const preferredVisualCol = state.preferredVisualCol ?? current.visualCol
-  return withoutGhost({
-    ...state,
-    cursorLine: target.lineIndex,
-    cursorCol: cursorAtVisualColumn(state.lines[target.lineIndex]!, target, preferredVisualCol),
-    preferredVisualCol,
-  }, true)
+  let lineIndex = state.cursorLine
+  let rows = current.rows
+  let rowIndex = current.rowIndex
+
+  while (true) {
+    rowIndex += direction
+    if (rowIndex < 0 || rowIndex >= rows.length) {
+      lineIndex += direction
+      if (lineIndex < 0 || lineIndex >= state.lines.length) return state
+      rows = visualRows(state.lines[lineIndex]!, width)
+      rowIndex = direction === -1 ? rows.length - 1 : 0
+    }
+    const target = rows[rowIndex]!
+    const cursorCol = cursorAtVisualColumn(
+      state.lines[lineIndex]!, target, preferredVisualCol, rowIndex < rows.length - 1,
+    )
+    // A reference can span several rows without any editable boundary inside.
+    if (cursorCol === undefined) continue
+    return withoutGhost({ ...state, cursorLine: lineIndex, cursorCol, preferredVisualCol }, true)
+  }
 }
 
 interface VisualRow {
-  lineIndex: number
   start: number
   end: number
 }
 
-function visualRows(text: string, lineIndex: number, width: number): VisualRow[] {
+function visualRows(text: string, width: number): VisualRow[] {
   const finiteWidth = Number.isFinite(width)
   const safeWidth = finiteWidth ? Math.max(1, Math.floor(width)) : Number.MAX_SAFE_INTEGER
-  const rows = wrapEditorText(text, safeWidth).map(chunk => ({ lineIndex, ...chunk }))
+  const rows = wrapEditorText(text, safeWidth)
   const last = rows[rows.length - 1]
   if (finiteWidth && text.length > 0 && last
     && displayWidthBefore(text.slice(last.start, last.end), last.end - last.start) >= safeWidth) {
-    rows.push({ lineIndex, start: text.length, end: text.length })
+    rows.push({ start: text.length, end: text.length })
   }
   return rows
 }
@@ -533,7 +559,7 @@ function visualCursor(state: EditorState, width: number): {
 } {
   const text = state.lines[state.cursorLine]!
   const cursorCol = snapToSegmentBoundary(text, state.cursorCol)
-  const rows = visualRows(text, state.cursorLine, width)
+  const rows = visualRows(text, width)
   let rowIndex = rows.findIndex(row => cursorCol >= row.start && cursorCol < row.end)
   if (rowIndex < 0) rowIndex = rows.length - 1
   const row = rows[rowIndex]!
@@ -544,9 +570,18 @@ function visualCursor(state: EditorState, width: number): {
   }
 }
 
-function cursorAtVisualColumn(text: string, row: VisualRow, visualCol: number): number {
+function cursorAtVisualColumn(
+  text: string,
+  row: VisualRow,
+  visualCol: number,
+  continues: boolean,
+): number | undefined {
   const candidate = row.start + boundaryAtDisplayWidth(text.slice(row.start, row.end), visualCol)
-  return snapToSegmentBoundary(text, candidate)
+  // A shared wrap boundary belongs to the following row. Landing there would
+  // leave ↑ on the same visual row forever when the preceding row is shorter.
+  const boundaries = [0, ...segmentEditorText(text).map(segment => segment.end)]
+    .filter(offset => offset >= row.start && (continues ? offset < row.end : offset <= row.end))
+  return boundaries.findLast(offset => offset <= candidate) ?? boundaries[0]
 }
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,99 @@ use tokio_util::sync::CancellationToken;
 use super::common::FailThenSucceedProvider;
 use crate::fixtures::agent_harness::collect_events;
 
+#[tokio::test]
+async fn replay_repairs_run_after_custom_conversion_without_mutating_context() {
+    use crate::fixtures::agent_harness::make_config;
+    use crate::fixtures::compaction_assert::assert_no_orphan_tool_pairs;
+    use crate::fixtures::recording_provider::RecordingProvider;
+    use crate::fixtures::recording_provider::Reply;
+
+    let provider = std::sync::Arc::new(RecordingProvider::new(vec![Reply::text("ok")]));
+    let captured = provider.captured();
+    let mut config = make_config(MockProvider::text("unused"));
+    config.provider = provider;
+    config.retry_policy = RetryPolicy::disabled();
+    config.convert_to_llm = Some(Box::new(|messages| {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::Llm(Message::ToolResult { .. }) => None,
+                AgentMessage::Llm(m) => Some(m.clone()),
+                AgentMessage::Extension(_) => None,
+            })
+            .collect()
+    }));
+    let history = vec![
+        AgentMessage::Llm(Message::user("read file")),
+        AgentMessage::Llm(Message::Assistant {
+            content: vec![Content::ToolCall {
+                id: "a".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                metadata: None,
+            }],
+            stop_reason: StopReason::ToolUse,
+            model: "old-model".into(),
+            provider: "test".into(),
+            usage: Usage::default(),
+            timestamp: 1,
+            error_message: None,
+            response_id: None,
+        }),
+        AgentMessage::Llm(Message::ToolResult {
+            tool_call_id: "a".into(),
+            tool_name: "read".into(),
+            content: vec![Content::Text {
+                text: "real file contents".into(),
+            }],
+            is_error: false,
+            timestamp: 2,
+            retention: Retention::Normal,
+        }),
+    ];
+    let mut context = AgentContext {
+        system_prompt: "test".into(),
+        messages: history.clone(),
+        tools: Vec::new(),
+        cwd: std::path::PathBuf::new(),
+        path_guard: std::sync::Arc::new(PathGuard::open()),
+        prompt_cache_key: None,
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    let output = agent_loop(
+        vec![Message::user("continue").into()],
+        &mut context,
+        &config,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    let requests = captured.lock();
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(&requests[0].messages[2], Message::ToolResult {
+        tool_call_id, is_error: true, ..
+    } if tool_call_id == "a"));
+    let replay: Vec<AgentMessage> = requests[0]
+        .messages
+        .iter()
+        .cloned()
+        .map(AgentMessage::Llm)
+        .collect();
+    assert_no_orphan_tool_pairs(&replay);
+    assert_eq!(&context.messages[..history.len()], history.as_slice());
+    assert!(output
+        .iter()
+        .all(|m| !matches!(m, AgentMessage::Llm(Message::ToolResult { .. }))));
+    let events = collect_events(rx);
+    assert!(events
+        .iter()
+        .all(|event| !matches!(event, AgentEvent::ToolExecutionStart { .. })));
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::LlmCallStart { request, .. }
+        if request.messages == requests[0].messages)
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Retry with backoff tests
 // ---------------------------------------------------------------------------
@@ -47,6 +140,8 @@ async fn test_retry_on_rate_limit_uses_local_backoff_and_succeeds() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -136,6 +231,8 @@ async fn test_quota_limit_waits_without_using_bounded_retry_budget() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -241,6 +338,8 @@ async fn test_quota_probes_use_local_backoff_and_recover() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -324,6 +423,8 @@ async fn test_provider_declared_transient_error_retries_then_succeeds() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -372,7 +473,7 @@ async fn test_provider_declared_transient_error_retries_then_succeeds() {
 #[tokio::test(start_paused = true)]
 async fn test_retry_exhausted_enters_outage_wait_and_recovers() {
     // 5 failures: 1 initial + 2 bounded retries all fail, then the loop must
-    // switch to indefinite outage probing (60 s cadence) instead of failing
+    // switch to indefinite network probing (10 s cadence) instead of failing
     // the run, and succeed once the upstream recovers on the 6th call.
     let provider: std::sync::Arc<FailThenSucceedProvider> =
         std::sync::Arc::new(FailThenSucceedProvider {
@@ -396,6 +497,8 @@ async fn test_retry_exhausted_enters_outage_wait_and_recovers() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -458,7 +561,7 @@ async fn test_retry_exhausted_enters_outage_wait_and_recovers() {
         .collect();
     assert_eq!(outage_waits.len(), 3);
     for (delay_ms, error) in &outage_waits {
-        assert_eq!(*delay_ms, 60_000);
+        assert_eq!(*delay_ms, 10_000);
         assert!(error.contains("connection reset"));
     }
     // Bounded retries stay bounded: exactly 2 LlmCallRetry events, and outage
@@ -503,6 +606,8 @@ async fn test_outage_wait_is_cancellable() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -587,6 +692,8 @@ async fn test_protocol_incomplete_retries_twice_then_fails_without_outage_wait()
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -681,6 +788,8 @@ async fn test_auth_error_not_retried() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -741,6 +850,8 @@ async fn test_retry_none_disables_retries() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -840,6 +951,8 @@ async fn test_empty_response_retried_then_succeeds() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),
@@ -916,6 +1029,8 @@ async fn test_empty_response_exhausts_bounded_retries_then_recovers() {
         context_config: None,
         compaction_context: None,
         compaction_fallback_context: None,
+        judge: None,
+        prune_ledger: None,
         initial_compaction_state: None,
         execution_limits: None,
         cache_config: CacheConfig::default(),

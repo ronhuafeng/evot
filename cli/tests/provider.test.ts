@@ -175,6 +175,32 @@ describe('modelSelectorItems', () => {
     expect(active?.detail).toBe('(Fast and free)')
   })
 
+  test('rows carry the model id as a regroup-stable identity', () => {
+    // The spec is the row id; the model id is what survives the catalog
+    // renaming its provider groups, so a refreshed picker can re-find focus.
+    const items = modelSelectorItems(cloudOptions, 'droid:gpt-5.6-sol')
+    const rows = items.filter(item => !item.header)
+    expect(rows.length).toBeGreaterThan(0)
+    for (const row of rows) {
+      expect(row.identity).toBeDefined()
+      expect(row.id?.endsWith(`:${row.identity}`)).toBe(true)
+    }
+  })
+
+  test('stars the account default only on the cloud row with that wire id', () => {
+    const items = modelSelectorItems(cloudOptions, 'droid:gpt-5.6-sol', undefined, 'cohere/north-mini:free')
+    expect(items.find(item => item.id === 'evot-free:cohere/north-mini:free')?.pinned).toBe(true)
+    expect(items.filter(item => item.pinned)).toHaveLength(1)
+    // Active and default are independent marks.
+    expect(items.find(item => item.id === 'droid:gpt-5.6-sol')?.selected).toBe(true)
+    expect(items.find(item => item.id === 'droid:gpt-5.6-sol')?.pinned).toBeUndefined()
+    // A BYOK model sharing an id with the pin is a different model.
+    const byok = modelSelectorItems(cloudOptions, 'droid:gpt-5.6-sol', undefined, 'gpt-5.6-sol')
+    expect(byok.filter(item => item.pinned)).toHaveLength(0)
+    // No pin, no star anywhere.
+    expect(modelSelectorItems(cloudOptions, 'droid:gpt-5.6-sol').some(item => item.pinned)).toBe(false)
+  })
+
   test('keeps the active BYOK provider first, then cloud groups', () => {
     const items = modelSelectorItems(cloudOptions, 'droid:gpt-5.6-sol')
     expect(items.filter(item => item.header).map(item => item.label)).toEqual([

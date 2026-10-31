@@ -103,6 +103,27 @@ describe('buildThinkingLines', () => {
   test('reasoning that merely contains dots still renders', () => {
     expect(buildThinkingLines('checking ... now').map(line => line.text)).toEqual(['checking ... now'])
   })
+
+  test('every line of one block carries the fold policy for its view', () => {
+    const text = 'first\n\nsecond'
+    const folds = (options: { streaming?: boolean; expanded?: boolean }) =>
+      [...new Set(buildThinkingLines(text, options).map(line => line.thinkingFold))]
+    // Both live and finished compact views keep the tail; expanded never folds.
+    expect(folds({ streaming: true })).toEqual(['tail'])
+    expect(folds({})).toEqual(['tail'])
+    expect(folds({ streaming: true, expanded: true })).toEqual([undefined])
+    expect(folds({ expanded: true })).toEqual([undefined])
+  })
+
+  test('each block shares its own render identity, even for identical text', () => {
+    const first = buildThinkingLines('first\n\nsecond')
+    const next = buildThinkingLines('first\n\nsecond')
+    const blockId = first[0]?.thinkingBlockId
+    expect(typeof blockId).toBe('string')
+    expect(first.every(line => line.thinkingBlockId === blockId)).toBe(true)
+    expect(next[0]?.thinkingBlockId).not.toBe(blockId)
+    expect(new Set(first.map(line => line.id)).size).toBe(first.length)
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -132,7 +153,7 @@ describe('buildToolCall', () => {
     ].join('\n')
     const lines = buildToolCall('bash', { command }, command)
     const all = lines.map(l => l.text).join('\n')
-    expect(all).toContain("⌘ bash  cd /Users/bohu/github/evotai/llmproxy && python3 - <<'PY' … (+5 lines, ctrl+o to expand)")
+    expect(all).toContain("⌘ bash  cd /Users/bohu/github/evotai/llmproxy && python3 - <<'PY' … +5 lines (ctrl+o)")
     // Full heredoc body must not be flattened into the header.
     expect(all).not.toContain('from pathlib import Path')
   })
@@ -154,13 +175,12 @@ describe('buildToolCall', () => {
     expect(all).not.toContain('… (+')
   })
 
-  test('long single-line bash command is truncated on the card header', () => {
+  test('long shell headings retain the command for width-aware card layout', () => {
     const command = 'x'.repeat(200)
     const lines = buildToolCall('bash', { command }, command)
     const card = lines[lines.length - 1]!
-    expect(card.text).toContain('⌘ bash')
-    expect(card.text.endsWith('…')).toBe(true)
-    expect(card.text.length).toBeLessThan(command.length)
+    expect(card.text).toBe(`⌘ bash  ${command}`)
+    expect(card.commandMaxRows).toBe(2)
   })
 
   test('regular tool call still surfaces reason lines up-front', () => {
@@ -200,22 +220,23 @@ describe('buildToolCall', () => {
 
 describe('buildToolResult', () => {
   test('emits the status first with mark and duration', () => {
-    const lines = buildToolResult('bash', { command: 'ls -la' }, 'done', undefined, 42)
+    const lines = buildToolResult('bash', { command: 'ls -la' }, 'done', undefined, 4200)
     expect(lines.length).toBeGreaterThanOrEqual(1)
     const status = lines[0]!
     expect(status.kind).toBe('tool')
     expect(status.text).toMatch(/^ {2}✓/)
-    expect(status.text).toContain('42ms')
+    expect(status.text).toContain('4.2s')
     expect(status.text).not.toContain('⌘ bash')
     expect(status.text).not.toContain('completed')
   })
 
   test('error result status line uses ✗ and stays before output', () => {
-    const lines = buildToolResult('bash', { command: 'fail' }, 'error', 'command not found', 10)
+    const lines = buildToolResult('bash', { command: 'fail' }, 'error', 'command not found', 1000)
     expect(lines[0]!.text).toMatch(/^ {2}✗/)
     expect(lines[0]!.text).toContain('failed')
-    expect(lines[0]!.text).toContain('10ms')
-    expect(lines.slice(1).some((line) => line.kind === 'error')).toBe(true)
+    expect(lines[0]!.text).toContain('1.0s')
+    expect(lines[0]!.text).toContain('command not found')
+    expect(lines.slice(1).some((line) => line.kind === 'error')).toBe(false)
   })
 
   test('failed edit with missing/dot path surfaces the attempted target', () => {
@@ -231,9 +252,9 @@ describe('buildToolResult', () => {
     expect(missing[0]!.text).toBe('✎ edit  (missing path)')
     expect(missing[1]!.text).toMatch(/^ {2}✗ · failed/)
     expect(missing[1]!.text).toContain('invalid path')
-    // Error body is auto-expanded — no "ctrl+o to expand" for failures.
+    // The reason rides on the status row; a one-line body has nothing to fold.
     const missingBody = missing.map(l => l.text).join('\n')
-    expect(missingBody).toContain('Cannot read')
+    expect(missing[1]!.text).toContain('Cannot read')
     expect(missingBody).not.toContain('ctrl+o to expand')
     // Byte size is not the primary failure signal.
     expect(missing[1]!.text).not.toContain('74 B')
@@ -279,7 +300,7 @@ describe('buildToolResult', () => {
     expect(all).toContain('oldText not found')
   })
 
-  test('failed bash keeps the command on the headline and expands the error', () => {
+  test('failed bash keeps the command on the headline and folds the error body', () => {
     const lines = buildToolCard({
       id: 'bash-fail',
       name: 'bash',
@@ -291,13 +312,14 @@ describe('buildToolResult', () => {
     })
     expect(lines[0]!.text).toContain('⌘ bash')
     expect(lines[0]!.text).toContain('cargo test -p db0_runtime planning')
-    expect(lines[1]!.text).toBe('  ✗ · failed · exit 101 · 2.3s')
+    expect(lines[1]!.text).toBe('  ✗ · failed · exit 101 · 2.3s · error: no matching package named `db0_runtime` found · 4 lines (ctrl+o)')
     const all = lines.map(l => l.text).join('\n')
-    expect(all).toContain('no matching package')
-    expect(all).not.toContain('ctrl+o to expand')
+    expect(all).not.toContain('Caused by')
+    expect(all).toContain('(ctrl+o)')
+    expect(lines.some(l => l.kind === 'error')).toBe(false)
   })
 
-  test('long failed output auto-previews only the tail, expandable via ctrl+o', () => {
+  test('long failed output folds entirely, expandable via ctrl+o', () => {
     const body = Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join('\n')
     const collapsed = buildToolCard({
       id: 'bash-long-fail',
@@ -308,11 +330,11 @@ describe('buildToolResult', () => {
       details: { exit_code: 2 },
     })
     const collapsedText = collapsed.map(l => l.text).join('\n')
-    // Tail preview: last lines visible, earlier lines behind an expand hint.
-    expect(collapsedText).toContain('line 60')
-    expect(collapsedText).toContain('line 41')
-    expect(collapsedText).not.toContain('line 40\n')
-    expect(collapsedText).toContain('(+40 lines, ctrl+o to expand)')
+    expect(collapsedText).not.toContain('line 60')
+    expect(collapsedText).toContain('failed · exit 2 · line 1')
+    expect(collapsedText).toContain('60 lines (ctrl+o)')
+    // The fold rides on the status row: headline + status, no hint row.
+    expect(collapsed).toHaveLength(2)
 
     const expandedCard = buildToolCard({
       id: 'bash-long-fail',
@@ -342,19 +364,19 @@ describe('buildToolResult', () => {
   test('uses real tool metadata for semantic status summaries', () => {
     const cases = [
       {
-        call: { id: 'bash', name: 'bash', args: { command: 'true' }, status: 'done' as const, result: 'ok', details: { exit_code: 0 }, durationMs: 25 },
-        status: '  ✓ · exit 0 · 25ms',
+        call: { id: 'bash', name: 'bash', args: { command: 'true' }, status: 'done' as const, result: 'ok', details: { exit_code: 0 }, durationMs: 2500 },
+        status: '  ✓ · exit 0 · 2.5s · 1 line (ctrl+o)',
       },
       {
-        call: { id: 'bash-bg', name: 'bash', args: { command: 'bun run dev' }, status: 'done' as const, result: 'Command is running in the background.', details: { backgrounded: true, status: 'running' }, durationMs: 25 },
-        status: '  ● · started · running in background · 25ms',
+        call: { id: 'bash-bg', name: 'bash', args: { command: 'bun run dev' }, status: 'done' as const, result: 'Command is running in the background.', details: { backgrounded: true, status: 'running' }, durationMs: 2500 },
+        status: '  ● · started · running in background · 2.5s',
       },
       // An explicit background was the plan, so "started" fits. The rest were
       // not: naming the reason keeps a deadline or a keypress from reading as a
       // command that simply began.
       {
-        call: { id: 'bash-bg-explicit', name: 'bash', args: { command: 'bun run dev' }, status: 'done' as const, result: 'started', details: { backgrounded: true, background_reason: 'explicit', status: 'running' }, durationMs: 25 },
-        status: '  ● · started · running in background · 25ms',
+        call: { id: 'bash-bg-explicit', name: 'bash', args: { command: 'bun run dev' }, status: 'done' as const, result: 'started', details: { backgrounded: true, background_reason: 'explicit', status: 'running' }, durationMs: 2500 },
+        status: '  ● · started · running in background · 2.5s',
       },
       {
         call: { id: 'bash-bg-timeout', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'timeout_elapsed', status: 'running' }, durationMs: 600_000 },
@@ -365,18 +387,18 @@ describe('buildToolResult', () => {
         status: '  ● · still running · moved to background · 120.0s',
       },
       {
-        call: { id: 'bash-bg-user', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'user_requested', status: 'running' }, durationMs: 25 },
-        status: '  ● · still running · backgrounded by you · 25ms',
+        call: { id: 'bash-bg-user', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'user_requested', status: 'running' }, durationMs: 2500 },
+        status: '  ● · still running · backgrounded by you · 2.5s',
       },
       {
-        call: { id: 'bash-bg-message', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'message_delivery', status: 'running' }, durationMs: 25 },
-        status: '  ● · still running · backgrounded to read your message · 25ms',
+        call: { id: 'bash-bg-message', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'message_delivery', status: 'running' }, durationMs: 2500 },
+        status: '  ● · still running · backgrounded to read your message · 2.5s',
       },
       // Written by the engine, so an unrecognized reason must still render a
       // status rather than an empty one.
       {
-        call: { id: 'bash-bg-unknown', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'something_new', status: 'running' }, durationMs: 25 },
-        status: '  ● · started · running in background · 25ms',
+        call: { id: 'bash-bg-unknown', name: 'bash', args: { command: 'cargo build' }, status: 'done' as const, result: 'still going', details: { backgrounded: true, background_reason: 'something_new', status: 'running' }, durationMs: 2500 },
+        status: '  ● · started · running in background · 2.5s',
       },
       {
         call: { id: 'read', name: 'read', args: { path: 'a.ts' }, status: 'done' as const, result: 'body', details: { bytes: 2048 } },
@@ -396,7 +418,7 @@ describe('buildToolResult', () => {
       },
       {
         call: { id: 'web', name: 'web_fetch', args: { url: 'https://example.com' }, status: 'done' as const, result: 'line one\nline two', details: { status: 200 } },
-        status: '  ✓ · HTTP 200 · 2 lines',
+        status: '  ✓ · HTTP 200 · 2 lines (ctrl+o)',
       },
     ]
 
@@ -420,19 +442,19 @@ describe('buildToolResult', () => {
     const cases = [
       {
         call: { id: 'grep', name: 'grep', args: { pattern: 'needle' }, status: 'done' as const, result: 'src/a.ts:1: needle\nsrc/b.ts:2: needle' },
-        status: '  ✓ · 2 matches',
+        status: '  ✓ · 2 matches (ctrl+o)',
       },
       {
         call: { id: 'grep-context', name: 'grep', args: { pattern: 'needle', context: 1 }, status: 'done' as const, result: 'src/a.ts-1- before\nsrc/a.ts:2: needle\n--\nsrc/b.ts:4: needle\nsrc/b.ts-5- after' },
-        status: '  ✓ · 2 matches',
+        status: '  ✓ · 2 matches (ctrl+o)',
       },
       {
         call: { id: 'grep-files', name: 'grep', args: { pattern: 'needle', files_with_matches: true }, status: 'done' as const, result: 'src/a.ts\nsrc/b.ts' },
-        status: '  ✓ · 2 files',
+        status: '  ✓ · 2 files (ctrl+o)',
       },
       {
         call: { id: 'grep-capped', name: 'grep', args: { pattern: 'needle' }, status: 'done' as const, result: 'src/a.ts:1: needle\n... (capped at 100 matches — refine the pattern)' },
-        status: '  ✓ · 1 match shown',
+        status: '  ✓ · 1 match shown (ctrl+o)',
       },
       {
         call: { id: 'grep-zero', name: 'grep', args: { pattern: 'needle' }, status: 'done' as const, result: '(no matches)' },
@@ -440,15 +462,15 @@ describe('buildToolResult', () => {
       },
       {
         call: { id: 'glob', name: 'glob', args: { pattern: ['**/*.ts'] }, status: 'done' as const, result: 'src/a.ts\nsrc/b.ts' },
-        status: '  ✓ · 2 files',
+        status: '  ✓ · 2 files (ctrl+o)',
       },
       {
         call: { id: 'glob-dirs', name: 'glob', args: { pattern: ['**'], type: 'd' }, status: 'done' as const, result: 'src\ntests' },
-        status: '  ✓ · 2 directories',
+        status: '  ✓ · 2 directories (ctrl+o)',
       },
       {
         call: { id: 'glob-timeout', name: 'glob', args: { pattern: ['**'] }, status: 'done' as const, result: 'src/a.ts\n... (search timed out — results may be incomplete)' },
-        status: '  ✓ · 1 file shown',
+        status: '  ✓ · 1 file shown (ctrl+o)',
       },
       {
         call: { id: 'glob-zero-timeout', name: 'glob', args: { pattern: ['**'] }, status: 'done' as const, result: '(no matches; search timed out before completing)' },
@@ -469,7 +491,7 @@ describe('buildToolResult', () => {
       status: 'done',
       result: 'unstructured\noutput',
     })
-    expect(lines[1]!.text).toBe('  ✓ · 2 lines · 19 B')
+    expect(lines[1]!.text).toBe('  ✓ · 2 lines · 19 B (ctrl+o)')
   })
 
   test('metadata can mark nominal tool results as failures', () => {
@@ -510,30 +532,52 @@ describe('buildToolResult', () => {
       },
     })
     expect(lines[0]!.text).toBe('✎ edit  a.ts')
-    expect(lines[1]!.text).toBe('  ✓ · 1 replacement · +1 −1 · 8ms')
+    expect(lines[1]!.text).toBe('  ✓ · 1 replacement · +1 −1')
     expect(lines.slice(2).map(line => line.text).join('\n')).toContain('↳ reason: fix behavior')
     expect(lines.slice(2).map(line => line.text).join('\n')).toContain('+new')
   })
 
-  test('collapsed multiline result shows only the expand hint, no content preview', () => {
+  test('a successful edit with a diff drops its result body in compact mode; expanded keeps it', () => {
+    const call = {
+      id: 'edit-body',
+      name: 'edit',
+      args: { path: 'a.ts' },
+      status: 'done' as const,
+      result: 'Updated a.ts.\n\nCurrent content of the changed region(s):\n1 | new',
+      durationMs: 8,
+      details: { diff: '@@ -1 +1 @@\n-old\n+new', replacement_count: 1, added_lines: 1, removed_lines: 1 },
+    }
+    const compact = buildToolCard(call).map(line => line.text).join('\n')
+    // The diff is the content; the engine's echo of the changed region and the
+    // fold hint for it would only repeat what is already on screen.
+    expect(compact).toContain('+new')
+    expect(compact).not.toContain('Current content')
+    expect(compact).not.toContain('ctrl+o')
+    const expanded = buildToolCard(call, true).map(line => line.text).join('\n')
+    expect(expanded).toContain('Current content of the changed region(s):')
+  })
+
+  test('a single-row non-shell result stays inline: nothing to fold, no hint', () => {
+    const lines = buildToolCard({ id: 'r', name: 'read', args: { path: 'a.ts' }, status: 'done', result: 'only line', durationMs: 1500 })
+    expect(lines.map(line => line.text)).toEqual(['◫ read  a.ts', '  ✓ · 1 line · 1.5s', '  only line'])
+  })
+
+  test('collapsed multiline result folds onto the status row, no content preview', () => {
     const result = JSON.stringify({ a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 }, null, 2)
     const lines = buildToolResult('edit', {}, 'done', result)
-    const bodyLines = lines.filter(l => l.kind === 'tool_result')
-    // Collapsed view: a single hint line carrying the full line count, no
-    // previewed content rows.
-    expect(bodyLines).toHaveLength(1)
-    expect(bodyLines[0]!.text).toContain('ctrl+o to expand')
-    expect(bodyLines[0]!.text).toMatch(/\.\.\. \(\+\d+ lines, ctrl\+o to expand\)/)
-    // No JSON body line leaked into the collapsed card.
-    expect(bodyLines.some(l => l.text.includes('"status"') || l.text.trim() === '{')).toBe(false)
+    // Collapsed view: the status row carries the full line count and the
+    // expand hint; there are no body rows at all.
+    expect(lines).toHaveLength(1)
+    expect(lines[0]!.text).toMatch(/· \d+ lines .*\(ctrl\+o\)$/)
+    expect(lines[0]!.text).not.toContain('{')
   })
 
   test('collapsed search result hint counts every line (no head preview)', () => {
     const result = Array.from({ length: 8 }, (_, i) => `match ${i}`).join('\n')
     const lines = buildToolResult('search', {}, 'done', result)
-    const bodyLines = lines.filter(l => l.kind === 'tool_result')
-    expect(bodyLines).toHaveLength(1)
-    expect(bodyLines[0]!.text).toContain('... (+8 lines, ctrl+o to expand)')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]!.text).toContain('8 lines')
+    expect(lines[0]!.text).toContain('(ctrl+o)')
     // No match rows previewed in the collapsed view.
     const all = lines.map(l => l.text).join('\n')
     expect(all).not.toContain('match 0')
@@ -545,9 +589,9 @@ describe('buildToolResult', () => {
     // collapses/expands like bash/search.
     const result = Array.from({ length: 93 }, (_, i) => `line ${i}`).join('\n')
     const collapsed = buildToolResult('Read', { path: 'a.ts' }, 'done', result, 0)
-    const collapsedBody = collapsed.filter(l => l.kind === 'tool_result')
-    expect(collapsedBody).toHaveLength(1)
-    expect(collapsedBody[0]!.text).toContain('... (+93 lines, ctrl+o to expand)')
+    expect(collapsed).toHaveLength(1)
+    expect(collapsed[0]!.text).toContain('93 lines')
+    expect(collapsed[0]!.text).toContain('(ctrl+o)')
     expect(collapsed.map(l => l.text).join('\n')).not.toContain('line 0')
 
     const expanded = buildToolResult('Read', { path: 'a.ts' }, 'done', result, 0, true)
@@ -575,12 +619,10 @@ describe('buildToolResult', () => {
     expect(all).toContain('ctrl+o to collapse')
   })
 
-  test('collapsed progress card shows header + expand hint, no content preview', () => {
+  test('collapsed progress card is a single header carrying the expand hint', () => {
     const lines = buildToolProgress('bash', 'line1\nline2\nline3')
-    expect(lines[0]!.text).toBe('⌘ bash  · 3 lines')
-    const body = lines.slice(1)
-    expect(body).toHaveLength(1)
-    expect(body[0]!.text).toContain('... (+3 lines, ctrl+o to expand)')
+    expect(lines[0]!.text).toBe('⌘ bash  · 3 lines (ctrl+o)')
+    expect(lines).toHaveLength(1)
     // No progress content previewed in the collapsed card.
     expect(lines.map(l => l.text).join('\n')).not.toContain('line3')
   })
@@ -686,7 +728,9 @@ describe('buildVerboseEvent', () => {
     expect(result.text).toContain('[LLM] ✓ · claude-sonnet-4 · turn 2 · 8.4s')
     expect(result.text).toContain('    tokens    42k in → 352 out')
     expect(result.text).toContain('    cache     21k read · 0 write · 33% hit')
-    expect(result.text).toContain('    timing    ttfb 1.1s (13%) · stream 7.3s (87%)')
+    // Historical events lack streaming_ms; wall time minus TTFB is not a measured stream.
+    expect(result.text).toContain('    timing    ttfb 1.1s (13%) · stream unavailable')
+    expect(result.text).not.toContain('tok/s')
     expect(result.text).toContain('    tools     search')
     expect(result.text).not.toContain('    output    ')
     expect(result.expandedText).toBeUndefined()
@@ -746,14 +790,19 @@ describe('buildVerboseEvent', () => {
         current_run_reclaimed: 0,
       },
     })
-    expect(completed).toContain('[COMPACT] ✓ · remote · threshold · L3')
+    expect(completed).toContain('[COMPACT] ✓ · remote · threshold · 48 → 12 msgs')
+    expect(completed).not.toContain('L3')
+    expect(completed).toContain('    summary   evicted 36 msgs · reclaimed 0')
     expect(completed).toContain('168k → 24k')
     expect(completed).toContain('blob 1.5 KB')
     expect(isVisibleEvent(completed)).toBe(true)
 
     const card = buildEventCard(completed)
-    expect(card[0]!.text).toBe('✦ compact')
+    expect(card[0]!.text).toBe('✦ compact  168k → 24k')
+    expect(card[0]!.toolCard).toEqual({ state: 'success', first: true, last: false })
     expect(card[1]!.text).toContain('✓ · remote')
+    expect(card[1]!.text).not.toContain('msgs')
+    expect(card.at(-1)!.toolCard?.last).toBe(true)
   })
 
   test('shows remote fallback but keeps skipped compaction log-only', () => {
@@ -775,38 +824,40 @@ describe('buildVerboseEvent', () => {
     expect(isVisibleEvent('[COMPACT] ✓ · skipped · within budget')).toBe(false)
   })
 
-  test('formats compact verbose with status symbols and preserves details', () => {
+  test('formats compaction started without a level and a prune compaction as a lossless cut', () => {
     const started = formatCompactionStarted({
-      level: 'L1',
       messages_count: 48,
       estimated_tokens: 168000,
       context_window: 200000,
       token_breakdown: { system: 8000, user: 24000, assistant: 18000, tool: 118000 },
     })
-    expect(started).toContain('[COMPACT] ● · L1 · 48 msgs')
+    expect(started).toContain('[COMPACT] ● · 48 msgs')
+    expect(started).not.toContain('L1')
     expect(started).toContain('    context   ')
     expect(started).toContain('    tokens    sys 8k · user 24k · asst 18k · tool 118k')
 
-    const completed = formatCompactionCompleted({
+    const pruned = formatCompactionCompleted({
+      reason: 'threshold',
+      context_window: 200000,
       result: {
-        type: 'level_done',
-        level: 1,
-        messages_before: 48,
-        messages_after: 35,
-        tokens_before: 168000,
-        tokens_after: 126000,
-        context_window: 200000,
-        map: '[··OHHH··SS] ',
-        legend: '·=unchanged/kept  O=Outline  H=HeadTail  S=Summarized',
-        result: '↓ outlined 2, head-tail 3',
-        details: ['changed 5/48', '#12 read_file HeadTail ~18k → ~4k (−14k)'],
+        type: 'compacted',
+        method: 'prune',
+        before_message_count: 256,
+        after_message_count: 170,
+        before_tokens: 74000,
+        after_tokens: 32000,
+        messages_evicted: 86,
+        current_run_reclaimed: 0,
       },
     })
-    expect(completed).toContain('[COMPACT] ✓ · L1 · 48 → 35 msgs · saved 42k (25%)')
-    expect(completed).toContain('    context   ')
-    expect(completed).toContain('    map       [··OHHH··SS]   · kept   O Outline   H HeadTail   S Summarized')
-    expect(completed).toContain('    summary   outlined 2 · head-tail 3')
-    expect(completed).toContain('    actions   #12 read_file HeadTail 18k → 4k (−14k)')
+    const lines = pruned.split('\n')
+    expect(lines[0]).toBe('[COMPACT] ✓ · jev prune · no summary · threshold · 256 → 170 msgs · 74k → 32k · saved 42k (57%)')
+    expect(pruned).not.toContain('L3')
+    expect(pruned).not.toContain('reclaimed')
+    expect(lines.at(-1)).toBe('    summary   removed 86 stale tool msgs')
+    const card = buildEventCard(pruned)
+    expect(card[0]!.text).toBe('✦ compact  74k → 32k')
+    expect(card[1]!.text).toContain('jev prune · no summary')
   })
 })
 

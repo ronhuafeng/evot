@@ -69,6 +69,8 @@ pub struct ProcessSnapshot {
     pub task_id: String,
     pub tool_call_id: String,
     pub command: String,
+    /// Purpose captured at launch, retained when a foreground command detaches.
+    pub description: Option<String>,
     pub cwd: PathBuf,
     pub output_path: PathBuf,
     pub output: String,
@@ -78,6 +80,16 @@ pub struct ProcessSnapshot {
     pub status: ProcessStatus,
     pub exit_code: Option<i32>,
     pub elapsed: Duration,
+    /// How long the task has produced no output (since start when it never
+    /// has). Frozen at the terminal instant like `elapsed`.
+    ///
+    /// A blocking wait uses this to tell a live build apart from a deadlocked
+    /// test: both look identical from `status` alone.
+    pub quiet_for: Duration,
+    /// How many blocking waits on this task ended because it looked stalled.
+    /// Each one lengthens the next stall threshold, so re-waiting cannot
+    /// degrade into a poll loop.
+    pub stall_wakes: u32,
     /// True when the stop came from the user (`/stop`, background panel) rather
     /// than from the model's own `task_stop` call.
     ///
@@ -87,13 +99,26 @@ pub struct ProcessSnapshot {
     pub stopped_by_user: bool,
 }
 
-/// Listing-only view of a task. Deliberately excludes the captured output so
-/// polling callers (the TUI footer) never copy megabytes of rolling tail just
-/// to count what is running.
+/// Last lines of captured output kept on a listing. Small enough that pollers
+/// pay a fixed cost per task, large enough to say which step a script is on.
+pub const SUMMARY_OUTPUT_LINES: usize = 8;
+pub const SUMMARY_OUTPUT_BYTES: usize = 800;
+
+/// Listing-only view of a task. Deliberately excludes the full captured output
+/// so polling callers (the TUI footer) never copy megabytes of rolling tail
+/// just to count what is running; only a bounded `recent_output` is kept.
 #[derive(Debug, Clone)]
 pub struct ProcessSummary {
     pub task_id: String,
     pub command: String,
+    /// Launch purpose, without needing to read captured output.
+    pub description: Option<String>,
+    /// Up to `SUMMARY_OUTPUT_LINES` trailing lines, each already trimmed and
+    /// never longer than `SUMMARY_OUTPUT_BYTES` in total. Empty when the task
+    /// has printed nothing yet (a compile, a sleep loop): absence of lines is
+    /// not a stall, see `quiet_for`.
+    pub recent_output: Vec<String>,
+    pub quiet_for: Duration,
     pub cwd: PathBuf,
     pub output_path: PathBuf,
     pub status: ProcessStatus,
@@ -127,6 +152,7 @@ pub fn task_label(command: &str) -> String {
 pub struct StartProcess {
     pub command: Command,
     pub command_text: String,
+    pub description: Option<String>,
     pub tool_call_id: String,
     pub cwd: PathBuf,
     pub timeout: Duration,

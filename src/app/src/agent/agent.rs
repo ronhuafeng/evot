@@ -1,225 +1,48 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::hash::Hasher;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
 
-use super::run::control::RunControl;
+use super::dump::build_prompt_dump;
+use super::dump::resolve_dump_path;
+use super::fork::ForkRequest;
+use super::fork::ForkedAgent;
+use super::request::expand_prompt_command;
+use super::request::ExecutionLimits;
+use super::request::PromptCommandContext;
+use super::request::QueryRequest;
+use super::request::SubmitOutcome;
+use super::run::registry::RunRegistry;
 use super::run::run::Run;
 use super::run::runtime;
 use super::run::runtime::TurnFactory;
-use super::session::Session;
-use super::tools::build_tools;
-use super::tools::HostTools;
 use super::tools::ToolMode;
+use super::turn_assembler::TurnAssembler;
+use super::turn_assembler::TurnBuildRequest;
+use super::turn_factory::AgentTurnFactory;
 use super::variables::Variables;
-use crate::agent::prompt::dynamic_sections;
-use crate::agent::prompt::format_skills_for_prompt;
-use crate::agent::prompt::DynamicContext;
-use crate::agent::prompt::PromptMode;
 use crate::agent::prompt::Section;
-use crate::agent::prompt::SkillSpec;
 use crate::conf::Config;
 use crate::conf::LlmConfig;
 use crate::conf::Protocol;
 use crate::error::EvotError;
 use crate::error::Result;
+use crate::models::ModelSelection;
+use crate::models::SelectionReload;
+use crate::sessions::Session;
+use crate::sessions::SessionGates;
+use crate::sessions::SessionQueries;
+use crate::sessions::SessionSelection;
+use crate::sessions::SessionService;
 use crate::storage::open_storage;
 use crate::storage::MemoryStorage;
 use crate::storage::Storage;
-use crate::types::ListSessions;
-use crate::types::ListTranscriptEntries;
-use crate::types::PromptDump;
-use crate::types::SectionDump;
 use crate::types::SessionMeta;
-use crate::types::SystemPromptDump;
-use crate::types::TokenTotals;
-use crate::types::ToolDump;
-use crate::types::TranscriptEntry;
-use crate::types::TranscriptItem;
-
-// ---------------------------------------------------------------------------
-// SelectionReload
-// ---------------------------------------------------------------------------
-
-/// Where the live model selection landed after a config reload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionReload {
-    /// The live selection is still served; it kept serving, on fresh config.
-    Kept,
-    /// The live selection is gone; the config's active selection took over.
-    Switched,
-    /// Nothing is configured any more; the agent has no model.
-    Unconfigured,
-}
-
-impl SelectionReload {
-    /// Whether a usable model remains. False only for `Unconfigured`, which is
-    /// the one state that needs `/login` or a provider on the Models page.
-    pub fn has_model(self) -> bool {
-        !matches!(self, Self::Unconfigured)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ExecutionLimits
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub struct ExecutionLimits {
-    pub max_turns: u32,
-    pub max_total_tokens: u64,
-    pub max_duration_secs: u64,
-}
-
-impl Default for ExecutionLimits {
-    fn default() -> Self {
-        Self {
-            max_turns: 512,
-            max_total_tokens: 100_000_000,
-            max_duration_secs: 3600,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// QueryRequest
-// ---------------------------------------------------------------------------
-
-pub struct QueryRequest {
-    pub input: Vec<evot_engine::Content>,
-    pub session_id: Option<String>,
-    pub mode: ToolMode,
-    pub source: String,
-    /// Optional per-run model snapshot. `submit` fills this from the agent when
-    /// omitted, so every run uses one stable selection across all turns.
-    pub llm: Option<LlmConfig>,
-    /// Host-owned tools (ask_user, …) to attach to this run. `None` when the
-    /// caller has no host bridge (e.g. gateway/headless callers).
-    pub host_tools: Option<HostTools>,
-    /// Workspace for a *new* session. Existing sessions always keep the cwd
-    /// persisted on `SessionMeta`; this field is ignored on resume.
-    pub cwd: Option<String>,
-}
-
-impl QueryRequest {
-    pub fn text(prompt: impl Into<String>) -> Self {
-        Self {
-            input: vec![evot_engine::Content::Text {
-                text: prompt.into(),
-            }],
-            session_id: None,
-            mode: ToolMode::Headless,
-            source: String::new(),
-            llm: None,
-            host_tools: None,
-            cwd: None,
-        }
-    }
-
-    pub fn with_input(input: Vec<evot_engine::Content>) -> Self {
-        Self {
-            input,
-            session_id: None,
-            mode: ToolMode::Headless,
-            source: String::new(),
-            llm: None,
-            host_tools: None,
-            cwd: None,
-        }
-    }
-
-    /// Extract plain text from input content (for transcript, titles, logs).
-    pub fn input_text(&self) -> String {
-        crate::agent::run::convert::extract_content_text(&self.input)
-    }
-
-    pub fn session_id(mut self, id: Option<String>) -> Self {
-        self.session_id = id;
-        self
-    }
-
-    pub fn mode(mut self, mode: ToolMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    /// Pin a resolved model selection to this run. Useful for callers such as
-    /// Chat that expose a per-message model picker.
-    pub fn llm(mut self, llm: LlmConfig) -> Self {
-        self.llm = Some(llm);
-        self
-    }
-
-    /// Attach host-owned tools (the host bridge plus its registered specs).
-    pub fn host_tools(mut self, host_tools: Option<HostTools>) -> Self {
-        self.host_tools = host_tools;
-        self
-    }
-
-    pub fn source(mut self, source: impl Into<String>) -> Self {
-        self.source = source.into();
-        self
-    }
-
-    /// Bind a workspace directory for a newly created session. Resume always
-    /// keeps the persisted session cwd, so this is a no-op once a session id
-    /// already exists.
-    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
-        self.cwd = Some(cwd.into());
-        self
-    }
-}
-
-/// Expand `/clip all` into a prompt with the memory workflow loaded.
-/// Non-command input passes through unchanged.
-fn expand_prompt_command(
-    mut request: QueryRequest,
-    skills_dirs: &[PathBuf],
-) -> Result<QueryRequest> {
-    use crate::command::clip_session_prompt;
-    use crate::command::parse_command;
-    use crate::command::Command;
-
-    if !matches!(
-        parse_command(&request.input_text()),
-        Some(Command::ClipSession)
-    ) {
-        return Ok(request);
-    }
-    let memory = crate::agent::prompt::skill::load_skill(skills_dirs, "memory")
-        .map_err(|error| EvotError::Agent(format!("cannot load memory skill: {error}")))?;
-    let instructions = crate::agent::prompt::skill::load_skill_instructions(&memory)
-        .map_err(|error| EvotError::Agent(format!("cannot read memory skill: {error}")))?;
-    let text = clip_session_prompt(&instructions);
-    request.input = vec![evot_engine::Content::Text { text }];
-    Ok(request)
-}
-
-// ---------------------------------------------------------------------------
-// SubmitOutcome — result of a submit: either a Run or a handled command
-// ---------------------------------------------------------------------------
-
-pub enum SubmitOutcome {
-    /// Normal agent run.
-    Run(Run),
-    /// A gateway command was handled; carry this text back to the caller.
-    Command(String),
-}
 
 // ---------------------------------------------------------------------------
 // Agent
 // ---------------------------------------------------------------------------
-
-struct ActiveRun {
-    run_id: String,
-    handle: RunControl,
-    completed: tokio_util::sync::CancellationToken,
-}
 
 enum AbortRunOutcome {
     Stopped,
@@ -228,45 +51,18 @@ enum AbortRunOutcome {
 }
 
 const RUN_ABORT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
-const PROCESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const SESSION_LIFECYCLE_SHARDS: usize = 64;
-const MAX_SESSION_PROCESS_MANAGERS: usize = 256;
-const COMPACTION_SUMMARY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Agent {
-    llm: RwLock<LlmConfig>,
+    selection: ModelSelection,
     system_prompt: RwLock<String>,
-    /// Per-section breakdown matching `system_prompt`. Used by `/_dump`.
-    /// Empty when `with_system_prompt` was called with a raw string and no
-    /// sections; the dump path then treats the whole prompt as a single
-    /// "system_prompt" section.
-    system_prompt_sections: RwLock<Vec<Section>>,
-    limits: RwLock<ExecutionLimits>,
-    skills_dirs: RwLock<Vec<PathBuf>>,
-    skill_names: RwLock<Option<Vec<String>>>,
+    assembler: Arc<TurnAssembler>,
     cwd: String,
-    /// Root dir for spill files. Only set when storage backend is Fs.
-    spill_root: Option<PathBuf>,
-    storage: RwLock<Arc<dyn Storage>>,
-    variables: RwLock<Option<Arc<Variables>>>,
-    sandbox: super::sandbox::SandboxPolicy,
-    provider_override: RwLock<Option<Arc<dyn evot_engine::provider::StreamProvider>>>,
+    storage: Arc<dyn Storage>,
     /// session_id → (run_id, handle, done_flag)
-    active_runs: Arc<parking_lot::Mutex<HashMap<String, ActiveRun>>>,
+    active_runs: Arc<RunRegistry>,
     /// Fixed sharded gates linearize start/clear/delete per session without
     /// retaining one lock per historical session.
-    session_lifecycle_gates: Vec<tokio::sync::Mutex<()>>,
-    /// Session-scoped process registries survive per-turn tool reconstruction.
-    process_managers:
-        Arc<parking_lot::Mutex<HashMap<String, Arc<evot_engine::tools::ProcessManager>>>>,
-}
-
-impl Drop for Agent {
-    fn drop(&mut self) {
-        for manager in self.process_managers.lock().values() {
-            manager.terminate_all();
-        }
-    }
+    session_lifecycle_gates: SessionGates,
 }
 
 impl Agent {
@@ -276,33 +72,30 @@ impl Agent {
         Ok(Arc::new(Self::new_inner(config, cwd, storage)?))
     }
 
+    /// Agent whose sessions live only in memory: no session archive, no
+    /// spilled tool results, nothing left on disk after the process exits.
+    pub fn new_ephemeral(config: &Config, cwd: impl Into<String>) -> Result<Arc<Self>> {
+        let mut agent = Self::new_inner(config, cwd.into(), Arc::new(MemoryStorage::new()))?;
+        let mut assembler = TurnAssembler::new(config);
+        assembler.spill_root = None;
+        agent.assembler = Arc::new(assembler);
+        Ok(Arc::new(agent))
+    }
+
     fn new_inner(config: &Config, cwd: String, storage: Arc<dyn Storage>) -> Result<Self> {
         let system_prompt = format!("You are a helpful assistant. Working directory: {cwd}");
         Ok(Self {
-            llm: RwLock::new(
+            selection: ModelSelection::new(
                 config
                     .active_llm()
                     .unwrap_or_else(|_| LlmConfig::unconfigured()),
             ),
             system_prompt: RwLock::new(system_prompt),
-            system_prompt_sections: RwLock::new(Vec::new()),
-            limits: RwLock::new(ExecutionLimits::default()),
-            skills_dirs: RwLock::new(Vec::new()),
-            skill_names: RwLock::new(None),
+            assembler: Arc::new(TurnAssembler::new(config)),
             cwd,
-            spill_root: match config.storage.backend {
-                crate::conf::StorageBackend::Fs => Some(config.storage.fs.root_dir.clone()),
-                _ => None,
-            },
-            storage: RwLock::new(storage),
-            variables: RwLock::new(None),
-            sandbox: super::sandbox::SandboxPolicy::from_config(&config.sandbox),
-            provider_override: RwLock::new(None),
-            active_runs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            session_lifecycle_gates: (0..SESSION_LIFECYCLE_SHARDS)
-                .map(|_| tokio::sync::Mutex::new(()))
-                .collect(),
-            process_managers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            storage,
+            active_runs: Arc::new(RunRegistry::default()),
+            session_lifecycle_gates: SessionGates::new(),
         })
     }
 
@@ -313,7 +106,7 @@ impl Agent {
         provider: impl evot_engine::provider::StreamProvider + 'static,
     ) -> Result<Arc<Self>> {
         let agent = Arc::new(Self::new_inner(config, cwd.into(), storage)?);
-        *agent.provider_override.write() = Some(Arc::new(provider));
+        *agent.assembler.provider_override.write() = Some(Arc::new(provider));
         Ok(agent)
     }
 
@@ -322,7 +115,7 @@ impl Agent {
     pub fn with_system_prompt(self: &Arc<Self>, prompt: impl Into<String>) -> Arc<Self> {
         let prompt = prompt.into();
         let mut current_prompt = self.system_prompt.write();
-        let mut sections = self.system_prompt_sections.write();
+        let mut sections = self.assembler.system_prompt_sections.write();
         *current_prompt = prompt;
         sections.clear();
         Arc::clone(self)
@@ -337,7 +130,7 @@ impl Agent {
         sections: Vec<Section>,
     ) -> Arc<Self> {
         let mut current_prompt = self.system_prompt.write();
-        let mut current_sections = self.system_prompt_sections.write();
+        let mut current_sections = self.assembler.system_prompt_sections.write();
         *current_prompt = text;
         *current_sections = sections;
         Arc::clone(self)
@@ -351,7 +144,7 @@ impl Agent {
         }
 
         let mut prompt = self.system_prompt.write();
-        let mut sections = self.system_prompt_sections.write();
+        let mut sections = self.assembler.system_prompt_sections.write();
         if sections.is_empty() {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
@@ -382,18 +175,18 @@ impl Agent {
     }
 
     pub fn with_limits(self: &Arc<Self>, limits: ExecutionLimits) -> Arc<Self> {
-        *self.limits.write() = limits;
+        *self.assembler.limits.write() = limits;
         Arc::clone(self)
     }
 
     pub fn with_skills_dirs(self: &Arc<Self>, dirs: Vec<PathBuf>) -> Arc<Self> {
-        *self.skills_dirs.write() = dirs;
+        *self.assembler.skills_dirs.write() = dirs;
         self.with_claude_skills_dirs()
     }
 
     pub fn add_skills_dirs(self: &Arc<Self>, dirs: Vec<PathBuf>) -> Arc<Self> {
         {
-            let mut current = self.skills_dirs.write();
+            let mut current = self.assembler.skills_dirs.write();
             for dir in dirs {
                 if !current.contains(&dir) {
                     current.push(dir);
@@ -406,7 +199,7 @@ impl Agent {
     pub fn set_skill_names(&self, names: Vec<String>) -> Result<()> {
         crate::agent::prompt::skill::load_skills_by_name(&self.skills_dirs(), &names)
             .map_err(|error| EvotError::Agent(error.to_string()))?;
-        *self.skill_names.write() = Some(names);
+        *self.assembler.skill_names.write() = Some(names);
         Ok(())
     }
 
@@ -414,7 +207,7 @@ impl Agent {
         if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             let claude_dir = PathBuf::from(home).join(".claude").join("skills");
             if claude_dir.is_dir() {
-                let mut dirs = self.skills_dirs.write();
+                let mut dirs = self.assembler.skills_dirs.write();
                 if !dirs.contains(&claude_dir) {
                     dirs.push(claude_dir);
                 }
@@ -424,7 +217,8 @@ impl Agent {
     }
 
     pub fn with_variables(self: &Arc<Self>, variables: Arc<Variables>) -> Arc<Self> {
-        *self.variables.write() = Some(variables);
+        crate::privacy::remember_secrets(variables.secret_values());
+        *self.assembler.variables.write() = Some(variables);
         Arc::clone(self)
     }
 
@@ -435,7 +229,7 @@ impl Agent {
     }
 
     pub fn llm(&self) -> LlmConfig {
-        self.llm.read().clone()
+        self.selection.snapshot()
     }
 
     pub fn cwd(&self) -> &str {
@@ -448,97 +242,47 @@ impl Agent {
     /// layer should read so `/skill list` and the banner never drift from what
     /// the agent actually loads.
     pub fn skills_dirs(&self) -> Vec<PathBuf> {
-        self.skills_dirs.read().clone()
+        self.assembler.skills_dirs.read().clone()
     }
 
     pub fn limits(&self) -> ExecutionLimits {
-        self.limits.read().clone()
+        self.assembler.limits.read().clone()
     }
 
     pub fn set_llm(&self, llm: LlmConfig) {
-        *self.llm.write() = llm;
+        self.selection.replace(llm);
     }
 
     /// Set the active thinking level for the current provider.
     pub fn set_thinking_level(&self, level: evot_engine::ThinkingLevel) {
-        self.llm.write().thinking_level = level;
+        self.selection.set_thinking_level(level);
     }
 
     /// Apply a named thinking level when supported by the active model.
     /// Kept as a public API for callers that explicitly manage live state;
     /// session resume intentionally reloads the current configured value instead.
     pub fn restore_thinking_level(&self, name: &str) {
-        let Ok(level) = crate::conf::thinking_level_from_str(name) else {
-            return;
-        };
-        if self.supported_thinking_levels().contains(&level) {
-            self.set_thinking_level(level);
-        }
+        self.selection.restore_thinking_level(name);
     }
 
     /// Thinking levels the current model can cycle through, in ascending order
     /// of effort. Empty when the model does not honor a reasoning effort (e.g.
     /// an OpenAI-compatible provider without the reasoning-effort capability).
     pub fn supported_thinking_levels(&self) -> Vec<evot_engine::ThinkingLevel> {
-        let llm = self.llm.read().clone();
-        Self::supported_thinking_levels_for(&llm)
-    }
-
-    fn supported_thinking_levels_for(llm: &LlmConfig) -> Vec<evot_engine::ThinkingLevel> {
-        let model = Self::model_config_for(llm);
-        if model.reasoning() {
-            model.supported_thinking_levels()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Return the catalog + route + override metadata resolved by configuration.
-    fn model_config_for(llm: &LlmConfig) -> evot_engine::provider::ModelConfig {
-        llm.model_config.clone()
-    }
-
-    /// Replace the LLM config while inheriting the session's current thinking
-    /// level, clamped to what the new model supports. Models without selectable
-    /// reasoning always use `Off`. Cloud models with a catalog default skip
-    /// this and take that default instead — the server is choosing the effort.
-    fn set_llm_preserving_thinking(&self, mut llm: LlmConfig) {
-        let current = self.llm.read().thinking_level;
-        llm.thinking_level = Self::model_config_for(&llm).effective_thinking_level(current);
-        self.set_llm(llm);
-    }
-
-    fn set_llm_for_model_switch(&self, config: &Config, llm: LlmConfig) {
-        if config.cloud_thinking_levels.contains_key(&llm.model) {
-            self.set_llm(llm);
-            return;
-        }
-        self.set_llm_preserving_thinking(llm);
+        self.selection.supported_thinking_levels()
     }
 
     /// The active model's resolved context window in tokens, after applying
     /// explicit overrides. Used to size and validate compaction so the retained
     /// context fits what the model actually accepts.
     pub fn resolved_context_window(&self) -> u32 {
-        Self::model_config_for(&self.llm.read()).context_window()
+        self.selection.resolved_context_window()
     }
 
     /// Advance the thinking level to the next supported tier, wrapping around.
     /// Returns the new level, or `None` when the model has no selectable levels.
     pub fn cycle_thinking_level(&self) -> Option<evot_engine::ThinkingLevel> {
-        let levels = self.supported_thinking_levels();
-        if levels.is_empty() {
-            return None;
-        }
-        let current = self.llm.read().thinking_level;
-        let next_index = levels
-            .iter()
-            .position(|l| *l == current)
-            .map(|i| (i + 1) % levels.len())
-            .unwrap_or(0);
-        let next = levels[next_index];
-        self.set_thinking_level(next);
-        Some(next)
+        self.selection.cycle_thinking_level()
     }
 
     /// Set the active model by spec (e.g. "deepseek-chat" or "openrouter:google/gemini-2.5-pro").
@@ -547,19 +291,20 @@ impl Agent {
     /// active LLM. Explicit `provider:model` remains the escape hatch for model
     /// ids not listed in config, as long as the provider itself exists.
     pub fn set_model_by_spec(&self, config: &Config, spec: &str) -> Result<()> {
-        let (provider_name, model_override) = config.resolve_model_spec(spec)?;
-        let llm = config.build_llm(&provider_name, model_override)?;
-        self.set_llm_for_model_switch(config, llm);
-        Ok(())
+        self.selection.select_by_spec(config, spec)
     }
 
-    /// Switch provider by spec while preserving the live thinking level.
-    /// Used for interactive model changes.
-    pub fn set_provider_by_spec(&self, config: &Config, spec: &str) -> Result<()> {
-        let (provider_name, model_override) = config.resolve_model_spec(spec)?;
-        let llm = config.build_llm(&provider_name, model_override)?;
-        self.set_llm_for_model_switch(config, llm);
-        Ok(())
+    /// Select a model from the configured directory and return the exact
+    /// snapshot to pin to a run. This does not persist configuration.
+    pub fn select_configured_model(
+        &self,
+        config: &Config,
+        provider: &str,
+        model: &str,
+        thinking_level: Option<&str>,
+    ) -> Result<LlmConfig> {
+        self.selection
+            .select_configured(config, provider, model, thinking_level)
     }
 
     /// Re-resolve the live selection against a reloaded config, after login,
@@ -575,28 +320,7 @@ impl Agent {
     /// Total by construction: every config maps to one of the three landings, so
     /// callers never have to invent a recovery of their own.
     pub fn reload_selection(&self, config: &Config) -> SelectionReload {
-        let (provider, model) = {
-            let llm = self.llm.read();
-            (llm.provider.clone(), llm.model.clone())
-        };
-        if config.serves(&provider, &model) {
-            // `serves` already found the provider, so this cannot fail; falling
-            // through on the impossible error still lands somewhere valid.
-            if let Ok(llm) = config.build_llm(&provider, Some(model)) {
-                self.set_llm_preserving_thinking(llm);
-                return SelectionReload::Kept;
-            }
-        }
-        match config.active_llm() {
-            Ok(llm) => {
-                self.set_llm(llm);
-                SelectionReload::Switched
-            }
-            Err(_) => {
-                self.set_llm(LlmConfig::unconfigured());
-                SelectionReload::Unconfigured
-            }
-        }
+        self.selection.reload_selection(config)
     }
 
     /// Restore a resumed session's saved provider/model. Falls back to
@@ -604,89 +328,66 @@ impl Agent {
     /// provider dropped from config), so its thinking level still refreshes.
     /// Returns whether the saved selection was restored.
     pub fn reload_provider_for_resume(&self, config: &Config, spec: &str) -> Result<bool> {
-        match config.resolve_model_spec(spec) {
-            Ok((provider_name, model_override)) => {
-                let llm = config.build_llm(&provider_name, model_override)?;
-                self.set_llm(llm);
-                Ok(true)
-            }
-            Err(saved_error) => {
-                let current_spec = {
-                    let llm = self.llm.read();
-                    format!("{}:{}", llm.provider, llm.model)
-                };
-                let (provider_name, model_override) = config
-                    .resolve_model_spec(&current_spec)
-                    .map_err(|_| saved_error)?;
-                let llm = config.build_llm(&provider_name, model_override)?;
-                self.set_llm(llm);
-                Ok(false)
-            }
-        }
+        self.selection.reload_provider_for_resume(config, spec)
     }
 
     pub fn variables(&self) -> Option<Arc<Variables>> {
-        self.variables.read().clone()
+        self.assembler.variables.read().clone()
     }
 
     pub fn storage(&self) -> Arc<dyn Storage> {
-        self.storage.read().clone()
+        self.storage.clone()
     }
 
     fn session_lifecycle_gate(&self, session_id: &str) -> &tokio::sync::Mutex<()> {
-        let mut hasher = DefaultHasher::new();
-        session_id.hash(&mut hasher);
-        let index = (hasher.finish() as usize) % self.session_lifecycle_gates.len();
-        &self.session_lifecycle_gates[index]
+        self.session_lifecycle_gates.gate(session_id)
     }
 
     // -- run control ---------------------------------------------------------
 
     /// Send a steering message to the active run for a session.
     pub fn steer(&self, session_id: &str, input: Vec<evot_engine::Content>) {
-        if let Some(ar) = self.active_runs.lock().get(session_id) {
-            if !ar.completed.is_cancelled() {
-                ar.handle
-                    .steer(evot_engine::AgentMessage::Llm(evot_engine::Message::User {
-                        content: input,
-                        timestamp: evot_engine::now_ms(),
-                    }));
-            }
-        }
+        self.try_steer(session_id, input);
+    }
+
+    pub fn try_steer(&self, session_id: &str, input: Vec<evot_engine::Content>) -> bool {
+        let (input, provenance) = crate::conversation::input::PreparedInput::user(input).finish();
+        self.active_runs.try_steer(
+            session_id,
+            evot_engine::AgentMessage::Llm(evot_engine::Message::User {
+                provenance,
+                content: input,
+                timestamp: evot_engine::now_ms(),
+            }),
+        )
     }
 
     /// Send a follow-up message to the active run for a session.
     pub fn follow_up(&self, session_id: &str, text: impl Into<String>) {
-        if let Some(ar) = self.active_runs.lock().get(session_id) {
-            if !ar.completed.is_cancelled() {
-                ar.handle
-                    .follow_up(evot_engine::AgentMessage::Llm(evot_engine::Message::user(
-                        text,
-                    )));
-            }
-        }
+        let (content, provenance) =
+            crate::conversation::input::PreparedInput::user(vec![evot_engine::Content::Text {
+                text: text.into(),
+            }])
+            .finish();
+        self.active_runs.follow_up(
+            session_id,
+            evot_engine::AgentMessage::Llm(evot_engine::Message::User {
+                content,
+                provenance,
+                timestamp: evot_engine::now_ms(),
+            }),
+        );
     }
 
     /// Abort the active run for a session.
     pub fn abort_run(&self, session_id: &str) {
-        if let Some(ar) = self.active_runs.lock().get(session_id) {
-            ar.handle.abort();
-        }
+        self.active_runs.abort(session_id);
     }
 
     /// Check if a session has an active (non-finished) run.
     /// Automatically cleans up finished runs.
     pub fn has_active_run(&self, session_id: &str) -> bool {
-        let mut map = self.active_runs.lock();
-        if let Some(ar) = map.get(session_id) {
-            if ar.completed.is_cancelled() {
-                map.remove(session_id);
-                return false;
-            }
-            true
-        } else {
-            false
-        }
+        self.active_runs.contains(session_id)
     }
 
     /// Abort the current run for a session and wait until its cleanup callback
@@ -714,13 +415,7 @@ impl Agent {
         session_id: &str,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> AbortRunOutcome {
-        let active = {
-            let map = self.active_runs.lock();
-            map.get(session_id).map(|active| {
-                active.handle.abort();
-                active.completed.clone()
-            })
-        };
+        let active = self.active_runs.abort(session_id);
         let Some(completed) = active else {
             return AbortRunOutcome::Stopped;
         };
@@ -783,26 +478,21 @@ impl Agent {
     // -- query ---------------------------------------------------------------
 
     pub async fn submit(self: &Arc<Self>, mut request: QueryRequest) -> Result<SubmitOutcome> {
-        // Session-independent commands are handled before resolve_session,
-        // which would otherwise persist an empty session when the caller has
-        // no session yet (e.g. `/resume <query>` from a fresh CLI).
-        if let Some(crate::command::Command::ResumeSearch { query }) =
-            crate::command::parse_command(&request.input_text())
-        {
-            let msg = self.handle_resume_search(&query).await?;
-            return Ok(SubmitOutcome::Command(msg));
-        }
-
         // Freeze one selection for session metadata and every turn in this run.
         // Without this snapshot, concurrent callers changing the live model
         // could make a run start or auto-continue on a different provider.
         let llm = request.llm.clone().unwrap_or_else(|| self.llm());
         request.llm = Some(llm.clone());
         let session = self
-            .resolve_session(
+            .session_service()
+            .resolve(
                 request.session_id.as_deref(),
                 &request.source,
-                &llm,
+                SessionSelection {
+                    provider: llm.provider.clone(),
+                    model: llm.model.clone(),
+                    thinking_level: Self::persisted_thinking_level_for(&llm),
+                },
                 request.cwd.as_deref(),
             )
             .await?;
@@ -820,9 +510,15 @@ impl Agent {
         if let Some(outcome) = self.maybe_handle_command(&request, &session).await? {
             return Ok(outcome);
         }
-        // `/clip all` loads the memory workflow and continues as a normal run.
-        let skills_dirs = self.skills_dirs.read().clone();
-        let request = expand_prompt_command(request, &skills_dirs)?;
+        // `/clip all` and `/sessions <query>` become prepared prompts and
+        // continue as a normal run.
+        let skills_dirs = self.assembler.skills_dirs.read().clone();
+        let request = expand_prompt_command(request, &PromptCommandContext {
+            skills_dirs: &skills_dirs,
+            storage: self.storage.clone(),
+            session: &session,
+        })
+        .await?;
 
         let run = self.start_run(request, session).await?;
         Ok(SubmitOutcome::Run(run))
@@ -849,12 +545,7 @@ impl Agent {
                 let session_id = session.session_id().await;
                 let _lifecycle = self.session_lifecycle_gate(&session_id).lock().await;
                 self.abort_run_and_wait_for_completion(&session_id).await?;
-                let process_manager = self.process_managers.lock().remove(&session_id);
-                if let Some(manager) = process_manager {
-                    manager
-                        .terminate_all_and_wait(PROCESS_SHUTDOWN_TIMEOUT)
-                        .await;
-                }
+                self.assembler.processes.retire(&session_id).await;
                 session.write_clear_marker().await?;
                 session.save().await?;
                 Ok(Some(SubmitOutcome::Command("Session cleared.".into())))
@@ -879,7 +570,7 @@ impl Agent {
                         )))
                     }
                 };
-                let msg = format_manual_compaction_outcome(&outcome);
+                let msg = outcome.describe();
                 Ok(Some(SubmitOutcome::Command(msg)))
             }
             Command::Dump { target } => {
@@ -890,12 +581,7 @@ impl Agent {
             }
             // Expanded into a normal prompt by `expand_prompt_command` after
             // this interception step; nothing to handle here.
-            Command::ClipSession => Ok(None),
-            // Semantic session search — one-shot LLM ranking, no agent run.
-            Command::ResumeSearch { query } => {
-                let msg = self.handle_resume_search(&query).await?;
-                Ok(Some(SubmitOutcome::Command(msg)))
-            }
+            Command::ClipSession | Command::SessionSearch(_) => Ok(None),
         }
     }
 
@@ -923,71 +609,24 @@ impl Agent {
             },
             observer,
         };
-        let result = crate::compact::orchestrator::compact_session_with_status(
-            session,
-            request,
-            cancel.clone(),
-        )
-        .await?;
-        if result.status == crate::compact::orchestrator::CompactSessionStatus::Cancelled {
-            return Ok(crate::compact::orchestrator::ManualCompactionOutcome::Cancelled);
-        }
-        session.save().await?;
-        match result.item {
-            Some(crate::types::TranscriptItem::Compact {
-                summary,
-                tokens_before,
-                tokens_after,
-                messages_before,
-                messages_after,
-                details,
-                ..
-            }) => Ok(
-                crate::compact::orchestrator::ManualCompactionOutcome::Compacted {
-                    summary,
-                    tokens_before,
-                    tokens_after,
-                    messages_before,
-                    messages_after,
-                    context_window,
-                    messages_evicted: messages_before
-                        .saturating_sub(messages_after)
-                        .saturating_add(1),
-                    current_run_reclaimed: 0,
-                    compaction_level: 3,
-                    used_fallback: result.used_fallback,
-                    method: details.method,
-                    remote_blob_bytes: details.remote_blob_bytes,
-                    fallback_reason: details.fallback_reason,
-                },
-            ),
-            _ => Ok(crate::compact::orchestrator::ManualCompactionOutcome::NothingToCompact),
-        }
+        crate::compact::service::compact(session, request, cancel).await
     }
 
     fn llm_provider(&self, protocol: &Protocol) -> Arc<dyn evot_engine::provider::StreamProvider> {
-        use evot_engine::provider::AnthropicProvider;
-        use evot_engine::provider::OpenAiCompatProvider;
-        use evot_engine::provider::OpenAiResponsesProvider;
-
-        self.provider_override
-            .read()
-            .clone()
-            .unwrap_or_else(|| match protocol {
-                Protocol::Anthropic => Arc::new(AnthropicProvider),
-                Protocol::OpenAiResponses => Arc::new(OpenAiResponsesProvider),
-                Protocol::OpenAi => Arc::new(OpenAiCompatProvider),
-            })
+        match self.assembler.provider_override.read().clone() {
+            Some(provider) => crate::models::transport::overridden(provider),
+            None => crate::models::transport::for_protocol(protocol),
+        }
     }
 
     fn compact_summarizer(&self) -> crate::compact::orchestrator::CompactSummarizer {
-        let llm = self.llm.read().clone();
+        let llm = self.selection.snapshot();
         let provider = self.llm_provider(&llm.protocol);
         crate::compact::orchestrator::CompactSummarizer {
             provider,
             llm,
             reserve_tokens: evot_engine::DEFAULT_SUMMARY_RESERVE_TOKENS,
-            timeout: COMPACTION_SUMMARY_TIMEOUT,
+            timeout: None,
         }
     }
 
@@ -1029,22 +668,19 @@ impl Agent {
         let rid = run_id.clone();
         let completed_signal = completed.clone();
         let on_complete: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-            completed_signal.cancel();
-            let mut map = active_runs.lock();
-            if let Some(ar) = map.get(&sid) {
-                if ar.run_id == rid {
-                    map.remove(&sid);
-                }
-            }
+            active_runs.complete(&sid, &rid, &completed_signal);
         });
 
         let factory: Arc<dyn TurnFactory> = Arc::new(AgentTurnFactory {
-            agent: Arc::clone(self),
+            assembler: Arc::clone(&self.assembler),
             session: Arc::clone(&session),
             mode: request.mode,
             session_id: session_id.clone(),
             llm,
+            previous_llm: self.selection.previous_llm(),
             host_tools: request.host_tools.clone(),
+            extra_tools: request.extra_tools.clone(),
+            approver: request.approver.clone(),
         });
 
         let run = runtime::execute_run(runtime::ExecuteRunArgs {
@@ -1060,15 +696,8 @@ impl Agent {
         // completion token is cancelled before that callback takes the lock, so
         // this ordering closes the check/insert race that could leave a finished
         // run registered forever.
-        let mut active_runs = self.active_runs.lock();
-        if !completed.is_cancelled() {
-            active_runs.insert(session_id, ActiveRun {
-                run_id,
-                handle: run.handle(),
-                completed,
-            });
-        }
-        drop(active_runs);
+        self.active_runs
+            .register(session_id, run_id, run.handle(), completed);
 
         Ok(run)
     }
@@ -1078,44 +707,23 @@ impl Agent {
     /// Fork an independent, non-persisted agent for side conversations.
     pub fn fork(self: &Arc<Self>, request: ForkRequest) -> Result<ForkedAgent> {
         let Self {
-            llm,
+            selection,
             system_prompt: _,
-            system_prompt_sections: _,
-            limits,
-            skills_dirs: _,
-            skill_names: _,
+            assembler,
             cwd,
-            spill_root: _,
             storage: _,
-            variables: _,
-            sandbox,
-            provider_override: _,
             active_runs: _,
             session_lifecycle_gates: _,
-            process_managers: _,
         } = self.as_ref();
 
         let forked = Arc::new(Self {
-            llm: RwLock::new(llm.read().clone()),
+            selection: ModelSelection::new(selection.snapshot()),
             system_prompt: RwLock::new(request.system_prompt),
-            system_prompt_sections: RwLock::new(Vec::new()),
-            limits: RwLock::new(limits.read().clone()),
-            skills_dirs: RwLock::new(vec![]),
-            skill_names: RwLock::new(None),
+            assembler: Arc::new(assembler.fork()),
             cwd: cwd.clone(),
-            spill_root: None,
-            storage: RwLock::new(Arc::new(MemoryStorage::new())),
-            variables: RwLock::new(None),
-            sandbox: super::sandbox::SandboxPolicy {
-                enabled: sandbox.enabled,
-                extra_dirs: sandbox.extra_dirs.clone(),
-            },
-            provider_override: RwLock::new(None),
-            active_runs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            session_lifecycle_gates: (0..SESSION_LIFECYCLE_SHARDS)
-                .map(|_| tokio::sync::Mutex::new(()))
-                .collect(),
-            process_managers: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            storage: Arc::new(MemoryStorage::new()),
+            active_runs: Arc::new(RunRegistry::default()),
+            session_lifecycle_gates: SessionGates::new(),
         });
         Ok(ForkedAgent {
             agent: forked,
@@ -1125,56 +733,24 @@ impl Agent {
 
     // -- session queries -----------------------------------------------------
 
-    pub async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionMeta>> {
-        let storage = self.storage.read().clone();
-        let sessions = storage
-            .list_sessions(ListSessions {
-                // Apply the public limit after draft filtering. Otherwise a run
-                // of abandoned `/new` drafts can fill the page and hide real
-                // conversations below it.
-                limit: 0,
-                offset: 0,
-            })
-            .await?;
-        let mut visible = Vec::new();
-        for session in sessions {
-            let is_draft = session.turns == 0
-                && session.title.is_none()
-                && !storage.session_has_entries(&session.session_id).await?;
-            if !is_draft {
-                visible.push(session);
-                if limit > 0 && visible.len() == limit {
-                    break;
-                }
-            }
-        }
-        Ok(visible)
+    pub fn sessions(&self) -> SessionQueries {
+        SessionQueries::new(self.storage())
     }
 
-    pub async fn list_sessions_with_text(
+    pub async fn rename_session(
         &self,
-        limit: usize,
-    ) -> Result<Vec<crate::search::SessionWithText>> {
-        let storage = self.storage.read().clone();
-        storage.list_sessions_with_text(limit).await
-    }
-
-    pub async fn find_session(&self, id: &str) -> Result<Option<SessionMeta>> {
-        let storage = self.storage.read().clone();
-        storage.get_session(id).await
+        session_id: &str,
+        title: &str,
+    ) -> Result<crate::types::SessionMeta> {
+        let _lifecycle = self.session_lifecycle_gate(session_id).lock().await;
+        self.storage.rename_session(session_id, title).await
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
         let _lifecycle = self.session_lifecycle_gate(session_id).lock().await;
         self.abort_run_and_wait_for_completion(session_id).await?;
-        let process_manager = self.process_managers.lock().remove(session_id);
-        if let Some(manager) = process_manager {
-            manager
-                .terminate_all_and_wait(PROCESS_SHUTDOWN_TIMEOUT)
-                .await;
-        }
-        let storage = self.storage.read().clone();
-        storage.delete_session(session_id).await
+        self.assembler.processes.retire(session_id).await;
+        self.storage.delete_session(session_id).await
     }
 
     /// Listing view of a session's background tasks. Uses the summary form so a
@@ -1183,11 +759,7 @@ impl Agent {
         &self,
         session_id: &str,
     ) -> Vec<evot_engine::tools::ProcessSummary> {
-        self.process_managers
-            .lock()
-            .get(session_id)
-            .map(|manager| manager.summaries())
-            .unwrap_or_default()
+        self.assembler.processes.summaries(session_id)
     }
 
     pub async fn stop_background_process(
@@ -1195,37 +767,10 @@ impl Agent {
         session_id: &str,
         task_id: &str,
     ) -> Result<Option<evot_engine::tools::ProcessSummary>> {
-        let manager = self.process_managers.lock().get(session_id).cloned();
-        let Some(manager) = manager else {
-            return Ok(None);
-        };
-        let summaries = manager.summaries();
-        let matches = summaries
-            .iter()
-            .filter(|summary| {
-                matches!(
-                    &summary.status,
-                    evot_engine::tools::ProcessStatus::RunningBackground(_)
-                ) && (summary.task_id == task_id || summary.task_id.starts_with(task_id))
-            })
-            .collect::<Vec<_>>();
-        let resolved = match matches.as_slice() {
-            [] => return Ok(None),
-            [summary] => summary.task_id.clone(),
-            _ => {
-                return Err(EvotError::Run(format!(
-                    "background task ID prefix is ambiguous: {task_id}"
-                )))
-            }
-        };
-        // The pending notification is deliberately left in place: the model has
-        // to learn the user stopped this task, and `summaries()` below reports
-        // the outcome to the caller.
-        manager.stop_by_user(&resolved).await;
-        Ok(manager
-            .summaries()
-            .into_iter()
-            .find(|summary| summary.task_id == resolved))
+        self.assembler
+            .processes
+            .stop_background(session_id, task_id)
+            .await
     }
 
     /// Detach every foreground shell in a session, returning how many moved.
@@ -1237,11 +782,9 @@ impl Agent {
         session_id: &str,
         reason: evot_engine::tools::BackgroundReason,
     ) -> usize {
-        let manager = self.process_managers.lock().get(session_id).cloned();
-        match manager {
-            Some(manager) => manager.background_all_foreground(reason).len(),
-            None => 0,
-        }
+        self.assembler
+            .processes
+            .background_foreground(session_id, reason)
     }
 
     /// Blocking `task_output` waits in flight for a session.
@@ -1250,22 +793,16 @@ impl Agent {
     /// backgrounded, so there is no foreground shell to detach — the UI needs
     /// this count to know ctrl+b has something to release.
     pub fn blocking_task_waits(&self, session_id: &str) -> usize {
-        let manager = self.process_managers.lock().get(session_id).cloned();
-        match manager {
-            Some(manager) => manager.blocking_waiters(),
-            None => 0,
-        }
+        self.assembler.processes.blocking_waiters(session_id)
     }
 
     /// End in-flight blocking waits, returning how many were released.
     ///
     /// The watched tasks keep running; only the waiting ends.
     pub fn release_blocking_task_waits(&self, session_id: &str) -> usize {
-        let manager = self.process_managers.lock().get(session_id).cloned();
-        match manager {
-            Some(manager) => manager.release_blocking_waiters(),
-            None => 0,
-        }
+        self.assembler
+            .processes
+            .release_blocking_waiters(session_id)
     }
 
     /// Completion notices queued for a session but not yet delivered to a turn.
@@ -1274,22 +811,23 @@ impl Agent {
     /// turn is the only thing that can actually carry these. `build_turn`
     /// drains them via `take_notifications`.
     pub fn pending_process_notifications(&self, session_id: &str) -> usize {
-        let manager = self.process_managers.lock().get(session_id).cloned();
-        match manager {
-            Some(manager) => manager.pending_notifications(),
-            None => 0,
-        }
+        self.assembler.processes.pending_notifications(session_id)
+    }
+
+    pub fn pending_process_wake_notifications(&self, session_id: &str) -> usize {
+        self.assembler
+            .processes
+            .pending_wake_notifications(session_id)
     }
 
     pub async fn stop_all_background_processes(
         &self,
         session_id: &str,
     ) -> Vec<evot_engine::tools::ProcessSummary> {
-        let manager = self.process_managers.lock().get(session_id).cloned();
-        match manager {
-            Some(manager) => manager.stop_all_background(PROCESS_SHUTDOWN_TIMEOUT).await,
-            None => Vec::new(),
-        }
+        self.assembler
+            .processes
+            .stop_all_background(session_id)
+            .await
     }
 
     /// Kill every background process across all sessions, synchronously.
@@ -1297,51 +835,7 @@ impl Agent {
     /// Used on process-exit paths that bypass async teardown, where waiting is
     /// not possible and orphaned children are the failure mode.
     pub fn kill_all_background_processes_now(&self) -> usize {
-        let managers = self
-            .process_managers
-            .lock()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        managers.iter().map(|manager| manager.kill_all_now()).sum()
-    }
-
-    pub async fn list_favorites(&self) -> Result<Vec<String>> {
-        let storage = self.storage.read().clone();
-        storage.load_favorites().await
-    }
-
-    /// Remove deleted ids from the favorites document. Returns how many favorite
-    /// entries were pruned.
-    pub async fn remove_favorites(&self, session_ids: &[String]) -> Result<usize> {
-        let storage = self.storage.read().clone();
-        let ids = storage.load_favorites().await?;
-        let before = ids.len();
-        let kept: Vec<String> = ids
-            .into_iter()
-            .filter(|id| !session_ids.iter().any(|deleted| deleted == id))
-            .collect();
-        let removed = before.saturating_sub(kept.len());
-        if removed > 0 {
-            storage.save_favorites(kept).await?;
-        }
-        Ok(removed)
-    }
-
-    /// Toggle a session's favorite state, returning the new state (`true` =
-    /// now favorited). Persisted via the storage backend's favorites document.
-    pub async fn toggle_favorite(&self, session_id: &str) -> Result<bool> {
-        let storage = self.storage.read().clone();
-        let mut ids = storage.load_favorites().await?;
-        let now_favorited = if let Some(pos) = ids.iter().position(|id| id == session_id) {
-            ids.remove(pos);
-            false
-        } else {
-            ids.push(session_id.to_string());
-            true
-        };
-        storage.save_favorites(ids).await?;
-        Ok(now_favorited)
+        self.assembler.processes.kill_all_now()
     }
 
     pub async fn create_session(&self, source: &str) -> Result<SessionMeta> {
@@ -1367,112 +861,37 @@ impl Agent {
         let (provider, model) = match llm {
             Some(pair) => pair,
             None => {
-                let live = self.llm.read();
+                let live = self.selection.snapshot();
                 (live.provider.clone(), live.model.clone())
             }
         };
-        let storage = self.storage.read().clone();
-        let id = crate::types::new_id();
-        let dir = match cwd {
-            Some(path) => canonical_workspace(&path)?,
-            None => self.cwd.clone(),
-        };
-        let session =
-            Session::new_with_provider_source(id, dir, provider, model, source, storage).await?;
-        Ok(session.meta().await)
+        self.session_service()
+            .create(source, cwd.as_deref(), provider, model)
+            .await
     }
 
-    pub async fn load_transcript(&self, id: &str) -> Result<Vec<TranscriptItem>> {
-        let storage = self.storage.read().clone();
-        if storage.get_session(id).await?.is_none() {
-            return Ok(Vec::new());
+    /// Fork `source_id` into a new persistent session that inherits its
+    /// active context. Refused while the source is running, so the fork point
+    /// never lands inside a half-written turn.
+    pub async fn fork_session(&self, source_id: &str, title: Option<&str>) -> Result<SessionMeta> {
+        let _lifecycle = self.session_lifecycle_gate(source_id).lock().await;
+        if self.has_active_run(source_id) {
+            return Err(EvotError::Session(
+                "cannot fork while the session is running".into(),
+            ));
         }
-        let entries = storage
-            .list_entries(ListTranscriptEntries {
-                session_id: id.to_string(),
-                run_id: None,
-                after_seq: None,
-                limit: None,
-            })
-            .await?;
-        Ok(entries.into_iter().map(|entry| entry.item).collect())
-    }
-
-    pub async fn load_context_transcript(&self, id: &str) -> Result<Vec<TranscriptItem>> {
-        let storage = self.storage.read().clone();
-        match Session::open(id, storage).await? {
-            Some(session) => Ok(session.transcript().await),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    /// Load the current branch for terminal replay without serializing all
-    /// superseded history or the Engine-only payload embedded in a compact
-    /// snapshot. Retained messages are replayed before a lightweight compact
-    /// card, followed by entries written after that compact point.
-    pub async fn load_resume_transcript(&self, id: &str) -> Result<Vec<TranscriptItem>> {
-        let storage = self.storage.read().clone();
-        if storage.get_session(id).await?.is_none() {
-            return Ok(Vec::new());
-        }
-        let entries = storage.load_active_entries(id).await?;
-        Ok(resume_transcript_items(entries))
+        self.session_service().fork(source_id, title).await
     }
 
     pub async fn load_session(&self, id: &str) -> Result<Option<Arc<Session>>> {
-        let storage = self.storage.read().clone();
-        Session::open(id, storage).await
+        self.session_service().load(id).await
+    }
+
+    fn session_service(&self) -> SessionService {
+        SessionService::new(self.storage.clone(), self.cwd.clone())
     }
 
     // -- private -------------------------------------------------------------
-
-    fn build_system_prompt(&self, mode: ToolMode, cwd: &str) -> (String, Vec<Section>) {
-        let mut sections = self.system_prompt_sections.read().clone();
-        bind_workspace_sections(&mut sections, cwd);
-
-        let ctx = DynamicContext {
-            mode: prompt_mode(mode),
-            sandbox: self.sandbox.enabled,
-            variables: self
-                .variables
-                .read()
-                .as_ref()
-                .map(|v| v.variable_names())
-                .unwrap_or_default(),
-        };
-        sections.extend(dynamic_sections(&ctx));
-
-        let text = sections
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        (text, sections)
-    }
-
-    /// Search recent sessions for literal matches before falling back to
-    /// semantic ranking with the configured LLM.
-    async fn handle_resume_search(&self, query: &str) -> Result<String> {
-        let storage = self.storage.read().clone();
-        let sessions = storage
-            .list_sessions_with_text(crate::agent::resume_search::SESSION_LIMIT)
-            .await?;
-        if let Some(results) = crate::agent::resume_search::literal_results(query, &sessions) {
-            return Ok(results);
-        }
-
-        let llm = self.llm.read().clone();
-        if llm.provider.is_empty() || llm.api_key.trim().is_empty() {
-            return Err(EvotError::Conf(
-                "Semantic session search needs a configured LLM provider.".to_string(),
-            ));
-        }
-        let ctx = crate::agent::resume_search::RankContext {
-            provider: self.llm_provider(&llm.protocol),
-            llm,
-        };
-        crate::agent::resume_search::rank_sessions(&ctx, query, &sessions).await
-    }
 
     /// Build a structured snapshot of what evot would send to the LLM right
     /// now (system prompt + tool definitions). Persists
@@ -1487,6 +906,7 @@ impl Agent {
         // build_turn runs the full per-turn assembly (tools, skills).
         let llm = self.llm();
         let turn = self
+            .assembler
             .build_turn(
                 &llm,
                 mode,
@@ -1495,7 +915,10 @@ impl Agent {
                 TurnBuildRequest {
                     input: Vec::new(),
                     host_tools: None,
+                    extra_tools: Vec::new(),
+                    approver: None,
                     consume_process_notifications: false,
+                    previous_llm: None,
                 },
             )
             .await?;
@@ -1528,56 +951,6 @@ impl Agent {
         ))
     }
 
-    async fn resolve_session(
-        &self,
-        session_id: Option<&str>,
-        source: &str,
-        llm: &LlmConfig,
-        cwd: Option<&str>,
-    ) -> Result<Arc<Session>> {
-        let provider = llm.provider.clone();
-        let model = llm.model.clone();
-        let thinking_level = Self::persisted_thinking_level_for(llm);
-        let storage = self.storage.read().clone();
-        let session = match session_id {
-            Some(id) => match Session::open(id, storage.clone()).await? {
-                Some(session) => {
-                    session.set_model_selection(provider, model).await?;
-                    session
-                }
-                None => {
-                    Session::new_with_provider_source(
-                        id.to_string(),
-                        Self::create_cwd(cwd, &self.cwd)?,
-                        provider,
-                        model,
-                        source,
-                        storage,
-                    )
-                    .await?
-                }
-            },
-            None => {
-                let id = crate::types::new_id();
-                Session::new_with_provider_source(
-                    id,
-                    Self::create_cwd(cwd, &self.cwd)?,
-                    provider,
-                    model,
-                    source,
-                    storage,
-                )
-                .await?
-            }
-        };
-        // Mirror the live model selection: every run stamps the session with the
-        // agent's current reasoning effort so it survives restarts (persisted by
-        // the run's final `save()`).
-        session.set_thinking_level(thinking_level).await;
-
-        Ok(session)
-    }
-
     /// The session-facing label for the agent's current thinking level, or
     /// `None` when the level is not a selectable tier for the active model
     /// (e.g. a config-set level the model rejects). Resume restores this
@@ -1585,590 +958,10 @@ impl Agent {
     /// metadata meaningful.
     fn persisted_thinking_level_for(llm: &LlmConfig) -> Option<String> {
         let level = llm.thinking_level;
-        if Self::supported_thinking_levels_for(llm).contains(&level) {
+        if ModelSelection::supported_thinking_levels_for(llm).contains(&level) {
             Some(level.as_str().to_string())
         } else {
             None
-        }
-    }
-
-    fn create_cwd(requested: Option<&str>, fallback: &str) -> Result<String> {
-        match requested {
-            Some(path) => canonical_workspace(path),
-            None => Ok(fallback.to_string()),
-        }
-    }
-
-    async fn build_turn(
-        &self,
-        llm: &LlmConfig,
-        mode: ToolMode,
-        session: Arc<Session>,
-        session_id: &str,
-        request: TurnBuildRequest,
-    ) -> Result<runtime::TurnInput> {
-        let TurnBuildRequest {
-            mut input,
-            host_tools,
-            consume_process_notifications,
-        } = request;
-        let llm = llm.clone();
-        if llm.provider.is_empty() {
-            return Err(EvotError::Conf(
-                "No model available yet. Log in via the dashboard sidebar, run `evot login` here, or add a provider on the Models page."
-                    .to_string(),
-            ));
-        }
-        if llm.api_key.trim().is_empty() {
-            return Err(EvotError::Conf(format!(
-                "No API key set for provider '{}'. Add it in the dashboard settings \
-                 or set EVOT_LLM_{}_API_KEY in your env file.",
-                llm.provider,
-                llm.provider.to_uppercase().replace('-', "_"),
-            )));
-        }
-        let envs = self
-            .variables()
-            .map(|v| v.all_env_pairs())
-            .unwrap_or_default();
-        // Build path guard from sandbox policy. System dirs cover skill scan
-        // directories plus the memory vault used by the builtin memory skill.
-        let cwd = session.meta().await.cwd;
-        let cwd_path = std::path::Path::new(&cwd);
-        let skill_dirs = self.skills_dirs.read().clone();
-        let selected_skill_names = self.skill_names.read().clone();
-        let skills = load_turn_skills(&skill_dirs, selected_skill_names.as_deref())?;
-        let mut system_dirs = skill_dirs.clone();
-        if let Ok(memory_dir) = crate::conf::paths::memory_dir() {
-            if let Err(e) = std::fs::create_dir_all(&memory_dir) {
-                tracing::warn!("cannot create memory dir {}: {e}", memory_dir.display());
-            }
-            system_dirs.push(memory_dir);
-        }
-        for skill in &skills {
-            system_dirs.push(skill.base_dir.clone());
-        }
-        let spill_dir = self
-            .spill_root
-            .as_ref()
-            .map(|root| root.join("sessions").join(session_id).join("tool-results"));
-        if let Some(spill_dir) = &spill_dir {
-            std::fs::create_dir_all(spill_dir)?;
-            system_dirs.push(spill_dir.clone());
-        }
-        let sandbox_rt = self.sandbox.build_runtime(cwd_path, &system_dirs)?;
-        let process_manager = if mode.allows_background_processes() {
-            let mut managers = self.process_managers.lock();
-            managers.retain(|_, manager| !manager.is_idle() || Arc::strong_count(manager) > 1);
-            if let Some(manager) = managers.get(session_id) {
-                Some(manager.clone())
-            } else {
-                if managers.len() >= MAX_SESSION_PROCESS_MANAGERS {
-                    let reclaimable = managers
-                        .iter()
-                        .filter(|(_, manager)| {
-                            Arc::strong_count(manager) == 1 && manager.is_reclaimable()
-                        })
-                        .map(|(session_id, _)| session_id.clone())
-                        .collect::<Vec<_>>();
-                    for reclaimable_id in reclaimable {
-                        if managers.len() < MAX_SESSION_PROCESS_MANAGERS {
-                            break;
-                        }
-                        if let Some(manager) = managers.remove(&reclaimable_id) {
-                            manager.cleanup_reclaimable_outputs();
-                        }
-                    }
-                }
-                if managers.len() >= MAX_SESSION_PROCESS_MANAGERS {
-                    return Err(EvotError::Run(format!(
-                        "too many sessions with retained background tasks (limit: {MAX_SESSION_PROCESS_MANAGERS}); inspect or clear completed tasks before starting another interactive session"
-                    )));
-                }
-                let manager = Arc::new(evot_engine::tools::ProcessManager::new());
-                managers.insert(session_id.to_string(), manager.clone());
-                Some(manager)
-            }
-        } else {
-            None
-        };
-
-        let tools = build_tools(
-            mode,
-            envs,
-            sandbox_rt.allow_bash,
-            sandbox_rt.bash_sandbox_dirs,
-            process_manager.clone(),
-            host_tools,
-        );
-
-        let (mut system_prompt, mut sections) = self.build_system_prompt(mode, &cwd);
-        if let Some(section) = skills_prompt_section(&skills) {
-            let insert_at = sections
-                .iter()
-                .position(|section| matches!(section.name, "environment" | "dynamic_boundary"))
-                .unwrap_or(sections.len());
-            sections.insert(insert_at, section);
-            system_prompt = sections
-                .iter()
-                .map(|section| section.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-        }
-
-        let (prior_messages, compaction_state, transcript_seq) = session.context_snapshot().await;
-        let prior_messages = evot_engine::sanitize_tool_pairs(prior_messages);
-        if consume_process_notifications {
-            if let Some(process_manager) = &process_manager {
-                input.extend(
-                    process_manager
-                        .take_notifications()
-                        .into_iter()
-                        .map(|text| evot_engine::Content::Text { text }),
-                );
-            }
-        }
-        // A wake carries no prompt of its own: the queued notices *are* its
-        // input. If they were taken by another turn between the poll that
-        // decided to wake and this drain, the turn would reach the provider with
-        // nothing in it — and every provider filters empty text blocks, so the
-        // message would be rejected as contentless rather than merely useless.
-        if input
-            .iter()
-            .all(|content| matches!(content, evot_engine::Content::Text { text } if text.trim().is_empty()))
-        {
-            input = vec![evot_engine::Content::Text {
-                text: "A background task finished, but its result was already delivered. \
-                       Continue from where you left off, or wait for the user."
-                    .to_string(),
-            }];
-        }
-
-        Ok(runtime::TurnInput {
-            options: runtime::EngineOptions {
-                provider: llm.provider,
-                protocol: llm.protocol,
-                model: llm.model,
-                api_key: llm.api_key,
-                model_config: llm.model_config,
-                system_prompt,
-                system_prompt_sections: sections,
-                limits: if mode.is_interactive() {
-                    None
-                } else {
-                    Some(self.limits.read().clone())
-                },
-                tools,
-                thinking_level: llm.thinking_level,
-                cwd: cwd_path.to_path_buf(),
-                path_guard: sandbox_rt.path_guard,
-                spill_dir,
-                process_manager,
-                prompt_cache_key: Some(session_id.to_string()),
-                provider_override: self.provider_override.read().clone(),
-                compaction_state,
-            },
-            history: prior_messages,
-            input,
-            session,
-            transcript_seq,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AgentTurnFactory — bridges Agent's per-turn build to the runtime
-// ---------------------------------------------------------------------------
-
-struct TurnBuildRequest {
-    input: Vec<evot_engine::Content>,
-    host_tools: Option<HostTools>,
-    consume_process_notifications: bool,
-}
-
-struct AgentTurnFactory {
-    agent: Arc<Agent>,
-    session: Arc<Session>,
-    mode: ToolMode,
-    session_id: String,
-    llm: LlmConfig,
-    host_tools: Option<HostTools>,
-}
-
-#[async_trait::async_trait]
-impl TurnFactory for AgentTurnFactory {
-    async fn build(&self, input: Vec<evot_engine::Content>) -> Result<runtime::TurnInput> {
-        self.agent
-            .build_turn(
-                &self.llm,
-                self.mode,
-                Arc::clone(&self.session),
-                &self.session_id,
-                TurnBuildRequest {
-                    input,
-                    host_tools: self.host_tools.clone(),
-                    consume_process_notifications: true,
-                },
-            )
-            .await
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn format_manual_compaction_outcome(
-    outcome: &crate::compact::orchestrator::ManualCompactionOutcome,
-) -> String {
-    match outcome {
-        crate::compact::orchestrator::ManualCompactionOutcome::Compacted {
-            tokens_before,
-            tokens_after,
-            messages_before,
-            messages_after,
-            context_window,
-            used_fallback,
-            method,
-            remote_blob_bytes,
-            fallback_reason,
-            ..
-        } => {
-            let mut line = format!(
-                "Session compacted: {tokens_before} → {tokens_after} tokens, {messages_before} → {messages_after} messages."
-            );
-            if *used_fallback {
-                line.push_str(
-                    "\nNote: the LLM summary was unavailable; a deterministic fallback summary was used.",
-                );
-            }
-            match method {
-                Some(evot_engine::CompactionMethod::Remote) => {
-                    line.push_str("\nProvider-native remote compaction was used.");
-                    if let Some(bytes) = remote_blob_bytes {
-                        line.push_str(&format!(" Native blob: {bytes} bytes."));
-                    }
-                }
-                Some(evot_engine::CompactionMethod::RemoteFailedLocal) => {
-                    line.push_str(
-                        "\nProvider-native remote compaction failed; local summarization was used.",
-                    );
-                    if let Some(reason) = fallback_reason {
-                        line.push_str(&format!(" Reason: {reason}"));
-                    }
-                }
-                Some(evot_engine::CompactionMethod::Local) if fallback_reason.is_some() => {
-                    if let Some(reason) = fallback_reason {
-                        line.push_str(&format!(
-                            "\nProvider-native remote compaction was unavailable; local summarization was used. Reason: {reason}"
-                        ));
-                    }
-                }
-                _ => {}
-            }
-            if *context_window > 0 && tokens_after >= context_window {
-                line.push_str(&format!(
-                    "\nWarning: context is still {tokens_after} tokens, above this model's {context_window}-token window. \
-                     Switch to a larger-context model or start a new session to continue."
-                ));
-            }
-            line
-        }
-        crate::compact::orchestrator::ManualCompactionOutcome::NothingToCompact => {
-            "Nothing to compact.".into()
-        }
-        crate::compact::orchestrator::ManualCompactionOutcome::Cancelled => {
-            "Compaction cancelled.".into()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Prompt dump helpers
-// ---------------------------------------------------------------------------
-
-/// Conservative whitespace-based proxy for token count. Avoids a tokenizer
-/// dependency in the dump path — for prompt-budget sanity checks it's fine,
-/// and replay tooling can re-tokenize the text directly. Roughly
-/// `len / 4` is the rule of thumb.
-fn rough_tokens(s: &str) -> usize {
-    let chars = s.chars().count();
-    chars.div_ceil(4)
-}
-
-fn mode_label(mode: ToolMode) -> &'static str {
-    match mode {
-        ToolMode::Interactive => "Interactive",
-        ToolMode::Headless => "Headless",
-        ToolMode::Planning => "Planning",
-        ToolMode::Readonly => "Readonly",
-    }
-}
-
-/// Distil the runtime [`ToolMode`] into the prompt-layer [`PromptMode`].
-fn resume_transcript_items(entries: Vec<TranscriptEntry>) -> Vec<TranscriptItem> {
-    let mut items = Vec::new();
-    for entry in entries {
-        match entry.item {
-            TranscriptItem::Compact {
-                id,
-                created_at,
-                reason,
-                summary,
-                tokens_before,
-                tokens_after,
-                messages_before,
-                messages_after,
-                messages,
-                details,
-                ..
-            } => {
-                let skip = usize::from(messages.first().is_some_and(|message| {
-                    matches!(
-                        message,
-                        TranscriptItem::User { text, .. }
-                            if crate::compact::context_view::is_summary_boundary_text(text, &summary)
-                    )
-                }));
-                items.extend(
-                    messages
-                        .into_iter()
-                        .skip(skip)
-                        .filter(TranscriptItem::is_context_item),
-                );
-                items.push(TranscriptItem::Compact {
-                    id,
-                    created_at,
-                    reason,
-                    summary: evot_engine::truncate_summary(
-                        &summary,
-                        evot_engine::context::DEFAULT_SUMMARY_MAX_BYTES,
-                    ),
-                    tokens_before,
-                    tokens_after,
-                    messages_before,
-                    messages_after,
-                    messages: Vec::new(),
-                    engine_messages: Vec::new(),
-                    state: Box::default(),
-                    details,
-                });
-            }
-            TranscriptItem::Marker { messages, .. } => {
-                items.extend(messages.into_iter().filter(TranscriptItem::is_context_item));
-            }
-            item => items.push(item),
-        }
-    }
-    items
-}
-
-fn load_turn_skills(dirs: &[PathBuf], names: Option<&[String]>) -> Result<Vec<SkillSpec>> {
-    match names {
-        Some(names) => crate::agent::prompt::skill::load_skills_by_name(dirs, names),
-        None => crate::agent::prompt::skill::load_skills(dirs),
-    }
-    .map_err(|error| EvotError::Agent(format!("failed to load skills: {error}")))
-}
-
-fn skills_prompt_section(skills: &[SkillSpec]) -> Option<Section> {
-    let text = format_skills_for_prompt(skills);
-    if text.is_empty() {
-        None
-    } else {
-        Some(Section {
-            name: "skills",
-            text,
-        })
-    }
-}
-
-fn prompt_mode(mode: ToolMode) -> PromptMode {
-    match mode {
-        ToolMode::Interactive => PromptMode::Interactive,
-        ToolMode::Planning => PromptMode::Planning,
-        ToolMode::Headless => PromptMode::Headless,
-        ToolMode::Readonly => PromptMode::Readonly,
-    }
-}
-
-fn build_prompt_dump(mode: ToolMode, turn: &runtime::TurnInput) -> PromptDump {
-    let opts = &turn.options;
-
-    // System prompt sections — sourced from the turn (includes planning,
-    // variables, sandbox, skills). Falls back to a single section if empty.
-    let section_dumps = if opts.system_prompt_sections.is_empty() {
-        vec![SectionDump {
-            name: "system_prompt".into(),
-            text: opts.system_prompt.clone(),
-            tokens: rough_tokens(&opts.system_prompt),
-        }]
-    } else {
-        opts.system_prompt_sections
-            .iter()
-            .map(|s| SectionDump {
-                name: s.name.to_string(),
-                text: s.text.clone(),
-                tokens: rough_tokens(&s.text),
-            })
-            .collect()
-    };
-
-    let system_tokens = rough_tokens(&opts.system_prompt);
-    let system_prompt = SystemPromptDump {
-        text: opts.system_prompt.clone(),
-        tokens: system_tokens,
-        sections: section_dumps,
-    };
-
-    // Tool definitions
-    let mut tool_dumps: Vec<ToolDump> = opts
-        .tools
-        .iter()
-        .map(|t| {
-            let name = t.name().to_string();
-            let description = t.description().to_string();
-            let parameters = t.parameters_schema();
-            let serialized = format!("{name}\n{description}\n{parameters}");
-            ToolDump {
-                name,
-                description,
-                parameters,
-                tokens: rough_tokens(&serialized),
-            }
-        })
-        .collect();
-    tool_dumps.sort_by(|a, b| a.name.cmp(&b.name));
-    let tool_tokens: usize = tool_dumps.iter().map(|t| t.tokens).sum();
-
-    PromptDump {
-        evot_version: env!("CARGO_PKG_VERSION").to_string(),
-        cwd: opts.cwd.display().to_string(),
-        mode: mode_label(mode).into(),
-        model: opts.model.clone(),
-        thinking_level: opts.thinking_level.as_str().into(),
-        system_prompt,
-        tools: tool_dumps,
-        totals: TokenTotals {
-            system_prompt_tokens: system_tokens,
-            tool_definition_tokens: tool_tokens,
-            grand_total: system_tokens + tool_tokens,
-        },
-    }
-}
-
-fn resolve_dump_path(target: Option<&str>) -> Result<PathBuf> {
-    if let Some(t) = target {
-        return Ok(PathBuf::from(t));
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| EvotError::Agent("HOME not set; cannot pick default dump path".into()))?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    Ok(PathBuf::from(home)
-        .join(".evotai")
-        .join("dumps")
-        .join(format!("prompt-{stamp}.json")))
-}
-
-fn canonical_workspace(cwd: &str) -> Result<String> {
-    let path = crate::conf::paths::expand_home_path(cwd.trim())?;
-    if path.as_os_str().is_empty() {
-        return Err(EvotError::Conf("workspace path must not be empty".into()));
-    }
-    let metadata = std::fs::metadata(&path).map_err(|error| {
-        EvotError::Conf(format!(
-            "workspace '{}' is not accessible: {error}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_dir() {
-        return Err(EvotError::Conf(format!(
-            "workspace '{}' is not a directory",
-            path.display()
-        )));
-    }
-    let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-    Ok(canonical.to_string_lossy().into_owned())
-}
-
-fn bind_workspace_sections(sections: &mut Vec<Section>, cwd: &str) {
-    use crate::agent::prompt::SystemPrompt;
-    for section in sections.iter_mut() {
-        match section.name {
-            "environment" => section.text = SystemPrompt::environment_text(cwd),
-            "project_context" => {
-                section.text = SystemPrompt::project_context_text(cwd).unwrap_or_default();
-            }
-            _ => {}
-        }
-    }
-    if !sections.iter().any(|section| section.name == "environment") {
-        let insert_at = sections
-            .iter()
-            .position(|section| section.name == "dynamic_boundary")
-            .unwrap_or(sections.len());
-        sections.insert(insert_at, Section {
-            name: "environment",
-            text: SystemPrompt::environment_text(cwd),
-        });
-    }
-    if let Some(text) = SystemPrompt::project_context_text(cwd) {
-        if let Some(section) = sections
-            .iter_mut()
-            .find(|section| section.name == "project_context")
-        {
-            if section.text.is_empty() {
-                section.text = text;
-            }
-        } else {
-            let insert_at = sections
-                .iter()
-                .position(|section| matches!(section.name, "environment" | "dynamic_boundary"))
-                .unwrap_or(sections.len());
-            sections.insert(insert_at, Section {
-                name: "project_context",
-                text,
-            });
-        }
-    }
-    sections.retain(|section| !(section.name == "project_context" && section.text.is_empty()));
-}
-
-// ---------------------------------------------------------------------------
-// ForkRequest / ForkedAgent
-// ---------------------------------------------------------------------------
-
-pub struct ForkRequest {
-    pub system_prompt: String,
-}
-
-/// Handle for a forked conversation.
-///
-/// Wraps an ephemeral `Agent` backed by `MemoryStorage`. Multi-turn context
-/// is maintained in-memory by `Session`. Drop to discard — nothing is persisted.
-pub struct ForkedAgent {
-    agent: Arc<Agent>,
-    session_id: Option<String>,
-}
-
-impl ForkedAgent {
-    pub async fn query(&mut self, prompt: &str) -> Result<Run> {
-        let request = QueryRequest::text(prompt)
-            .session_id(self.session_id.clone())
-            .mode(ToolMode::Readonly);
-        let outcome = self.agent.submit(request).await?;
-        match outcome {
-            SubmitOutcome::Run(run) => {
-                if self.session_id.is_none() {
-                    self.session_id = Some(run.session_id.clone());
-                }
-                Ok(run)
-            }
-            SubmitOutcome::Command(_) => Err(EvotError::Run(
-                "commands not supported in forked agent".into(),
-            )),
         }
     }
 }

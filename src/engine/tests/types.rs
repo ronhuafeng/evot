@@ -1,5 +1,6 @@
 //! Serde round-trip tests for core types.
 
+use evotengine::types::ReasoningField;
 use evotengine::*;
 
 fn roundtrip<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
@@ -17,12 +18,44 @@ fn roundtrip<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std
 #[test]
 fn test_message_user_roundtrip() {
     let msg = Message::User {
+        provenance: None,
         content: vec![Content::Text {
             text: "Hello".into(),
         }],
         timestamp: 123456,
     };
     roundtrip(&msg);
+}
+
+#[test]
+fn user_input_provenance_is_additive_and_preserves_legacy_required_fields(
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(serde::Deserialize)]
+    struct LegacyUser {
+        role: String,
+        content: Vec<Content>,
+        timestamp: u64,
+    }
+    let legacy: Message = serde_json::from_str(
+        r#"{"role":"user","content":[{"type":"text","text":"Commit"}],"timestamp":0}"#,
+    )?;
+    assert!(matches!(legacy, Message::User {
+        provenance: None,
+        ..
+    }));
+    for message in [
+        Message::user("Literal <system-reminder> example"),
+        Message::runtime_user("No XML is needed for runtime input", "arbitrary_kind", None),
+    ] {
+        let json = serde_json::to_string(&message)?;
+        let old_reader: LegacyUser = serde_json::from_str(&json)?;
+        assert_eq!(old_reader.role, "user");
+        assert_eq!(old_reader.content.len(), 1);
+        assert!(old_reader.timestamp > 0);
+        let current: Message = serde_json::from_str(&json)?;
+        assert_eq!(current, message);
+    }
+    Ok(())
 }
 
 #[test]
@@ -118,6 +151,96 @@ fn test_content_variants_roundtrip() {
         arguments: serde_json::json!({"command": "ls"}),
         metadata: None,
     });
+}
+
+// ---------------------------------------------------------------------------
+// ThinkingMetadata::OpenAiCompletions schema compatibility
+// ---------------------------------------------------------------------------
+
+/// Legacy sessions wrote `{"type":"open_ai_completions","field":...}` with no
+/// `details`; the current reader must accept them unchanged.
+#[test]
+fn legacy_openai_completions_thinking_metadata_reads_without_details() {
+    let legacy = r#"{"type":"thinking","thinking":"plan","metadata":{"type":"open_ai_completions","field":"reasoning_content"}}"#;
+    let block: Content = serde_json::from_str(legacy).expect("legacy fixture parses");
+    assert_eq!(block, Content::Thinking {
+        thinking: "plan".into(),
+        metadata: Some(ThinkingMetadata::OpenAiCompletions {
+            field: ReasoningField::ReasoningContent,
+            details: None,
+        }),
+    });
+}
+
+/// The current writer must not emit `details` when there is none, so a strict
+/// legacy reader (which only knows `type` + `field`) still accepts the output.
+#[test]
+fn current_openai_completions_thinking_metadata_without_details_matches_legacy_shape() {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyMetadata {
+        #[serde(rename = "type")]
+        kind: String,
+        field: String,
+    }
+
+    let block = Content::Thinking {
+        thinking: "plan".into(),
+        metadata: Some(ThinkingMetadata::completions_text_only(
+            ReasoningField::Reasoning,
+        )),
+    };
+    let json = serde_json::to_value(&block).expect("serialize");
+    let legacy: LegacyMetadata =
+        serde_json::from_value(json["metadata"].clone()).expect("strict legacy reader accepts");
+    assert_eq!(legacy.kind, "open_ai_completions");
+    assert_eq!(legacy.field, "reasoning");
+}
+
+#[test]
+fn openai_completions_thinking_metadata_with_details_roundtrips() {
+    roundtrip(&Content::Thinking {
+        thinking: String::new(),
+        metadata: Some(ThinkingMetadata::OpenAiCompletions {
+            field: ReasoningField::ReasoningContent,
+            details: Some(vec![
+                serde_json::json!({"type": "reasoning.summary", "summary": "plan", "id": "rs_1"}),
+                serde_json::json!({"type": "reasoning.encrypted", "data": "ENC", "id": "rs_1", "format": "openai-responses-v1"}),
+            ]),
+        }),
+    });
+}
+
+#[test]
+fn thinking_metadata_replay_payload_detection() {
+    assert!(
+        !ThinkingMetadata::completions_text_only(ReasoningField::ReasoningContent)
+            .has_replay_payload()
+    );
+    assert!(!ThinkingMetadata::OpenAiCompletions {
+        field: ReasoningField::ReasoningContent,
+        details: Some(vec![]),
+    }
+    .has_replay_payload());
+    assert!(ThinkingMetadata::OpenAiCompletions {
+        field: ReasoningField::ReasoningContent,
+        details: Some(vec![
+            serde_json::json!({"type": "reasoning.encrypted", "data": "x"})
+        ]),
+    }
+    .has_replay_payload());
+    assert!(ThinkingMetadata::Anthropic {
+        signature: "sig".into()
+    }
+    .has_replay_payload());
+    assert!(!ThinkingMetadata::Anthropic {
+        signature: String::new()
+    }
+    .has_replay_payload());
+    assert!(ThinkingMetadata::OpenAiResponses {
+        item: serde_json::json!({"type": "reasoning"})
+    }
+    .has_replay_payload());
 }
 
 // ---------------------------------------------------------------------------
@@ -302,4 +425,45 @@ fn test_tool_execution_strategy_roundtrip() {
     roundtrip(&ToolExecutionStrategy::Sequential);
     roundtrip(&ToolExecutionStrategy::Parallel);
     roundtrip(&ToolExecutionStrategy::Batched { size: 4 });
+}
+
+/// Whatever an image block declares, the provider is sent the type its bytes
+/// are. Blocks come from the read tool, chat channels and attachments, each
+/// naming a type from a file name or a sender's header, and Anthropic rejects
+/// a request whose declared type disagrees with the data.
+#[test]
+fn resolve_image_data_sends_the_type_the_bytes_are() {
+    use base64::Engine;
+    let jpeg = [
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0, 1, 1, 0, 0, 1, 0, 1, 0, 0,
+    ];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+
+    let declared_png = Content::Image {
+        mime_type: "image/png".into(),
+        source: ImageSource::Base64 { data: b64.clone() },
+    };
+    assert_eq!(declared_png.resolve_image_data().unwrap().1, "image/jpeg");
+
+    let tmp = std::env::temp_dir().join("evot-resolve-really-jpeg.png");
+    std::fs::write(&tmp, jpeg).unwrap();
+    let from_path = Content::Image {
+        mime_type: "image/png".into(),
+        source: ImageSource::Path {
+            path: tmp.to_string_lossy().into(),
+        },
+    };
+    let (data, mime) = from_path.resolve_image_data().unwrap();
+    let _ = std::fs::remove_file(tmp);
+    assert_eq!(mime, "image/jpeg");
+    assert_eq!(data, b64);
+
+    // Bytes nobody recognises keep the declared type: not our call to make.
+    let unknown = Content::Image {
+        mime_type: "image/heic".into(),
+        source: ImageSource::Base64 {
+            data: base64::engine::general_purpose::STANDARD.encode(b"????"),
+        },
+    };
+    assert_eq!(unknown.resolve_image_data().unwrap().1, "image/heic");
 }

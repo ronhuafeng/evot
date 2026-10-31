@@ -1,6 +1,7 @@
 mod factory;
 pub mod fs;
 mod in_memory;
+pub(crate) mod session_title;
 mod storage;
 
 pub use factory::*;

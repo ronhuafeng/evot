@@ -7,11 +7,11 @@ use evot::agent::SubmitOutcome;
 use evot::conf::Config;
 use evot::conf::Protocol;
 use evot::conf::ProviderProfile;
+use evot::observability::UsageSummary;
 use evot::storage::MemoryStorage;
 use evot::types::AssistantBlock;
 use evot::types::CompactionMethod;
 use evot::types::TranscriptItem;
-use evot::types::UsageSummary;
 use evot_engine::provider::MockProvider;
 use evot_engine::provider::MockResponse;
 use tempfile::TempDir;
@@ -85,9 +85,11 @@ async fn manual_compact_uses_remote_responses_and_persists_blob() -> TestResult 
 
     let phases = Arc::new(Mutex::new(Vec::new()));
     let observed = Arc::clone(&phases);
-    let observer: evot::compact::orchestrator::ManualCompactionObserver = Arc::new(move |phase| {
-        if let Ok(mut phases) = observed.lock() {
-            phases.push(phase);
+    let observer: evot::compact::orchestrator::ManualCompactionObserver = Arc::new(move |update| {
+        if update.activity.is_none() {
+            if let Ok(mut phases) = observed.lock() {
+                phases.push(update.phase);
+            }
         }
     });
     let outcome = agent
@@ -304,6 +306,7 @@ async fn manual_compact_uses_llm_summary() -> TestResult {
 
 fn user(text: &str) -> TranscriptItem {
     TranscriptItem::User {
+        provenance: None,
         text: text.into(),
         content: vec![],
     }

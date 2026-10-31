@@ -36,6 +36,14 @@ chmod +x "$EVOT_INSTALL_DIR/evot"
 }
 
 describe('executeInstall', () => {
+  test('older release scripts cannot accidentally install during staging', async () => {
+    globalThis.fetch = async () => new Response(installScript('2026.7.19'))
+    const result = await executeInstall('v2026.7.19', { EVOT_STAGE_DIR: join(root, 'stage') })
+    expect(result.success).toBe(false)
+    expect(result.output).toContain('does not support staging')
+    expect(existsSync(join(root, 'bin', 'evot'))).toBe(false)
+  })
+
   test('reports install-script download failures', async () => {
     globalThis.fetch = async () => new Response('unavailable', { status: 503 })
 
@@ -159,6 +167,12 @@ exit 22
       stderr: 'pipe',
       env: {
         ...process.env,
+        // PATH setup must never touch the developer's real shell profiles.
+        HOME: join(root, 'home'),
+        SHELL: '/bin/sh',
+        ZDOTDIR: '',
+        XDG_CONFIG_HOME: '',
+        EVOT_NO_MODIFY_PATH: '0',
         PATH: `${env.FAKE_BIN}:/usr/bin:/bin`,
         // Collapse the retry backoff. Three attempts otherwise sleep a fixed
         // 1s + 2s, which dominated these tests' runtime and pushed the
@@ -174,6 +188,46 @@ exit 22
     ])
     return { stdout, stderr, exitCode }
   }
+
+  test('stage-only validates the archive without changing the live install', async () => {
+    const installDir = join(root, 'installed', 'bin')
+    mkdirSync(installDir, { recursive: true })
+    writeFileSync(join(installDir, 'evot'), 'old binary')
+    const stageDir = join(root, 'staged')
+    const result = await runInstallSh({
+      FAKE_BIN: fakeBin(CURL_SERVES_ARCHIVE), TEST_ARCHIVE: packArchive('2026.7.19'),
+      EVOT_INSTALL_DIR: installDir, EVOT_INSTALL_VERSION: 'v2026.7.19', EVOT_STAGE_DIR: stageDir,
+    })
+    expect(result.exitCode).toBe(0)
+    expect(readFileSync(join(installDir, 'evot'), 'utf8')).toBe('old binary')
+    expect(existsSync(join(stageDir, 'evot-v2026.7.19-x86_64-unknown-linux-gnu.tar.gz.sha256'))).toBe(true)
+    expect(existsSync(join(root, 'installed', 'install-state.json'))).toBe(false)
+    expect(existsSync(join(root, 'home', '.profile'))).toBe(false)
+  })
+
+  test('the current installer advertises the stage API the host checks for', async () => {
+    // The host refuses to stage through a script without this marker, so the
+    // TypeScript check and the shell script must name the same token.
+    const script = readFileSync(installShPath, 'utf8')
+    expect(script).toContain('EVOT_INSTALLER_STAGE_API=1')
+    const originalPath = process.env.PATH
+    process.env.PATH = `${fakeBin(CURL_SERVES_ARCHIVE)}:/usr/bin:/bin`
+    process.env.TEST_ARCHIVE = packArchive('2026.7.19')
+    process.env.EVOT_DOWNLOAD_RETRY_BASE_DELAY = '0.01'
+    globalThis.fetch = async () => new Response(script)
+    try {
+      const stageDir = join(root, 'host-staged')
+      const result = await executeInstall('v2026.7.19', { EVOT_STAGE_DIR: stageDir })
+      expect(result.success).toBe(true)
+      expect(existsSync(join(stageDir, 'evot-v2026.7.19-x86_64-unknown-linux-gnu.tar.gz'))).toBe(true)
+      // Stage-only never verifies an installed binary: there is none.
+      expect(existsSync(join(root, 'bin', 'evot'))).toBe(false)
+    } finally {
+      process.env.PATH = originalPath
+      delete process.env.TEST_ARCHIVE
+      delete process.env.EVOT_DOWNLOAD_RETRY_BASE_DELAY
+    }
+  })
 
   test('validates the candidate before replacing the installed binary', async () => {
     const installDir = join(root, 'installed', 'bin')
@@ -577,9 +631,9 @@ printf 'evot v2026.7.19\\n'
 
   /**
    * `-s` hides curl's transfer meter, so a ~40 MB download printed one line and
-   * then looked frozen with no bytes, rate or ETA. The meter is opt-in on a
-   * terminal only: piping the installer into a log would otherwise accumulate
-   * thousands of carriage-returned progress lines.
+   * then looked frozen with no percentage. The compact progress bar is opt-in
+   * on a terminal only: piping the installer into a log would otherwise
+   * accumulate thousands of carriage-returned progress lines.
    */
   test('shows download progress on a terminal and stays quiet when piped', () => {
     const script = readFileSync(installShPath, 'utf8')
@@ -592,12 +646,14 @@ printf 'evot v2026.7.19\\n'
     // check and passed in.
     expect(downloadFn).not.toContain('-fsSL')
     expect(downloadFn.match(/\$CURL_QUIET/g)).toHaveLength(2)
+    expect(downloadFn.match(/\$CURL_PROGRESS/g)).toHaveLength(2)
     expect(downloadFn.match(/\$WGET_PROGRESS/g)).toHaveLength(2)
 
     // stderr, not stdout: the meter is written to stderr, and stdout is piped
     // for the `curl | sh` invocation that is the documented entry point.
-    expect(script).toContain('if [ -t 2 ]; then')
+    expect(script).toContain('if [ -t 2 ] || [ "${EVOT_INSTALL_PROGRESS:-}" = 1 ]; then')
     expect(script).toContain('CURL_QUIET="-s"')
+    expect(script).toContain('CURL_PROGRESS="-#"')
 
     // -S must survive in both branches so a hard failure is still reported when
     // the meter is off, rather than the install dying silently.
@@ -617,6 +673,97 @@ printf 'evot v2026.7.19\\n'
     expect(script).toContain('[ -t 1 ] || return 0')
   })
 
+  async function installForPath(env: Record<string, string> = {}) {
+    return runInstallSh({
+      FAKE_BIN: fakeBin(CURL_SERVES_ARCHIVE),
+      TEST_ARCHIVE: packArchive('2026.7.19'),
+      EVOT_INSTALL_DIR: join(root, 'bin'),
+      EVOT_INSTALL_VERSION: 'v2026.7.19',
+      ...env,
+    })
+  }
+
+  test('configures zsh once and prints a command that works in the current terminal', async () => {
+    const zdotdir = join(root, 'zsh config')
+    const rc = join(zdotdir, '.zshrc')
+    mkdirSync(zdotdir, { recursive: true })
+    writeFileSync(rc, '# existing settings\n')
+    // Shell metacharacters must remain literal, not expand in the profile.
+    const installDir = join(root, "custom bin's $HOME `literal`", 'bin')
+    const env = { SHELL: '/bin/zsh', ZDOTDIR: zdotdir, EVOT_INSTALL_DIR: installDir }
+    const first = await installForPath(env)
+    expect(first.exitCode).toBe(0)
+    expect(first.stdout).toContain('open a new terminal')
+    expect(first.stdout).toContain('evot login')
+    const profile = readFileSync(rc, 'utf8')
+    expect(profile).toStartWith('# existing settings\n')
+    const command = profile.split('\n').find(line => line.startsWith('export PATH='))
+    expect(command).toBeDefined()
+    expect(first.stdout).toContain(`    ${command}\n`)
+    const check = Bun.spawnSync(['sh', '-c', `${command}\ncommand -v evot\nevot --version`], {
+      env: { ...process.env, PATH: '/usr/bin:/bin' },
+    })
+    expect(check.exitCode).toBe(0)
+    expect(check.stdout.toString()).toBe(`${installDir}/evot\nevot v2026.7.19\n`)
+    expect((await installForPath(env)).exitCode).toBe(0)
+    expect(readFileSync(rc, 'utf8')).toBe(profile)
+    expect(existsSync(join(root, 'home', '.zshrc'))).toBe(false)
+  })
+
+  test('configures both interactive and login bash without replacing user settings', async () => {
+    const home = join(root, 'home')
+    mkdirSync(home, { recursive: true })
+    writeFileSync(join(home, '.bash_profile'), '# user login settings\n')
+    writeFileSync(join(home, '.profile'), '# do not change\n')
+    const result = await installForPath({ SHELL: '/bin/bash' })
+    expect(result.exitCode).toBe(0)
+    expect(readFileSync(join(home, '.bashrc'), 'utf8')).toContain('export PATH=')
+    expect(readFileSync(join(home, '.bash_profile'), 'utf8')).toStartWith('# user login settings\n')
+    expect(readFileSync(join(home, '.bash_profile'), 'utf8')).toContain('export PATH=')
+    expect(readFileSync(join(home, '.profile'), 'utf8')).toBe('# do not change\n')
+  })
+
+  test('creates a login profile for bash when none exists', async () => {
+    const result = await installForPath({ SHELL: '/bin/bash' })
+    expect(result.exitCode).toBe(0)
+    expect(readFileSync(join(root, 'home', '.profile'), 'utf8')).toContain('export PATH=')
+  })
+
+  test('configures fish in its XDG conf.d directory', async () => {
+    const configHome = join(root, 'config home')
+    const installDir = join(root, 'fish bin\\literal', 'bin')
+    const result = await installForPath({
+      SHELL: '/usr/bin/fish', XDG_CONFIG_HOME: configHome, EVOT_INSTALL_DIR: installDir,
+    })
+    expect(result.exitCode).toBe(0)
+    const config = readFileSync(join(configHome, 'fish', 'conf.d', 'evot.fish'), 'utf8')
+    const quotedDir = `'${installDir.replaceAll('\\', '\\\\')}'`
+    expect(config).toContain(`contains -- ${quotedDir} $PATH; or set -gx PATH ${quotedDir} $PATH`)
+    expect(result.stdout).toContain('contains --')
+    expect(result.stdout).not.toContain('export PATH=')
+    expect(existsSync(join(root, 'home', '.profile'))).toBe(false)
+  })
+
+  test('allows opting out of shell modifications while printing a working next step', async () => {
+    const result = await installForPath({ EVOT_NO_MODIFY_PATH: '1' })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('skipped shell configuration')
+    expect(result.stdout).toContain('export PATH=')
+    expect(result.stdout).not.toContain('open a new terminal')
+    expect(existsSync(join(root, 'home', '.profile'))).toBe(false)
+  })
+
+  test('configuration failures do not fail installation or promise a new terminal will work', async () => {
+    const zdotdir = join(root, 'not-a-directory')
+    writeFileSync(zdotdir, 'blocked')
+    const result = await installForPath({ SHELL: '/bin/zsh', ZDOTDIR: zdotdir })
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout).toContain('could not configure')
+    expect(result.stdout).toContain('export PATH=')
+    expect(result.stdout).not.toContain('open a new terminal')
+    expect(existsSync(join(root, 'bin', 'evot'))).toBe(true)
+  })
+
   test("prints a ready line when the installed binary is on PATH", async () => {
     const installDir = join(root, 'ready', 'bin')
     const archive = packArchive('2026.7.19')
@@ -632,5 +779,6 @@ printf 'evot v2026.7.19\\n'
 
     expect(exitCode).toBe(0)
     expect(stdout).toContain("ready. run 'evot' to get started")
+    expect(existsSync(join(root, 'home', '.profile'))).toBe(false)
   })
 })

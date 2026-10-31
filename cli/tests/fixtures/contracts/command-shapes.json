@@ -1,0 +1,16 @@
+[
+  {"text":"/compact","command":true},
+  {"text":" /model change ","command":true},
+  {"text":"/_dump","command":true},
+  {"text":"/unknown","command":true},
+  {"text":"/clear\targ","command":true},
+  {"text":"/","command":false},
+  {"text":"/tmp/file","command":false},
+  {"text":"/file.txt","command":false},
+  {"text":"https://example.invalid/compact","command":false},
+  {"text":"say /compact","command":false},
+  {"text":"/MODEL","command":true},
+  {"text":"/New","command":true},
+  {"text":"/v2","command":false},
+  {"text":"","command":false}
+]

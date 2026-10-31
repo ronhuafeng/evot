@@ -3,6 +3,8 @@
  * with ordered assistant content and completed tool results.
  */
 
+import { replayUserInput } from './user-input.js'
+import { toolArgsRecord } from '../term/app/tool-args.js'
 import type { TranscriptItem } from '../native/index.js'
 import type { UIAssistantBlock, UIMessage } from '../term/app/types.js'
 
@@ -13,12 +15,13 @@ import type { UIAssistantBlock, UIMessage } from '../term/app/types.js'
 type RawAssistantBlock =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
-  | { type: 'tool_call'; id: string; name: string; input: Record<string, unknown> }
+  | { type: 'tool_call'; id: string; name: string; input: unknown }
 
 interface RawItem {
   type: string
   // User
   text?: string
+  display_parts?: unknown
   // Assistant content uses an array; tool results use a string.
   content?: RawAssistantBlock[] | string
   // Transcripts written before the canonical content migration.
@@ -33,7 +36,7 @@ interface RawItem {
   kind?: string
   data?: Record<string, unknown>
   // Compact
-  reason?: 'threshold' | 'overflow' | 'manual'
+  reason?: 'threshold' | 'overflow' | 'manual' | 'prune' | 'refusal'
   summary?: string
   tokens_before?: number
   tokens_after?: number
@@ -54,12 +57,17 @@ export function transcriptToMessages(items: TranscriptItem[]): UIMessage[] {
   for (const item of rawItems) {
     const t = item.type
     if (t === 'user') {
-      messages.push({
-        id: `transcript-user-${idx++}`,
-        role: 'user',
-        text: item.text ?? '',
-        timestamp: 0,
-      })
+      for (const part of replayUserInput(item)) {
+        // Model-facing runtime context has no user-facing form; the addon's
+        // display projection hides it too.
+        if (part.kind === 'runtime-context') continue
+        messages.push({
+          id: `transcript-${part.kind}-${idx++}`,
+          role: part.kind === 'user' ? 'user' : 'system',
+          text: part.text,
+          timestamp: 0,
+        })
+      }
     } else if (t === 'assistant') {
       const canonical = Array.isArray(item.content) ? item.content : undefined
       const content = buildAssistantContent(canonical ?? item.content_blocks ?? [], toolResults)
@@ -113,17 +121,18 @@ function buildAssistantContent(
         return { type: 'thinking', contentIndex, text: block.text }
       case 'tool_call': {
         const result = toolResults.get(block.id)
+        const args = toolArgsRecord(block.input) ?? {}
         return {
           type: 'tool_call',
           contentIndex,
           toolCall: {
             id: block.id,
             name: block.name,
-            args: block.input,
+            args,
             status: result ? (result.isError ? 'error' : 'done') : 'queued',
             result: result?.content,
             details: result?.details,
-            previewCommand: inferPreviewCommand(block.name, block.input),
+            previewCommand: inferPreviewCommand(block.name, args),
           },
         }
       }

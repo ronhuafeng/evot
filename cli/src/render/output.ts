@@ -8,11 +8,13 @@
  * This module is pure logic — no React, no stdout. Easy to test.
  */
 
+import { providerFailurePresentation } from '../provider/error-presentation.js'
+import { parsePrivacyStop, privacyCard, privacyDestination, privacyOriginsRow, privacyRulesRow, type PrivacyDetail, type PrivacyStop } from '../privacy/notice.js'
 import { renderMarkdown, renderThinkingMarkdown } from './markdown.js'
 import { colorizeUnifiedDiffRows, type DiffRowKind } from './diff.js'
-import { highlightCode, highlightCodeLine } from '../markdown/render/ansi.js'
-import { truncate, formatDuration, formatElapsed, toolResultLines, formatBashCommandDisplay, expandLinesHint, COLLAPSE_HINT, summarizeInline } from './format.js'
+import { truncate, formatDuration, formatElapsed, formatWallClock, toolResultLines, formatBashCommandDisplay, EXPAND_HINT, COLLAPSE_HINT, summarizeInline } from './format.js'
 import { formatCompactionCompleted } from './verbose.js'
+import { earlyWakeFromResult } from '../loop/early-wake.js'
 import type { UICompaction, UIMessage, UIToolCall } from '../term/app/types.js'
 
 // ---------------------------------------------------------------------------
@@ -28,7 +30,7 @@ function toolGlyph(name: string): ToolGlyph {
   switch (name.toLowerCase()) {
     case 'bash': return { icon: '⌘' }
     case 'read': case 'read_code': return { icon: '◫' }
-    case 'grep': case 'glob': case 'find': case 'search': return { icon: '⌕' }
+    case 'grep': case 'glob': case 'find': case 'search': case 'session_search': return { icon: '⌕' }
     case 'web_fetch': case 'webfetch': return { icon: '⊕' }
     case 'edit': case 'file_edit': case 'write': case 'file_write': return { icon: '✎' }
     // Background task tools act on a shell, so they share the bash glyph
@@ -44,6 +46,7 @@ function toolDisplayName(name: string): string {
   switch (name.toLowerCase()) {
     case 'task_output': case 'taskoutput': return 'background shell'
     case 'task_stop': case 'taskstop': return 'stop background shell'
+    case 'session_search': return 'search sessions'
     default: return name
   }
 }
@@ -104,17 +107,19 @@ function toolPrimaryArg(
 ): string {
   const n = name.toLowerCase()
   if (n === 'bash') {
-    const command = previewCommand ?? (args?.command as string) ?? ''
-    return formatBashCommandDisplay(command, expanded).headline
+    const command = toolDraftText({ previewCommand, command: args?.command }, ['previewCommand', 'command'])
+    return formatBashCommandDisplay(command, expanded, true).headline
   }
   if (isTaskTool(name)) {
     // The engine resolves the task id to its command via preview_command, so
     // concurrent cards name different shells instead of all reading
     // `task_output`. Falls back to the raw id when the task is already gone.
-    const command = previewCommand ?? (args?.task_id as string) ?? ''
+    const command = toolDraftText({ previewCommand, task_id: args?.task_id }, ['previewCommand', 'task_id'])
     if (!command) return ''
-    return formatBashCommandDisplay(command, expanded).headline
+    return formatBashCommandDisplay(command, expanded, true).headline
   }
+
+  if (n === 'session_search') return sessionSearchScope(args)
 
   const { display: pathDisplay } = toolPathArg(args)
   if (n === 'edit' || n === 'file_edit') {
@@ -166,52 +171,12 @@ function toolDraftText(args: Record<string, unknown>, keys: string[]): string {
   return ''
 }
 
-function lineCount(text: string): number {
-  return writePreviewLines(text).length
-}
-
-const WRITE_PREVIEW_LINES = 10
-const WRITE_STREAM_CONTEXT_LINES = 50
-const WRITE_PREVIEW_CACHE_LIMIT = 64
-// Above this size, skip syntax highlighting entirely: a synchronous full-file
-// highlight of a huge generated file would stall the event loop for seconds.
-const WRITE_HIGHLIGHT_MAX_BYTES = 200 * 1024
-
-type WritePreviewCache = {
-  path: string
-  language: string | undefined
-  rawContent: string
-  argsComplete: boolean
-  /** Content exceeded WRITE_HIGHLIGHT_MAX_BYTES — render unhighlighted. */
-  plain: boolean
-  displayLines: string[]
-  highlightedLines: string[]
-}
-
-const writePreviewCache = new Map<string, WritePreviewCache>()
-
-const WRITE_LANGUAGE_BY_EXTENSION: Record<string, string> = {
-  bash: 'bash', c: 'c', cc: 'cpp', cpp: 'cpp', cs: 'csharp', css: 'css',
-  go: 'go', h: 'c', hpp: 'cpp', html: 'html', java: 'java', js: 'javascript',
-  json: 'json', jsonc: 'jsonc', jsx: 'javascript', kt: 'kotlin', lua: 'lua',
-  md: 'markdown', mjs: 'javascript', php: 'php', proto: 'proto', py: 'python',
-  rb: 'ruby', rs: 'rust', scss: 'scss', sh: 'bash', sql: 'sql', swift: 'swift',
-  toml: 'toml', ts: 'typescript', tsx: 'typescript', txt: 'plaintext',
-  xml: 'xml', yaml: 'yaml', yml: 'yaml', zsh: 'bash',
-}
-
-function writeLanguage(path: string): string | undefined {
-  const filename = path.split(/[\\/]/).pop()?.toLowerCase() ?? ''
-  if (filename === 'dockerfile') return 'dockerfile'
-  if (filename === 'makefile') return 'makefile'
-  const dot = filename.lastIndexOf('.')
-  return dot >= 0 ? WRITE_LANGUAGE_BY_EXTENSION[filename.slice(dot + 1)] : undefined
-}
-
 function normalizeWritePreviewText(text: string): string {
   return text
     .replace(/\r/g, '')
-    .replace(/\t/g, '   ')
+    // Four spaces to match the split-diff renderer's own tab expansion, so the
+    // streamed body and the engine diff that replaces it indent identically.
+    .replace(/\t/g, '    ')
     // Tool arguments are untrusted model output. Never pass embedded terminal
     // controls through the preview; only line feeds are meaningful here.
     .replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '�')
@@ -224,121 +189,41 @@ function writePreviewLines(content: string): string[] {
   return lines
 }
 
-function allWritePreviewLines(content: string): string[] {
-  return content ? normalizeWritePreviewText(content).split('\n') : []
-}
-
-function highlightWriteLines(lines: string[], language: string | undefined): string[] {
-  const highlighted = highlightCode(lines.join('\n'), language).split('\n')
-  // The highlighter must preserve line structure; if it ever reflows newlines,
-  // fall back to per-line highlighting so display/highlight arrays stay in
-  // lockstep (trim and slice below index both arrays by the same offsets).
-  if (highlighted.length !== lines.length) {
-    return lines.map(line => highlightCodeLine(line, language))
-  }
-  return highlighted
-}
-
-function rebuildWritePreview(path: string, content: string, argsComplete: boolean): WritePreviewCache {
-  const language = writeLanguage(path)
-  const displayLines = allWritePreviewLines(content)
-  const plain = content.length > WRITE_HIGHLIGHT_MAX_BYTES
-  return {
-    path,
-    language,
-    rawContent: content,
-    argsComplete,
-    plain,
-    displayLines,
-    highlightedLines: plain ? [...displayLines] : highlightWriteLines(displayLines, language),
-  }
-}
-
-function refreshWritePreviewPrefix(cache: WritePreviewCache): void {
-  const count = Math.min(WRITE_STREAM_CONTEXT_LINES, cache.displayLines.length)
-  if (count === 0) return
-  const highlighted = highlightWriteLines(cache.displayLines.slice(0, count), cache.language)
-  for (let index = 0; index < count; index++) {
-    cache.highlightedLines[index] = highlighted[index]
-      ?? highlightCodeLine(cache.displayLines[index] ?? '', cache.language)
-  }
-}
-
-function cachedWritePreview(call: UIToolCall, path: string, content: string): WritePreviewCache {
-  let cache = writePreviewCache.get(call.id)
-  if (
-    !cache
-    || cache.path !== path
-    || !content.startsWith(cache.rawContent)
-    || (call.argsComplete === true && !cache.argsComplete)
-  ) {
-    // Final arguments are authoritative: rebuild the complete fragment once so
-    // cross-line syntax state is exact before execution begins.
-    cache = rebuildWritePreview(path, content, call.argsComplete === true)
-  } else if (content.length > cache.rawContent.length) {
-    // Highlight the receiving/new lines cheaply, then refresh the first 50 as
-    // one source fragment so block comments and multiline strings stay correct.
-    // This mirrors pi's bounded streaming strategy.
-    const delta = normalizeWritePreviewText(content.slice(cache.rawContent.length))
-    cache.rawContent = content
-    if (cache.displayLines.length === 0) {
-      cache.displayLines.push('')
-      cache.highlightedLines.push('')
-    }
-    const parts = delta.split('\n')
-    const last = cache.displayLines.length - 1
-    const { plain, language } = cache
-    const highlightLine = (line: string): string =>
-      plain ? line : highlightCodeLine(line, language)
-    cache.displayLines[last] += parts[0] ?? ''
-    cache.highlightedLines[last] = highlightLine(cache.displayLines[last]!)
-    for (let index = 1; index < parts.length; index++) {
-      const line = parts[index] ?? ''
-      cache.displayLines.push(line)
-      cache.highlightedLines.push(highlightLine(line))
-    }
-    if (!cache.plain) refreshWritePreviewPrefix(cache)
-  }
-
-  writePreviewCache.delete(call.id)
-  writePreviewCache.set(call.id, cache)
-  while (writePreviewCache.size > WRITE_PREVIEW_CACHE_LIMIT) {
-    const oldest = writePreviewCache.keys().next().value
-    if (oldest === undefined) break
-    writePreviewCache.delete(oldest)
-  }
-  return cache
+function lineCount(text: string): number {
+  return writePreviewLines(text).length
 }
 
 /**
- * Streamed content preview for a write call: shown while arguments stream
- * (queued) and while the tool is running until the authoritative diff arrives.
+ * The streamed body of a `write` call, shaped as the all-additions patch a new
+ * file produces. It goes through [`diffOutputLines`], so the card is a diff
+ * from the first streamed line; the engine's authoritative diff then only has
+ * to extend it with context and removals for a rewrite.
  */
-function appendWriteContentPreview(lines: OutputLine[], call: UIToolCall, expanded?: boolean): void {
+function streamedWritePatch(content: string): string {
+  const body = writePreviewLines(content)
+  if (body.length === 0) return ''
+  return [`@@ -0,0 +1,${body.length} @@`, ...body.map(line => `+${line}`)].join('\n')
+}
+
+/**
+ * Fixed gutter width for every diff on a `write` card.
+ *
+ * A streamed body grows line by line, so a gutter sized to the current line
+ * count would widen at 9→10 and 99→100 and shift every row already painted.
+ * The renderer treats scrollback as append-only, so rows that already scrolled
+ * out would keep the narrow gutter and the transcript would show a permanent
+ * one-column jog. Four digits covers real writes; the engine diff that
+ * replaces the streamed body uses the same width so the swap moves nothing.
+ */
+const WRITE_DIFF_GUTTER = 4
+
+/** Live write body while arguments stream and the tool executes. */
+function appendWriteBody(lines: OutputLine[], call: UIToolCall): void {
   const name = call.name.toLowerCase()
   if (name !== 'write' && name !== 'file_write') return
-  const content = toolDraftText(call.args, ['content'])
-  if (!content) return
-
-  const path = toolDraftText(call.args, ['path', 'file', 'file_path'])
-  const cache = cachedWritePreview(call, path, content)
-  let total = cache.highlightedLines.length
-  while (total > 0 && cache.displayLines[total - 1] === '') total--
-  if (total === 0) return
-
-  const visibleLines = cache.highlightedLines.slice(0, total)
-  const shown = expanded ? visibleLines : visibleLines.slice(0, WRITE_PREVIEW_LINES)
-  lines.push({ id: genId('tool-preview-space'), kind: 'tool', text: '' })
-  for (const text of shown) {
-    lines.push({ id: genId('tool-preview'), kind: 'tool', text: `  ${text}`, toolCodePreview: true })
-  }
-
-  const remaining = total - shown.length
-  if (remaining > 0) {
-    lines.push(toolHintLine(`  ... (${remaining} more ${remaining === 1 ? 'line' : 'lines'}, ${total} total, ctrl+o to expand)`))
-  } else if (expanded && total > 1) {
-    lines.push(toolHintLine(`  ${COLLAPSE_HINT}`))
-  }
+  const patch = streamedWritePatch(toolDraftText(call.args, ['content']))
+  if (!patch) return
+  lines.push(...diffOutputLines(patch, WRITE_DIFF_GUTTER))
 }
 
 function toolDraftSummary(call: UIToolCall): string {
@@ -355,12 +240,12 @@ function toolDraftSummary(call: UIToolCall): string {
   return 'preparing arguments'
 }
 
-function toolStatusLine(mark: '○' | '●' | '✓' | '✗', parts: string[]): OutputLine {
+function toolStatusLine(mark: '○' | '●' | '✓' | '✗', parts: string[], hint = ''): OutputLine {
   const detail = parts.filter(Boolean).join(' · ')
   return {
     id: genId('tool-status'),
     kind: 'tool',
-    text: `  ${mark}${detail ? ` · ${detail}` : ''}`,
+    text: `  ${mark}${detail ? ` · ${detail}` : ''}${hint ? ` ${hint}` : ''}`,
   }
 }
 
@@ -374,14 +259,15 @@ function insertToolStatus(lines: OutputLine[], status: OutputLine): void {
   lines.splice(callIndex < 0 ? 0 : callIndex + 1, 0, status)
 }
 
-/** One OutputLine per diff row, so the viewmodel can tint added/removed rows. */
-function diffOutputLines(diff: string): OutputLine[] {
-  return colorizeUnifiedDiffRows(diff).map(row => ({
+/** Keep each patch together so responsive layout also works across history-cache slices. */
+function diffOutputLines(diff: string, gutter = 0): OutputLine[] {
+  return [{
     id: genId('tool-diff'),
-    kind: 'tool' as const,
-    text: row.text,
-    diffRow: row.kind,
-  }))
+    kind: 'tool',
+    text: colorizeUnifiedDiffRows(diff, true, gutter).map(row => row.text).join('\n'),
+    diffText: diff,
+    diffGutter: gutter > 0 ? gutter : undefined,
+  }]
 }
 
 // ---------------------------------------------------------------------------
@@ -395,14 +281,28 @@ export interface OutputLine {
   rawMarkdown?: string
   /** Thinking text already contains markdown ANSI; apply only the outer tint. */
   thinkingStyle?: boolean
+  /** Render-only identity: adjacent reasoning blocks keep separate windows. */
+  thinkingBlockId?: string
+  /**
+   * Fold policy shared by every line of one reasoning block. The viewmodel
+   * wraps the whole block first, then keeps its newest visual rows. The same
+   * window stays visible after streaming ends. Absent means never fold
+   * (expanded view).
+   */
+  thinkingFold?: ThinkingFold
   /** System text that already carries its own ANSI styling (e.g. `/skill`).
    *  Rendered verbatim instead of being flattened to one dim gray. */
   preStyled?: boolean
-  /** Tool line containing pre-styled source code from a streamed write call. */
-  toolCodePreview?: boolean
   /** Tool line that is one row of a rendered diff; added/removed rows get
    *  their own fill inside the card. */
+  /** Width-aware compact command budget; expanded cards have no row limit. */
+  commandMaxRows?: number
   diffRow?: DiffRowKind
+  /** Original patch retained for responsive split/unified layout at render time. */
+  diffText?: string
+  /** Fixed gutter width, so a patch that grows between frames never re-indents
+   *  rows already painted (and already in scrollback). See WRITE_DIFF_GUTTER. */
+  diffGutter?: number
   codeBlockId?: string
   codeLanguage?: string
   /** Visual spacer inserted between streamed markdown chunks. It creates a
@@ -424,7 +324,15 @@ export interface OutputLine {
    * the card's edges, where the padded rows go.
    */
   toolCard?: ToolCardMembership
+  /** Display-only events persisted for sharing, independent of rendered copy. */
+  shareEvents?: Array<
+    | { kind: 'thinking_level_change'; data: { thinking_level: string } }
+    | { kind: 'model_change'; data: { provider: string; model: string } }
+  >
 }
+
+/** Compact reasoning scrolls in a tail window, then keeps that window. */
+export type ThinkingFold = 'tail'
 
 export type ToolCardState = 'pending' | 'success' | 'error'
 
@@ -432,15 +340,24 @@ export interface ToolCardMembership {
   state: ToolCardState
   first: boolean
   last: boolean
+  /** `notice`: the product speaking (privacy), not a tool the model called.
+   * Painted as an accent border-left on every row, the way the user message
+   * carries the brand rail; the fill and ink stay those of any card. */
+  tone?: 'notice'
 }
 
 /** Stamp a finished card's lines with their shared state and edges. */
-function stampToolCard(lines: OutputLine[], state: ToolCardState): OutputLine[] {
+function stampToolCard(lines: OutputLine[], state: ToolCardState, tone?: ToolCardMembership['tone']): OutputLine[] {
   const last = lines.length - 1
   return lines.map((line, index) => ({
     ...line,
-    toolCard: { state, first: index === 0, last: index === last },
+    toolCard: { state, first: index === 0, last: index === last, ...(tone ? { tone } : {}) },
   }))
+}
+
+/** Every privacy card, whatever it says, wears the notice rail. */
+function stampPrivacyCard(lines: OutputLine[], state: ToolCardState): OutputLine[] {
+  return stampToolCard(lines, state, 'notice')
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +386,7 @@ export function buildUserMessage(text: string, timestamp: number = Date.now()): 
 
 export function buildAssistantLines(
   markdownText: string,
-  options: { streaming?: boolean } = {},
+  options: { streaming?: boolean; idPrefix?: string } = {},
 ): OutputLine[] {
   if (!markdownText.trim()) return []
   const rendered = renderMarkdown(markdownText, { streaming: options.streaming })
@@ -477,7 +394,7 @@ export function buildAssistantLines(
   const cleaned = rendered.replace(/^\n+/, '').replace(/\n+$/, '')
   const parts = cleaned.split('\n')
   return parts.map((line, i) => ({
-    id: genId('asst'),
+    id: options.idPrefix === undefined ? genId('asst') : `${options.idPrefix}-${i}`,
     kind: 'assistant' as const,
     text: line,
     rawMarkdown: markdownText,
@@ -505,23 +422,28 @@ function hasReasoningContent(text: string): boolean {
 /**
  * Reasoning rows, rendered as markdown and tinted muted by the viewmodel.
  *
- * Shown in full: reasoning is the most useful thing on screen while a long
- * turn runs, so it is never collapsed behind a summary row. `streaming` only
- * affects fence handling in the markdown pipeline.
+ * Unless `expanded`, a short tail window scrolls in place while reasoning
+ * streams. Once the block finishes, the same window stays in the transcript
+ * with its original text and an expand hint for any hidden rows.
+ * `streaming` only selects fence handling in the markdown pipeline.
  */
 export function buildThinkingLines(
   text: string,
-  options: { streaming?: boolean } = {},
+  options: { streaming?: boolean; expanded?: boolean } = {},
 ): OutputLine[] {
   if (!text.trim() || !hasReasoningContent(text)) return []
   const rendered = renderThinkingMarkdown(text, { streaming: options.streaming })
   if (!rendered || !rendered.trim()) return []
   const cleaned = rendered.replace(/^\n+/, '').replace(/\n+$/, '')
-  return cleaned.split('\n').map((line) => ({
-    id: genId('think'),
+  const thinkingFold: ThinkingFold | undefined = options.expanded ? undefined : 'tail'
+  const thinkingBlockId = genId('think')
+  return cleaned.split('\n').map((line, index) => ({
+    id: index === 0 ? thinkingBlockId : genId('think'),
     kind: 'thinking' as const,
     text: line,
     thinkingStyle: true,
+    thinkingBlockId,
+    thinkingFold,
   }))
 }
 
@@ -538,6 +460,7 @@ export function buildToolCall(
     id: genId('tool'),
     kind: 'tool',
     text: toolCallText(name, args, previewCommand, expanded, options),
+    commandMaxRows: name.toLowerCase() === 'bash' || isTaskTool(name) ? (expanded ? undefined : 2) : undefined,
   }]
   for (const reason of formatReasonLines(args)) {
     lines.push({ id: genId('tool'), kind: 'tool', text: `  ${reason}` })
@@ -552,8 +475,8 @@ export function buildToolCall(
   // Expanded multi-line bash: keep newlines instead of flattening into a wall.
   // Collapse hint matches expanded tool results / progress cards — but only
   // when the user explicitly expanded (not auto-expanded failures).
-  if (name.toLowerCase() === 'bash' && expanded) {
-    const command = previewCommand ?? (args?.command as string) ?? ''
+  if ((name.toLowerCase() === 'bash' || isTaskTool(name)) && expanded) {
+    const command = toolDraftText({ previewCommand, command: args?.command }, ['previewCommand', 'command'])
     const details = formatBashCommandDisplay(command, true).detailLines
     for (const detail of details) {
       lines.push({ id: genId('tool'), kind: 'tool', text: detail })
@@ -593,6 +516,7 @@ export function buildToolCard(call: UIToolCall, expanded?: boolean, _now = Date.
   // cancellation) separately. Rendering its engine-side lifecycle as a generic
   // tool card duplicates that UI with an unhelpful `ready/running` card.
   if (isAskUserTool(call.name)) return []
+  if (isScheduleWakeupTool(call.name)) return buildLoopCard(call, _now)
 
   const details = asDetails(call.details)
   const diff = typeof details.diff === 'string' ? details.diff : undefined
@@ -608,21 +532,48 @@ export function buildToolCard(call: UIToolCall, expanded?: boolean, _now = Date.
   const lines = buildToolCall(
     call.name,
     args,
-    call.previewCommand,
+    isTaskTool(call.name) ? detailString(details, 'command') ?? call.previewCommand : call.previewCommand,
     expanded,
     { failed: settledFailed },
   )
 
+  const write = call.name.toLowerCase() === 'write' || call.name.toLowerCase() === 'file_write'
+  const showFinalDiff = call.status === 'done' && !settledFailed && !!diff
+  if (write && typeof call.args.content === 'string') {
+    // All mutable metadata follows the code, and the body's gutter is fixed, so
+    // rows already painted into native scrollback stay byte-identical as the
+    // content grows and when the engine's diff replaces it. That includes the
+    // status row: inserting it under the headline once the call settles would
+    // push every body row down one line, and the rows already in native
+    // scrollback cannot follow, so the transcript would keep the jog.
+    if (showFinalDiff && diff) lines.push(...diffOutputLines(diff, WRITE_DIFF_GUTTER))
+    else appendWriteBody(lines, call)
+    if (call.status === 'queued') {
+      lines.push(toolStatusLine('○', [call.argsComplete ? 'ready' : toolDraftSummary(call)]))
+    } else if (call.status === 'running') {
+      const progress = liveProgress(call, expanded)
+      lines.push(toolStatusLine('●', [...runningStatusParts(call.name, args), ...progress.parts], progress.hint))
+      for (const text of progress.rows) {
+        lines.push({ id: genId('tool-progress'), kind: 'tool_result', text: `  ${text}` })
+      }
+    } else {
+      // The body is already above, so the outcome rows must not repeat it:
+      // `buildToolResult` renders any `diff` it finds on `args`.
+      lines.push(...buildToolResult(call.name, call.args, call.status,
+        call.result, call.durationMs, expanded, details))
+    }
+    return stampToolCard(lines, call.status === 'queued' || call.status === 'running'
+      ? 'pending' : settledFailed ? 'error' : 'success')
+  }
+
   if (call.status === 'queued') {
     const summary = call.argsComplete ? 'ready' : toolDraftSummary(call)
     insertToolStatus(lines, toolStatusLine('○', [summary]))
-    appendWriteContentPreview(lines, call, expanded)
+    appendWriteBody(lines, call)
     return stampToolCard(lines, 'pending')
   }
 
   if (call.status !== 'running') {
-    // The call has settled; its streaming preview cache is no longer needed.
-    writePreviewCache.delete(call.id)
     // buildToolResult auto-previews failed bodies itself (tail lines), so pass
     // the raw user toggle: ctrl+o still expands/collapses failed cards.
     const resultLines = buildToolResult(
@@ -639,26 +590,55 @@ export function buildToolCard(call: UIToolCall, expanded?: boolean, _now = Date.
     return stampToolCard(lines, settledFailed ? 'error' : 'success')
   }
 
-  insertToolStatus(lines, toolStatusLine('●', runningStatusParts(call.name, args)))
   if (diff) {
-    lines.push(...diffOutputLines(diff))
+    // A write card keeps the fixed gutter it streamed with, so swapping the
+    // streamed body for the engine's diff does not re-indent anything.
+    lines.push(...diffOutputLines(diff, write ? WRITE_DIFF_GUTTER : 0))
   } else {
     // Keep the streamed content visible between tool_started and the engine's
     // preview diff so the card never blanks out mid-transition (pi behavior).
-    appendWriteContentPreview(lines, call, expanded)
+    appendWriteBody(lines, call)
   }
-  if (call.progress && !call.progress.startsWith('__evot_spill_event__ ')) {
-    const progressLines = toolResultLines(formatToolResultContent(call.progress), false, call.name, expanded)
-    for (const text of progressLines) {
-      lines.push({ id: genId('tool-progress'), kind: 'tool_result', text: `  ${text}` })
-    }
+  const progress = liveProgress(call, expanded)
+  insertToolStatus(lines, toolStatusLine('●', [...runningStatusParts(call.name, args), ...progress.parts], progress.hint))
+  for (const text of progress.rows) {
+    lines.push({ id: genId('tool-progress'), kind: 'tool_result', text: `  ${text}` })
   }
 
   return stampToolCard(lines, 'pending')
 }
 
-/** Failed tool bodies auto-preview at most this many tail lines. */
-const ERROR_PREVIEW_LINES = 20
+/**
+ * Streamed output of a running tool. Compact mode folds a multi-row body onto
+ * the status row (`● · running · 12 lines (ctrl+o)`), the same shape the
+ * settled card will take, so the card does not grow a row and then lose it.
+ * A single row shows inline; expanded mode shows everything.
+ */
+function liveProgress(call: UIToolCall, expanded?: boolean): { parts: string[]; hint: string; rows: string[] } {
+  if (!call.progress || call.progress.startsWith('__evot_spill_event__ ')) return { parts: [], hint: '', rows: [] }
+  const rows = toolResultLines(formatToolResultContent(call.progress), false, call.name, true)
+  if (expanded || rows.length <= 1) return { parts: [], hint: '', rows }
+  return { parts: [plural(rows.length, 'line')], hint: EXPAND_HINT, rows: [] }
+}
+
+/** Failed tool bodies stay folded; the status row carries a short reason. */
+function errorReason(result: string, summary: string): string {
+  const first = result.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).find(Boolean) ?? ''
+  // `Exit code: 7` or `HTTP 404 error` restate the summary; add only new facts.
+  const normalize = (text: string) => text.toLowerCase().replace(/[^a-z0-9]/g, '')
+  const known = normalize(summary)
+  const candidate = normalize(first).replace(/^exitcode/, 'exit')
+  if (!first || !known || candidate === known || candidate.startsWith(known) && candidate.length - known.length <= 6) return ''
+  return summarizeInline(first, 96)
+}
+
+/** Process output from a `task_output` result, without the protocol envelope. */
+function taskOutputBody(result: string): string {
+  if (!result.startsWith('Task ID:')) return result
+  const marker = '\nOutput:\n'
+  const at = result.indexOf(marker)
+  return at === -1 ? '' : result.slice(at + marker.length)
+}
 
 /**
  * Status parts for a card that is still executing.
@@ -675,8 +655,12 @@ function runningStatusParts(name: string, args: Record<string, unknown>): string
     return [blocking ? 'waiting for task' : 'checking task']
   }
   if (n === 'task_stop' || n === 'taskstop') return ['stopping task']
+  if (n === 'session_search') return ['reading sessions']
   return ['running']
 }
+
+/** Tool latency below this is not shown on the status row. */
+export const SHOWN_DURATION_MS = 1000
 
 export function buildToolResult(
   name: string,
@@ -687,10 +671,23 @@ export function buildToolResult(
   expanded?: boolean,
   details: Record<string, unknown> = {},
 ): OutputLine[] {
+  // Privacy refused the call before it ran: say why and how to allow it.
+  const privacy = status === 'error' && result ? parsePrivacyStop(result) : null
+  if (privacy) {
+    const [statusRow, ...rows] = privacyCard(privacy).rows
+    return [
+      { id: genId('tool-status'), kind: 'tool', text: `  ${statusRow?.text ?? '✗ · blocked by privacy'}` },
+      ...rows.map((row): OutputLine => ({ id: genId('tool-res'), kind: row.tone === 'error' ? 'error' : 'tool_result', text: `  ${row.text}` })),
+    ]
+  }
   const exitCode = name.toLowerCase() === 'bash' ? detailNumber(details, 'exit_code') : undefined
   const isError = status === 'error' || details.error === true || (exitCode !== undefined && exitCode !== 0)
-  const summary = toolResultSummary(name, args, result, details, isError)
-  const duration = durationMs !== undefined ? formatDuration(durationMs) : ''
+  // A task poll is summarized by the task's output, not by the protocol
+  // envelope around it (`Task ID: … Output:`), so its counts match the fold.
+  const summary = toolResultSummary(name, args, result && !isError && isTaskTool(name) ? taskOutputBody(result) : result, details, isError)
+  // Sub-second latency is noise on a card (`12ms` vs `30ms` for a read says
+  // nothing); only a wait worth noticing is shown.
+  const duration = durationMs !== undefined && durationMs >= SHOWN_DURATION_MS ? formatDuration(durationMs) : ''
   // Failed status: lead with "failed" so the line reads as an outcome, not a
   // size/duration metric ("74 B · 0ms" is meaningless for a missing path).
   const backgrounded = details.backgrounded === true
@@ -710,46 +707,65 @@ export function buildToolResult(
   // step, so it keeps the `●` running glyph — whether the task is detached or
   // still being waited on in the foreground.
   const stillRunning = taskStatus === 'running' || taskStatus === 'running_foreground'
+
+  // The result body. Compact mode strips the task envelope and drops the
+  // body of a backgrounded shell; expanded mode keeps everything for
+  // diagnostics. Compact edit/write cards also drop a successful body: the
+  // diff below is the real content, and `Updated path. Current content of the
+  // changed region(s): …` only repeats it.
+  const diff = args?.diff as string | undefined
+  const hasDiff = !isError && typeof diff === 'string' && diff.length > 0
+  const body = !result ? ''
+    // The page is JSON working data for the model; people see which sessions it read.
+    : !isError && name.toLowerCase() === 'session_search' ? sessionSearchBody(result)
+    : !expanded && !isError && isTaskTool(name) ? taskOutputBody(result)
+    : !expanded && !isError && (details.backgrounded === true || hasDiff) ? ''
+    : result
+  const formattedResult = formatToolResultContent(body)
+  const bodyRows = body.trim() ? toolResultLines(formattedResult, isError, name, true) : []
+  // A multi-row body folds in compact mode. The fold is reported on the
+  // status row, not on a row of its own: `✓ · exit 0 · 1.2s · 4 lines (ctrl+o)`
+  // says everything the old `… (+4 lines, ctrl+o to expand)` row did, one
+  // row shorter on every tool call. A status that already shows the same
+  // count (`read` says `3 lines`) only gets the hint. Shell output folds
+  // even at one row: a command's single line is often a long path or a
+  // wrapped error, and the status row already says how the command ended.
+  const shell = name.toLowerCase() === 'bash' || isTaskTool(name)
+  const folded = !expanded && (bodyRows.length > 1 || (shell && !isError && !taskFailed && bodyRows.length > 0))
   const statusParts = isError
-    ? ['failed', summary, duration].filter(Boolean)
+    ? ['failed', summary, duration, result && !expanded ? errorReason(result, summary || 'failed') : ''].filter(Boolean)
     : taskParts.length > 0
-      ? taskParts
+      ? taskFailed && result && !expanded && result.startsWith('Task ID:') && taskOutputBody(result)
+        ? [...taskParts, errorReason(taskOutputBody(result), taskParts.join(' '))].filter(Boolean)
+        : taskParts
       : [summary, duration].filter(Boolean)
+  // `read` says `3 lines` and `grep` says `2 matches` already; a status that
+  // counts its result in any unit skips the line count and keeps the hint.
+  const counted = /\b\d+ (line|match|hit|file|director|result|entr|session)/
+  const foldParts = folded && !statusParts.some(part => counted.test(part)) ? [plural(bodyRows.length, 'line')] : []
   const mark = isError || taskFailed ? '✗' : backgrounded || stillRunning ? '●' : '✓'
-  const lines: OutputLine[] = [toolStatusLine(mark, statusParts)]
+  const lines: OutputLine[] = [toolStatusLine(mark, [...statusParts, ...foldParts], folded ? EXPAND_HINT : '')]
 
   // Diff (for write/edit tools) — skip on failure; the attempt is already
   // summarized on the headline and the error body is what matters.
-  const diff = args?.diff as string | undefined
-  if (!isError && diff && typeof diff === 'string' && diff.length > 0) {
-    lines.push(...diffOutputLines(diff))
+  if (hasDiff && diff) {
+    // A write's authoritative diff replaces a streamed body that was already
+    // painted with a fixed gutter, so it has to keep that same width.
+    const writeTool = name.toLowerCase() === 'write' || name.toLowerCase() === 'file_write'
+    lines.push(...diffOutputLines(diff, writeTool ? WRITE_DIFF_GUTTER : 0))
   }
 
-  // Tool result content. Collapsed success is a single `... (+N lines, ctrl+o
-  // to expand)` hint. Failures auto-preview the tail of the body (errors live
-  // at the end) capped at ERROR_PREVIEW_LINES; ctrl+o expands the rest and
-  // collapses back to the preview.
-  if (result) {
-    const formattedResult = formatToolResultContent(result)
-    if (isError && !expanded) {
-      const all = toolResultLines(formattedResult, true, name, true)
-      const hidden = all.length - ERROR_PREVIEW_LINES
-      if (hidden > 0) {
-        lines.push(toolHintLine(`  [2m... ${expandLinesHint(hidden)}[0m`))
-      }
-      for (const rl of hidden > 0 ? all.slice(-ERROR_PREVIEW_LINES) : all) {
-        lines.push({ id: genId('tool-res'), kind: 'error', text: `  ${rl}` })
-      }
-    } else {
-      const resultLines = toolResultLines(formattedResult, isError, name, expanded)
-      for (const rl of resultLines) {
-        lines.push({ id: genId('tool-res'), kind: isError ? 'error' : 'tool_result', text: `  ${rl}` })
-      }
-      // Collapse hint under any user-expanded multiline body (success or
-      // failure) — ctrl+o collapses back to the default view.
-      if (expanded && resultLines.length > 1) {
-        lines.push(toolHintLine(`  [2m${COLLAPSE_HINT}[0m`))
-      }
+  // Tool result content. A folded body is already accounted for on the
+  // status row. A single-row success is shown inline (nothing to fold); a
+  // single-row failure is not, because the status row names the reason.
+  if (!folded && bodyRows.length > 0 && !((isError || taskFailed) && !expanded)) {
+    for (const rl of bodyRows) {
+      lines.push({ id: genId('tool-res'), kind: isError ? 'error' : 'tool_result', text: `  ${rl}` })
+    }
+    // Collapse hint under any user-expanded multiline body (success or
+    // failure) — ctrl+o collapses back to the default view.
+    if (expanded && bodyRows.length > 1) {
+      lines.push(toolHintLine(`  [2m${COLLAPSE_HINT}[0m`))
     }
   }
 
@@ -759,7 +775,10 @@ export function buildToolResult(
 export function buildToolProgress(name: string, text: string, expanded?: boolean): OutputLine[] {
   const progressLines = text.replace(/\r\n/g, '\n').replace(/\n+$/, '').split('\n')
   const total = progressLines.length
-  const header = `${toolGlyph(name).icon} ${name}  · ${total} ${total === 1 ? 'line' : 'lines'}`
+  // Collapsed: no content preview. The header carries the line count and,
+  // for a multiline body, the expand hint; no extra row.
+  const count = `${total} ${total === 1 ? 'line' : 'lines'}`
+  const header = `${toolGlyph(name).icon} ${name}  · ${expanded || total <= 1 ? count : `${count} ${EXPAND_HINT}`}`
   const lines: OutputLine[] = [{ id: genId('tool'), kind: 'tool', text: header }]
   if (expanded) {
     // Expanded: full progress body + collapse hint.
@@ -771,11 +790,7 @@ export function buildToolProgress(name: string, text: string, expanded?: boolean
     }
     return lines
   }
-  // Collapsed: no content preview — the header already carries the line count,
-  // so a multiline body just adds a single expand hint (matching tool results).
-  if (total > 1) {
-    lines.push(toolHintLine(`  [2m... ${expandLinesHint(total)}[0m`))
-  } else {
+  if (total <= 1) {
     lines.push({ id: genId('tool-res'), kind: 'tool_result', text: `  ${progressLines[0] ?? ''}` })
   }
   return lines
@@ -796,6 +811,9 @@ export function buildVerboseEvent(eventText: string): OutputLine[] {
 export function isVisibleEvent(text: string): boolean {
   return /^\[LLM\]\s+[↻✗⚠]/u.test(text)
     || /^\[COMPACT\]\s+✓\s+·\s+(?!skipped\b)/u.test(text)
+    // Only a prune that changed the context is a card; a judge round that
+    // merely recorded verdicts is bookkeeping and stays in the log.
+    || /^\[JEV\]\s+✂/u.test(text)
 }
 
 /**
@@ -806,7 +824,7 @@ export function isVisibleEvent(text: string): boolean {
  *     <error message>
  * Falls back to plain verbose lines if the text isn't in the expected shape.
  */
-export function buildLlmCard(text: string): OutputLine[] {
+export function buildLlmCard(text: string, privacyDetail?: () => PrivacyDetail | undefined): OutputLine[] {
   const rawLines = text.split('\n')
   const head = (rawLines[0] ?? '').match(/^\[LLM\]\s+([↻✗⚠])\s*·?\s*(.*)$/u)
   if (!head) return buildVerboseEvent(text)
@@ -817,6 +835,10 @@ export function buildLlmCard(text: string): OutputLine[] {
   const body = rawLines.slice(1)
     .map((l) => l.replace(/^\s*error\s+/u, '').trim())
     .filter((l) => l.length > 0)
+
+  // Privacy stopped the request before it left: say that, not "invalid request".
+  const privacy = mark === '✗' ? parsePrivacyStop(body.join(' ')) : null
+  if (privacy) return buildPrivacyCard(privacy, privacyDetail?.())
 
   const lines: OutputLine[] = []
   if (isRetry) {
@@ -830,26 +852,141 @@ export function buildLlmCard(text: string): OutputLine[] {
     lines.push({ id: genId('tool'), kind: 'tool', text: `  ${mark}${meta ? ` · ${meta}` : ''}` })
   }
   for (const b of body) {
-    lines.push({ id: genId('tool-res'), kind: 'error', text: `  ${b}` })
+    const failure = providerFailurePresentation({ error: b })
+    lines.push({ id: genId('tool-res'), kind: 'error', text: `  ${failure.label}` })
   }
-  return lines
+  return stampToolCard(lines, mark === '✗' ? 'error' : isRetry ? 'pending' : 'success')
 }
 
-export function buildEventCard(text: string): OutputLine[] {
+/**
+ * Split a runtime event summary into the one figure that belongs on the
+ * headline and the metadata that belongs on the status row below it.
+ *
+ * Every runtime card (`jev prune`, `compact`, `llm`) takes the same shape as a
+ * tool card: `<glyph> <name>  <arg>` then `  ✓ · <meta>`. For context work the
+ * arg is the token transition (`70k → 63k`), the number the user scans for;
+ * the counts and the trigger are detail and go on the status row. The
+ * message-count transition and the parenthesised saving are dropped from the
+ * card: both repeat what the token transition and the context bar already
+ * say, and both remain in the verbose log.
+ */
+function splitEventSummary(head: string): { arg: string; meta: string[] } {
+  const parts = head.split(' · ').map(part => part.trim()).filter(part => part.length > 0)
+  const tokensIndex = parts.findIndex(part => /^\S+ → \S+(?: \(−\S+\))?$/u.test(part) && !part.endsWith('msgs'))
+  if (tokensIndex < 0) return { arg: '', meta: parts }
+  const arg = parts[tokensIndex]!.replace(/\s*\(−\S+\)$/u, '')
+  const meta = parts.filter((part, index) => index !== tokensIndex && !part.endsWith(' msgs'))
+  return { arg, meta }
+}
+
+function eventHeadline(glyph: string, name: string, arg: string): OutputLine {
+  return { id: genId('tool'), kind: 'tool', text: arg ? `${glyph} ${name}  ${arg}` : `${glyph} ${name}` }
+}
+
+function eventStatus(mark: string, meta: string[]): OutputLine {
+  return { id: genId('tool'), kind: 'tool', text: meta.length > 0 ? `  ${mark} · ${meta.join(' · ')}` : `  ${mark}` }
+}
+
+/** The context gauge row without the saving the headline already states. */
+function eventContextRow(line: string): OutputLine {
+  const body = line.replace(/^\s*context\s*/u, '').replace(/\s*\(−\S+\)(\s*·\s*jev prune)?\s*$/u, '').trim()
+  return { id: genId('tool-res'), kind: 'tool_result', text: `  ${body}` }
+}
+
+export function buildEventCard(text: string, privacyDetail?: () => PrivacyDetail | undefined): OutputLine[] {
+  if (text.startsWith('[JEV]')) {
+    // Judge prune: the header and the context line are the card; per-call
+    // verdicts stay in the verbose log where they can be studied.
+    const rawLines = text.split('\n')
+    const applied = /^\[JEV\]\s+✂/u.test(rawLines[0] ?? '')
+    const head = (rawLines[0] ?? '').replace(/^\[JEV\]\s+[✂·]?\s*·?\s*/u, '').trim()
+    const { arg, meta } = splitEventSummary(head)
+    const lines: OutputLine[] = [
+      eventHeadline(applied ? '✂' : '⚖', applied ? 'jev prune' : 'jev judge', arg),
+      eventStatus(applied ? '✓' : '·', meta),
+    ]
+    const context = rawLines.slice(1).find(line => /^\s*context\s/u.test(line))
+    if (context) lines.push(eventContextRow(context))
+    return stampToolCard(lines, 'success')
+  }
   if (text.startsWith('[COMPACT]')) {
     const rawLines = text.split('\n')
     const head = (rawLines[0] ?? '').replace(/^\[COMPACT\]\s+✓\s*·?\s*/u, '').trim()
-    const lines: OutputLine[] = [
-      { id: genId('tool'), kind: 'tool', text: '✦ compact' },
-      { id: genId('tool'), kind: 'tool', text: `  ✓ · ${head}` },
-    ]
+    const { arg, meta } = splitEventSummary(head)
+    const lines: OutputLine[] = [eventHeadline('✦', 'compact', arg), eventStatus('✓', meta)]
     for (const line of rawLines.slice(1)) {
-      const body = line.replace(/^\s*(context|summary)\s*/u, '').trim()
+      if (/^\s*context\s/u.test(line)) {
+        lines.push(eventContextRow(line))
+        continue
+      }
+      const body = line.replace(/^\s*(summary|fallback)\s*/u, '').trim()
       if (body) lines.push({ id: genId('tool-res'), kind: 'tool_result', text: `  ${body}` })
     }
-    return lines
+    return stampToolCard(lines, 'success')
   }
-  return buildLlmCard(text)
+  return buildLlmCard(text, privacyDetail)
+}
+
+/**
+ * A privacy stop as a tool-style card:
+ *   ⊘ privacy  blocked request
+ *     ✗ · nothing was sent to the model · PRIVATE_KEY
+ *     <why> / <the command that undoes it>
+ */
+export function buildPrivacyCard(stop: PrivacyStop, detail?: PrivacyDetail): OutputLine[] {
+  const card = privacyCard(stop, detail)
+  const lines: OutputLine[] = [{ id: genId('tool'), kind: 'tool', text: `⊘ privacy  ${card.title}` }]
+  for (const row of card.rows) {
+    const kind = row.tone === 'status' ? 'tool' : row.tone === 'error' ? 'error' : 'tool_result'
+    lines.push({ id: genId(row.tone === 'status' ? 'tool' : 'tool-res'), kind, text: `  ${row.text}` })
+  }
+  return stampPrivacyCard(lines, 'error')
+}
+
+const HAPPENING_TITLE: Record<string, string> = {
+  llm: 'masked request', share: 'scrubbed share', sync: 'scrubbed sync',
+  task: 'scrubbed task', task_report: 'scrubbed task report', delivery: 'scrubbed chat reply',
+}
+
+/**
+ * Something privacy just did, shown as it happens so the user knows at once:
+ *   ⊘ privacy  masked request → claude-opus-5.5 · evot-pro-anthropic
+ *     ✓ · masked SECRET ×233 · 97 values first seen now
+ *     in: Bash result "ssh db0-aws 'cat ~/perf/config.toml'" ×224 · user ×9
+ *     by rule: core.file-assignment 87 · known 9 · secrets.bare-key-field
+ *     The model saw placeholders; the reply was restored · /privacy shows the record
+ */
+export function buildPrivacyHappeningCard(notice: { target: string; reason: string } & PrivacyDetail, fresh: number): OutputLine[] {
+  const title = `${HAPPENING_TITLE[notice.target] ?? `scrubbed ${notice.target}`}${privacyDestination(notice)}`
+  const status = ['✓', notice.reason]
+  if (fresh > 0) status.push(`${fresh} ${fresh === 1 ? 'value' : 'values'} first seen now`)
+  const hint = notice.target === 'llm'
+    ? 'The model saw placeholders; the reply was restored · /privacy shows the record'
+    : 'Masked values were scrubbed for good before upload · /privacy shows the record'
+  const lines: OutputLine[] = [
+    { id: genId('tool'), kind: 'tool', text: `⊘ privacy  ${title}` },
+    { id: genId('tool'), kind: 'tool', text: `  ${status.join(' · ')}` },
+  ]
+  for (const row of [privacyOriginsRow(notice), privacyRulesRow(notice)]) {
+    if (row) lines.push({ id: genId('tool-res'), kind: 'tool_result', text: `  ${row}` })
+  }
+  lines.push({ id: genId('tool-res'), kind: 'tool_result', text: `  ${hint}` })
+  return stampPrivacyCard(lines, 'success')
+}
+
+/**
+ * A `/privacy` action the user ran, as the same kind of card as a stop, so
+ * what changed is as visible as what it answers:
+ *   ⊘ privacy  term Project Nightjar
+ *     term added: Project Nightjar
+ */
+export function buildPrivacyActionCard(args: string, text: string, state: ToolCardState = 'success'): OutputLine[] {
+  const lines: OutputLine[] = [{ id: genId('tool'), kind: 'tool', text: `⊘ privacy  ${args.trim().replace(/\s+/g, ' ')}` }]
+  for (const row of text.split('\n')) {
+    const body = row.trim()
+    if (body) lines.push({ id: genId('tool-res'), kind: state === 'error' ? 'error' : 'tool_result', text: `  ${body}` })
+  }
+  return stampPrivacyCard(lines, state)
 }
 
 export function buildError(message: string): OutputLine[] {
@@ -917,8 +1054,18 @@ export function messagesToOutputLines(messages: UIMessage[], expanded: boolean =
       lines.push(...buildCompactionLines(msg.compaction, expanded))
       continue
     }
+    if (msg.role === 'system') {
+      lines.push({ id: genId('system'), kind: 'system', text: msg.text })
+      continue
+    }
     if (msg.role === 'user') {
-      lines.push(...buildUserMessage(msg.text, msg.timestamp))
+      const userLines = buildUserMessage(msg.text, msg.timestamp)
+      // Replay uses zero for unavailable timestamps. Never display epoch time
+      // (08:00 AM in UTC+8) as though the user sent their message then.
+      if (!Number.isFinite(msg.timestamp) || msg.timestamp <= 0) {
+        for (const line of userLines) delete line.timestamp
+      }
+      lines.push(...userLines)
       continue
     }
 
@@ -953,7 +1100,7 @@ export function messagesToOutputLines(messages: UIMessage[], expanded: boolean =
     if (msg.content) {
       for (const block of [...msg.content].sort((a, b) => a.contentIndex - b.contentIndex)) {
         if (block.type === 'thinking') {
-          lines.push(...buildThinkingLines(block.text))
+          lines.push(...buildThinkingLines(block.text, { expanded }))
         }
         else if (block.type === 'text') lines.push(...buildAssistantLines(block.text))
         else lines.push(...buildToolCard(block.toolCall))
@@ -1081,6 +1228,45 @@ function isAskUserTool(name: string): boolean {
   return normalized === 'askuser'
 }
 
+function isScheduleWakeupTool(name: string): boolean {
+  return name.toLowerCase().replace(/_/g, '') === 'schedulewakeup'
+}
+
+function buildLoopCard(call: UIToolCall, now: number): OutputLine[] {
+  const args = call.args
+  const reason = typeof args.reason === 'string' ? args.reason.trim() : ''
+  const stop = args.stop === true
+  const quiet = args.noop === true
+  const line = (text: string): OutputLine => ({ id: genId('loop'), kind: 'tool', text })
+
+  if (call.status === 'queued' || call.status === 'running') {
+    return stampToolCard([line(stop ? '⏹ loop · stopping…' : '◌ loop · scheduling next wakeup…')], 'pending')
+  }
+  if (call.status === 'error') {
+    const lines = [line('✗ loop · wakeup not scheduled')]
+    const detail = typeof call.result === 'string' ? call.result.trim() : ''
+    if (detail) lines.push(line(`  ${detail}`))
+    return stampToolCard(lines, 'error')
+  }
+
+  const head = stop
+    ? '⏹ loop · stopping'
+    : `◌ loop${quiet ? ' · quiet' : ''} · ${loopNextWakeup(args, call.startedAt ?? now)}`
+  const lines = [line(head)]
+  if (reason) lines.push(line(`  ${reason}`))
+  // The host wrote the result; it knows which shells were running at the time.
+  const early = typeof call.result === 'string' ? earlyWakeFromResult(call.result) : null
+  if (early) lines.push(line(`  ${early}`))
+  return stampToolCard(lines, 'success')
+}
+
+function loopNextWakeup(args: Record<string, unknown>, from: number): string {
+  const requested = typeof args.delay_seconds === 'number' ? args.delay_seconds : NaN
+  if (!Number.isFinite(requested)) return 'next wakeup scheduled'
+  const seconds = Math.min(3600, Math.max(60, Math.round(requested)))
+  return `next wakeup in ${formatElapsed(seconds * 1000)} (${formatWallClock(from + seconds * 1000)})`
+}
+
 function humanBytes(n: number): string {
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
@@ -1127,6 +1313,7 @@ function taskToolStatusParts(details: Record<string, unknown>): string[] {
   const retrieval = detailString(details, 'retrieval_status')
   const exitCode = detailNumber(details, 'exit_code')
   const elapsedMs = detailNumber(details, 'elapsed_ms')
+  const quietMs = detailNumber(details, 'quiet_ms')
   const lines = detailNumber(details, 'total_lines')
   const parts: string[] = []
 
@@ -1150,7 +1337,7 @@ function taskToolStatusParts(details: Record<string, unknown>): string[] {
     // work is now detached and safe to leave, or still holding a wait. The bash
     // card has always named the background; this one now agrees with it.
     case 'running':
-      parts.push(runningInBackgroundLabel(retrieval))
+      parts.push(runningInBackgroundLabel(retrieval, quietMs))
       break
     case 'running_foreground':
       // No "in background" here: this task really is still in the foreground.
@@ -1174,19 +1361,25 @@ function taskToolStatusParts(details: Record<string, unknown>): string[] {
  * card and Claude Code: the useful fact is that the work is detached and the
  * turn is free, not merely that it has not finished.
  *
- * Only a hit deadline earns an extra clause. `released` and `not_ready` both
- * mean the same thing to someone reading the card — the task is detached and
- * this poll returned no result — and "running in background · stopped waiting"
- * said that twice.
+ * Only a hit deadline or a stall earns an extra clause. `released` and
+ * `not_ready` both mean the same thing to someone reading the card — the task
+ * is detached and this poll returned no result — and "running in background ·
+ * stopped waiting" said that twice.
  */
-function runningInBackgroundLabel(retrieval: string | undefined): string {
+function runningInBackgroundLabel(retrieval: string | undefined, quietMs?: number): string {
   // `timeout` is a legacy value: waits are no longer cut short by a bound, so
   // nothing writes it any more. Tool-result details are persisted per
   // transcript, so sessions recorded before that change still replay through
   // here and must not render a bare, unexplained "running in background".
-  return retrieval === 'timeout'
-    ? 'running in background · wait timed out'
-    : 'running in background'
+  if (retrieval === 'timeout') return 'running in background · wait timed out'
+  // A stall is the runtime giving up on the task, not on the wait: the card
+  // has to say why the model got the turn back with nothing to show.
+  if (retrieval === 'stalled') {
+    return quietMs !== undefined && quietMs > 0
+      ? `running in background · stalled, quiet ${formatElapsed(quietMs)}`
+      : 'running in background · stalled'
+  }
+  return 'running in background'
 }
 
 function resultLineCount(content: string): number {
@@ -1340,6 +1533,11 @@ function toolResultSummary(
     if (parts.length > 0) return parts.join(' · ')
   }
 
+  if (normalizedName === 'session_search') {
+    const coverage = sessionSearchCoverage(args, details)
+    if (coverage) return coverage
+  }
+
   if (normalizedName === 'search') {
     const hits = detailNumber(details, 'hits')
     if (hits !== undefined) return plural(hits, 'hit')
@@ -1366,6 +1564,58 @@ function toolResultSummary(
       : plural(lines, 'line')
   }
   return result ? humanBytes(Buffer.byteLength(result, 'utf-8')) : ''
+}
+
+// ---------------------------------------------------------------------------
+// session_search — `/sessions <request>` pages through the archive. The card
+// says what was searched and how much of it was covered, not the JSON size.
+// ---------------------------------------------------------------------------
+
+const SESSION_SEARCH_KEYWORDS_SHOWN = 4
+
+/** `last 7 days · 向量, vector, benchmark +2 · from #21` */
+function sessionSearchScope(args: Record<string, unknown>): string {
+  const days = typeof args.since_days === 'number' ? args.since_days : undefined
+  const keywords = Array.isArray(args.keywords)
+    ? args.keywords.filter((word): word is string => typeof word === 'string' && word.trim() !== '').map(word => word.trim())
+    : []
+  const shown = keywords.slice(0, SESSION_SEARCH_KEYWORDS_SHOWN).join(', ')
+  const more = keywords.length > SESSION_SEARCH_KEYWORDS_SHOWN ? ` +${keywords.length - SESSION_SEARCH_KEYWORDS_SHOWN}` : ''
+  const cursor = typeof args.cursor === 'number' && args.cursor > 0 ? `from #${args.cursor + 1}` : ''
+  return [days === undefined ? 'all time' : `last ${plural(days, 'day')}`, shown ? `${shown}${more}` : '', cursor]
+    .filter(Boolean).join(' · ')
+}
+
+/** `read 21–28 of 141 sessions · 3 keyword hits`, or `read all 12 sessions`. */
+function sessionSearchCoverage(args: Record<string, unknown>, details: Record<string, unknown>): string {
+  const total = detailNumber(details, 'sessions_in_window')
+  const returned = detailNumber(details, 'returned')
+  if (total === undefined || returned === undefined) return ''
+  if (total === 0) return 'no sessions in range'
+  const start = typeof args.cursor === 'number' ? args.cursor : 0
+  const end = start + returned
+  const hits = detailNumber(details, 'keyword_hits') ?? 0
+  const read = start === 0 && end >= total ? `read all ${plural(total, 'session')}`
+    : returned === 0 ? `nothing past #${start} of ${plural(total, 'session')}`
+      : `read ${start + 1}–${end} of ${plural(total, 'session')}`
+  return [read, hits > 0 ? plural(hits, 'keyword hit') : ''].filter(Boolean).join(' · ')
+}
+
+/** One row per session the page returned: when, what, and which keywords hit. */
+function sessionSearchBody(result: string): string {
+  const json = result.slice(result.indexOf('\n') + 1)
+  let page: unknown
+  try { page = JSON.parse(json) } catch { return '' }
+  const sessions = (page as { sessions?: unknown }).sessions
+  if (!Array.isArray(sessions)) return ''
+  return sessions.flatMap(session => {
+    if (!session || typeof session !== 'object') return []
+    const row = session as Record<string, unknown>
+    const date = typeof row.updated_at === 'string' ? row.updated_at.slice(0, 10) : ''
+    const title = typeof row.title === 'string' ? truncate(row.title.replace(/\s+/g, ' ').trim(), 100) : ''
+    const hits = Array.isArray(row.matched_keywords) ? row.matched_keywords.filter(word => typeof word === 'string') : []
+    return [[date, title, hits.length ? `· ${hits.join(', ')}` : ''].filter(Boolean).join('  ')]
+  }).join('\n')
 }
 
 function formatToolResultContent(content: string): string {

@@ -1,7 +1,15 @@
 import { describe, test, expect } from 'bun:test'
-import { buildOverlayBlocks, buildSelectorRegionLines } from '../src/term/viewmodel/overlays.js'
+import { buildOverlayBlocks } from '../src/term/viewmodel/overlays.js'
+import { buildSelectorRegionLines } from '../src/term/viewmodel/selector.js'
 import { blocksToLines } from '../src/term/viewmodel/types.js'
-import { createBackgroundOutputState, createBackgroundPanelState } from '../src/term/app/background-panel.js'
+import {
+  backgroundOutputRows,
+  backgroundOutputViewport,
+  createBackgroundOutputState,
+  createBackgroundPanelState,
+  formatOutputPosition,
+  scrollBackgroundOutput,
+} from '../src/term/app/background-panel.js'
 import { selectorDown } from '../src/term/selector.js'
 import type { BackgroundProcess } from '../src/native/index.js'
 
@@ -30,20 +38,18 @@ function render(processes: BackgroundProcess[], moves = 0): string[] {
 }
 
 describe('background panel rendering', () => {
-  test('leads with the title and the active/finished counts', () => {
+  test('leads with the title and only the active count', () => {
     const lines = render([
       proc({ task_id: 'a' }),
       proc({ task_id: 'b', status: 'completed', exit_code: 0 }),
     ])
-    expect(lines[1]).toBe('Background')
-    expect(lines[2]).toBe('1 active shell · 1 finished')
+    expect(lines[1]).toBe('Background  1')
+    expect(lines[2]).toBe('1 active shell')
   })
 
-  test('the title carries no generic row tally', () => {
-    // The subtitle and group headings already count things; "Background  2"
-    // beside the title would be a third count of the same list.
+  test('the shared title keeps the row tally independent of status', () => {
     const lines = render([proc(), proc({ task_id: 'b' })])
-    expect(lines[1]).toBe('Background')
+    expect(lines[1]).toBe('Background  2')
   })
 
   test('no filter line is offered, since bare letters are actions', () => {
@@ -52,33 +58,29 @@ describe('background panel rendering', () => {
     expect(text).not.toContain('type to search')
   })
 
-  test('hints read as "<key> to <action>" joined by a middot', () => {
+  test('hints use compact key/action pairs joined by a middot', () => {
     const lines = render([proc()])
     expect(lines[lines.length - 1])
-      .toBe('↑/↓ to select · Enter to view output · x to stop · Esc to close')
+      .toBe('↑↓ select · ↵ view output · x stop · esc close')
   })
 
-  test('a focused running row offers stop; a finished row does not', () => {
-    const running = render([
+  test('navigation cannot select a finished task', () => {
+    const processes = [
       proc({ task_id: 'a' }),
-      proc({ task_id: 'b', status: 'completed', exit_code: 0 }),
-    ])
-    expect(running[running.length - 1]).toContain('x to stop')
-
-    // Rows: Shells header, a, Completed header, b — two moves lands on b.
-    const finished = render([
-      proc({ task_id: 'a' }),
-      proc({ task_id: 'b', status: 'completed', exit_code: 0 }),
-    ], 1)
-    expect(finished[finished.length - 1]).not.toContain('x to stop')
-    expect(finished[finished.length - 1]).toContain('Enter to view output')
+      proc({ task_id: 'b', command: 'finished command', status: 'completed', exit_code: 0 }),
+    ]
+    for (const moves of [0, 1, 2]) {
+      const lines = render(processes, moves)
+      expect(lines[lines.length - 1]).toContain('x stop')
+      expect(lines.join('\n')).not.toContain('finished command')
+    }
   })
 
   test('stop all is only advertised with more than one live shell', () => {
     const one = render([proc()])
     const two = render([proc({ task_id: 'a' }), proc({ task_id: 'b' })])
-    expect(one[one.length - 1]).not.toContain('X to stop all')
-    expect(two[two.length - 1]).toContain('X to stop all')
+    expect(one[one.length - 1]).not.toContain('X stop all')
+    expect(two[two.length - 1]).toContain('X stop all')
   })
 
   test('a single group renders without a heading', () => {
@@ -87,37 +89,40 @@ describe('background panel rendering', () => {
     expect(text).not.toContain('Completed')
   })
 
-  test('a mixed list shows bold group headings with counts', () => {
-    const lines = render([
-      proc({ task_id: 'a' }),
+  test('finished history does not add any rendered rows', () => {
+    const active = proc({ task_id: 'a' })
+    const processes = [
+      active,
       proc({ task_id: 'b', status: 'completed', exit_code: 0 }),
       proc({ task_id: 'c', status: 'failed', exit_code: 1 }),
-    ])
-    expect(lines).toContain('  Shells (1)')
-    expect(lines).toContain('  Completed (2)')
+      proc({ task_id: 'd', status: 'killed' }),
+    ]
+    expect(render(processes)).toEqual(render([active]))
+    expect(buildSelectorRegionLines(createBackgroundPanelState(processes), 100, 24))
+      .toEqual(buildSelectorRegionLines(createBackgroundPanelState([active]), 100, 24))
   })
 
-  test('groups are separated by a blank line, not a divider rule', () => {
-    const lines = render([
-      proc({ task_id: 'a' }),
-      proc({ task_id: 'b', status: 'completed', exit_code: 0 }),
-    ])
-    const completedAt = lines.indexOf('  Completed (1)')
-    expect(completedAt).toBeGreaterThan(0)
-    expect(lines[completedAt - 1]).toBe('')
-    expect(lines.join('\n')).not.toContain('──')
+  test('finished-only history renders the same empty panel as no history', () => {
+    const processes = [
+      proc({ status: 'completed', exit_code: 0 }),
+      proc({ task_id: 'failed', status: 'failed', exit_code: 1 }),
+      proc({ task_id: 'killed', status: 'killed' }),
+    ]
+    expect(render(processes)).toEqual(render([]))
+    expect(buildSelectorRegionLines(createBackgroundPanelState(processes), 100, 24))
+      .toEqual(buildSelectorRegionLines(createBackgroundPanelState([]), 100, 24))
   })
 
   test('the focused row is marked and rows carry a parenthesised status', () => {
     const lines = render([proc({ command: 'bun run dev' })])
-    expect(lines.some(l => l.startsWith('❯ bun run dev'))).toBe(true)
+    expect(lines.some(l => l.startsWith('· bun run dev'))).toBe(true)
     expect(lines.find(l => l.includes('bun run dev'))).toContain('(running · 2s)')
   })
 
   test('an empty panel states it in the body and offers only close', () => {
     const lines = render([])
     expect(lines).toContain('  No tasks currently running')
-    expect(lines[lines.length - 1]).toBe('Esc to close')
+    expect(lines[lines.length - 1]).toBe('esc close')
     // No count line above an empty body: the body is the whole message.
     expect(lines.join('\n')).not.toContain('active shell')
   })
@@ -127,15 +132,147 @@ describe('background panel rendering', () => {
     const state = createBackgroundOutputState(proc(), output)
     const lines = buildSelectorRegionLines(state, 100, 24).map(stripAnsi)
 
-    expect(lines).toContain('Background output')
+    expect(lines).toContain('⌘ Background task · aaaaaaaa')
     expect(lines.some(line => line.trim() === 'line 30')).toBe(true)
     expect(lines.some(line => line.trim() === 'line 1')).toBe(false)
-    expect(lines).toContain('Esc to back')
+    expect(lines.join('\n')).toContain('esc back')
     expect(lines.every(line => line.length <= 100)).toBe(true)
 
     const short = buildSelectorRegionLines(state, 100, 12).map(stripAnsi)
     expect(short.length).toBeLessThan(lines.length)
     expect(short.some(line => line.trim() === 'line 30')).toBe(true)
+  })
+
+  test('output footer only shows navigation and available stop action', () => {
+    for (const status of ['running', 'completed'] as const) {
+      const state = createBackgroundOutputState(proc({ status }), 'hello')
+      const lines = buildSelectorRegionLines(state, 120, 30).map(stripAnsi)
+      const footer = lines.find(line => line.includes('esc back'))
+      expect(footer).toBeDefined()
+      expect(footer).toContain('scroll')
+      expect(footer).not.toContain('follow')
+      expect(footer).not.toContain('command')
+      if (status === 'running') expect(footer).toContain('x stop')
+      else expect(footer).not.toContain('stop')
+    }
+  })
+
+  test('detail shows one complete command, not a second clipped summary', () => {
+    const command = 'cd /repo && pytest -q tests/ > /tmp/test.log 2>&1; tail -3 /tmp/test.log; git diff --check'
+    const state = createBackgroundOutputState(proc({ command, status: 'completed', exit_code: 0 }), '2619 passed\ndiff-ok')
+    const lines = buildSelectorRegionLines(state, 120, 30).map(stripAnsi)
+    const text = lines.join('\n')
+    expect(text.split('cd /repo').length - 1).toBe(1)
+    expect(text).toContain(command)
+    expect(text).toContain('2619 passed')
+    expect(text).toContain('diff-ok')
+    expect(text).not.toContain('⌘ bash')
+    expect(text).toContain('Background task · aaaaaaaa')
+  })
+
+  test('live output includes the complete script before output', () => {
+    const process = proc({ command: 'printf hello\nprintf world' })
+    const state = createBackgroundOutputState(process, 'hello\nworld')
+    const rendered = buildSelectorRegionLines(state, 80, 30)
+    const plain = rendered.map(stripAnsi)
+    expect(plain.filter(text => text.includes('running ·'))).toHaveLength(1)
+    expect(plain).toContain('  Command')
+    expect(plain).toContain('  printf hello')
+    expect(plain).toContain('  printf world')
+    expect(plain).toContain('  Output')
+    expect(plain).toContain('  hello')
+    expect(plain).toContain('  world')
+    expect(plain.join('\n')).not.toContain('Output:')
+    expect(plain.join('\n')).not.toContain('ctrl+o')
+  })
+
+  test('huge command metadata never pushes activity or navigation off screen', () => {
+    const command = 'echo ' + 'long-argument '.repeat(1200)
+    for (const rows of [10, 12, 24, 40]) {
+      const state = createBackgroundOutputState(proc({ command }), 'latest output')
+      const lines = buildSelectorRegionLines(state, 60, rows).map(stripAnsi)
+      expect(lines.length).toBeLessThanOrEqual(rows)
+      expect(lines.every(text => text.length <= 60)).toBe(true)
+      expect(lines).toContain('  latest output')
+      expect(lines.join('\n')).toContain('esc')
+      const commandView = { ...state, outputView: { scrollOffset: 0 } }
+      expect(buildSelectorRegionLines(commandView, 60, rows).length).toBeLessThanOrEqual(rows)
+    }
+  })
+
+  test('scrolling reaches every wrapped command row including later commands', () => {
+    const command = "python3 - <<'PY'\nprint('fixture')\n\nPY\nchrome --screenshot=" + 'x'.repeat(160)
+    const state = createBackgroundOutputState(proc({ command }), 'fixture created')
+    const rows = backgroundOutputRows(state, 40)
+    expect(rows).toContain('chrome')
+    expect(rows.join('\n')).toContain('--screenshot=')
+    for (let offset = 0; offset < rows.length; offset++) {
+      const view = { ...state, outputView: { scrollOffset: offset } }
+      const lines = buildSelectorRegionLines(view, 40, 12).map(stripAnsi)
+      expect(lines).toContain(`  ${rows[offset]}`)
+      expect(lines.length).toBeLessThanOrEqual(12)
+      expect(lines.join('\n')).toContain('Background task · aaaaaaaa')
+      expect(lines.join('\n')).not.toContain('script (5 lines)')
+    }
+  })
+
+  test('the overlay keeps one height at every scroll position', () => {
+    // The composer sits directly under the overlay: a body window that grows or
+    // shrinks with the scroll position would drag the prompt up and down.
+    const output = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join('\n')
+    const state = createBackgroundOutputState(proc(), output)
+    const following = buildSelectorRegionLines(state, 100, 24).map(stripAnsi)
+    const viewport = backgroundOutputViewport(state, 100, 24)
+    expect(viewport.height).toBe(16)
+    expect(following.some(line => line.trim() === 'line 60')).toBe(true)
+    expect(following.join('\n')).toContain('earlier lines · ↑ to scroll back')
+
+    for (const offset of [0, 1, 5, viewport.body.length - viewport.height - 1]) {
+      const lines = buildSelectorRegionLines({ ...state, outputView: { scrollOffset: offset } }, 100, 24).map(stripAnsi)
+      expect(lines).toHaveLength(following.length)
+      expect(lines.join('\n')).toContain(`Paused · ${offset + 1}–${offset + viewport.height} of ${viewport.body.length}`)
+    }
+    // The top of the body is the command itself.
+    const top = buildSelectorRegionLines({ ...state, outputView: { scrollOffset: 0 } }, 100, 24).map(stripAnsi)
+    expect(top).toContain('  Command')
+    expect(top).toContain('  sleep 30')
+    // An offset at or past the last window is simply following.
+    const bottom = buildSelectorRegionLines({ ...state, outputView: { scrollOffset: 10_000 } }, 100, 24).map(stripAnsi)
+    expect(bottom).toEqual(following)
+  })
+
+  test('a short body has no scroll range and reports no position', () => {
+    const state = createBackgroundOutputState(proc(), 'hello\nworld')
+    const viewport = backgroundOutputViewport(state, 100, 24)
+    expect(scrollBackgroundOutput(viewport, 'up')).toBeUndefined()
+    expect(scrollBackgroundOutput(viewport, 'home')).toBeUndefined()
+    expect(formatOutputPosition(viewport)).toBe('')
+    const lines = buildSelectorRegionLines(state, 100, 24).map(stripAnsi)
+    expect(lines.join('\n')).not.toContain('Paused')
+  })
+
+  test('scroll keys are clamped to the body and hand back to the tail at the bottom', () => {
+    const output = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join('\n')
+    const state = createBackgroundOutputState(proc(), output)
+    const following = backgroundOutputViewport(state, 100, 24)
+    const maxStart = following.body.length - following.height
+    expect(following.start).toBe(maxStart)
+
+    expect(scrollBackgroundOutput(following, 'up')).toBe(maxStart - 1)
+    expect(scrollBackgroundOutput(following, 'page-up')).toBe(maxStart - (following.height - 1))
+    expect(scrollBackgroundOutput(following, 'home')).toBe(0)
+    expect(scrollBackgroundOutput(following, 'command')).toBe(0)
+    expect(scrollBackgroundOutput(following, 'down')).toBeUndefined()
+
+    const top = backgroundOutputViewport({ ...state, outputView: { scrollOffset: 0 } }, 100, 24)
+    expect(scrollBackgroundOutput(top, 'up')).toBe(0)
+    expect(scrollBackgroundOutput(top, 'page-up')).toBe(0)
+    expect(scrollBackgroundOutput(top, 'down')).toBe(1)
+    expect(scrollBackgroundOutput(top, 'end')).toBeUndefined()
+
+    const nearBottom = backgroundOutputViewport({ ...state, outputView: { scrollOffset: maxStart - 1 } }, 100, 24)
+    expect(scrollBackgroundOutput(nearBottom, 'down')).toBeUndefined()
+    expect(scrollBackgroundOutput(nearBottom, 'page-down')).toBeUndefined()
   })
 
   test('capped-output warning stays pinned above a noisy tail', () => {
@@ -149,8 +286,9 @@ describe('background panel rendering', () => {
 
   test('a multi-line command stays on one row', () => {
     const lines = render([proc({ command: 'tail -f log\n| grep err' })])
-    const row = lines.find(l => l.includes('tail -f log'))
-    expect(row).toContain('(+1 line)')
+    const row = lines.find(l => l.includes('script (2 lines)'))
+    expect(row).toBeDefined()
+    expect(lines.join('\n')).not.toContain('tail -f log')
     expect(lines.some(l => l.includes('grep err'))).toBe(false)
   })
 })

@@ -5,6 +5,39 @@ use evotengine::types::*;
 
 use super::super::fixtures::stream_config::*;
 
+#[test]
+fn opaque_alias_uses_modern_output_budget_and_generic_thinking_wire() {
+    for level in [ThinkingLevel::Off, ThinkingLevel::Max] {
+        let config = StreamConfigBuilder::anthropic()
+            .model("evot-fast")
+            .model_config(ModelConfig::anthropic("evot-fast", "Fast"))
+            .thinking(level)
+            .no_max_tokens()
+            .build();
+        let body = build_request_body(&config, false);
+        assert_eq!(body["model"], "evot-fast");
+        assert_eq!(body["max_tokens"], 128_000);
+        if level == ThinkingLevel::Off {
+            assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+        } else {
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["thinking"]["budget_tokens"], 16_384);
+        }
+        assert!(body.get("output_config").is_none());
+    }
+}
+
+#[test]
+fn opaque_alias_explicit_output_cap_is_preserved() {
+    let config = StreamConfigBuilder::anthropic()
+        .model("opaque-alias")
+        .model_config(ModelConfig::anthropic("opaque-alias", "Alias"))
+        .thinking(ThinkingLevel::Off)
+        .max_tokens(4096)
+        .build();
+    assert_eq!(build_request_body(&config, false)["max_tokens"], 4096);
+}
+
 /// Helper: assistant message with text content.
 fn assistant(text: &str) -> Message {
     Message::Assistant {
@@ -31,6 +64,91 @@ fn cache_config(cache: CacheConfig) -> StreamConfig {
         .tools(vec![tool_def("bash", "Run commands")])
         .cache_config(cache)
         .build()
+}
+
+#[test]
+fn normalized_history_serializes_all_parallel_results_in_the_next_message() {
+    use evotengine::context::transform_messages_for_model;
+    use evotengine::provider::ApiProtocol;
+
+    let mut calls = assistant("reading files");
+    if let Message::Assistant {
+        content,
+        stop_reason,
+        ..
+    } = &mut calls
+    {
+        *stop_reason = StopReason::ToolUse;
+        for id in ["a", "b", "c", "d"] {
+            content.push(Content::ToolCall {
+                id: id.into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "README.md"}),
+                metadata: None,
+            });
+        }
+        content.push(Content::Thinking {
+            thinking: "plan".into(),
+            metadata: Some(ThinkingMetadata::Anthropic {
+                signature: "old-sig".into(),
+            }),
+        });
+    }
+    let mut failed = assistant("incomplete response");
+    if let Message::Assistant { stop_reason, .. } = &mut failed {
+        *stop_reason = StopReason::Error;
+    }
+    let messages = transform_messages_for_model(
+        vec![
+            Message::user("summary"),
+            calls,
+            Message::ToolResult {
+                tool_call_id: "b".into(),
+                tool_name: "read".into(),
+                content: vec![Content::Text {
+                    text: "file contents".into(),
+                }],
+                is_error: false,
+                timestamp: 1,
+                retention: Retention::Normal,
+            },
+            failed,
+            Message::user("continue"),
+        ],
+        "another-provider",
+        "another-model",
+        ApiProtocol::AnthropicMessages,
+    );
+    let config = StreamConfigBuilder::anthropic().messages(messages).build();
+    let body = build_request_body(&config, false);
+    assert_eq!(body["messages"][1]["role"], "assistant");
+    let assistant_blocks = body["messages"][1]["content"].as_array().unwrap();
+    // Cross-model thinking stays visible, but a tool_use turn must end on
+    // tool_use: DeepSeek's Anthropic-compatible API treats a later text block
+    // as interrupting the pair with the next message's tool_result.
+    assert_eq!(assistant_blocks[0]["type"], "text");
+    assert_eq!(assistant_blocks[0]["text"], "reading files");
+    assert_eq!(assistant_blocks[1]["type"], "text");
+    assert_eq!(assistant_blocks[1]["text"], "plan");
+    assert_eq!(assistant_blocks[2]["type"], "tool_use");
+    assert_eq!(assistant_blocks.last().unwrap()["type"], "tool_use");
+    assert_eq!(body["messages"][2]["role"], "user");
+    for (index, id) in ["b", "a", "c", "d"].iter().enumerate() {
+        let block = &body["messages"][2]["content"][index];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], *id);
+        assert_eq!(block["is_error"], index != 0);
+        assert_eq!(
+            block["content"],
+            if index == 0 {
+                "file contents"
+            } else {
+                "No result provided"
+            }
+        );
+    }
+    assert!(!body.to_string().contains("incomplete response"));
+    assert!(!body.to_string().contains("old-sig"));
 }
 
 // ---------------------------------------------------------------------------
@@ -672,6 +790,7 @@ fn test_content_to_anthropic_keeps_native_signature_but_downgrades_openai_field_
             thinking: "cross-provider".into(),
             metadata: Some(ThinkingMetadata::OpenAiCompletions {
                 field: ReasoningField::ReasoningContent,
+                details: None,
             }),
         },
         Content::Thinking {
@@ -704,6 +823,85 @@ fn test_content_to_anthropic_filters_empty_text() {
     assert_eq!(result[0]["text"], "hello");
 }
 
+#[test]
+fn assistant_placeholder_thinking_after_tools_is_dropped() {
+    let content = vec![
+        Content::Text {
+            text: "compare the two renderers".into(),
+        },
+        Content::ToolCall {
+            id: "call_c9cfe266-abac-46ba-be90-bff3dce7313f".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "rg thinking"}),
+            metadata: None,
+        },
+        Content::ToolCall {
+            id: "call_06c624bb-8631-4362-bf34-ab956d7c3512".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "rg reasoning"}),
+            metadata: None,
+        },
+        Content::Thinking {
+            thinking: "...".into(),
+            metadata: Some(ThinkingMetadata::Anthropic {
+                signature: "foreign-sig".into(),
+            }),
+        },
+    ];
+
+    let result = assistant_content_to_anthropic(&content);
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0]["type"], "text");
+    assert_eq!(result[1]["type"], "tool_use");
+    assert_eq!(result[1]["id"], "call_c9cfe266-abac-46ba-be90-bff3dce7313f");
+    assert_eq!(result[2]["type"], "tool_use");
+    assert_eq!(result[2]["id"], "call_06c624bb-8631-4362-bf34-ab956d7c3512");
+}
+
+#[test]
+fn assistant_meaningful_text_after_tools_moves_before_tool_use() {
+    let content = vec![
+        Content::Text {
+            text: "opening".into(),
+        },
+        Content::ToolCall {
+            id: "call_1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "README.md"}),
+            metadata: None,
+        },
+        Content::Text {
+            text: "why I called it".into(),
+        },
+    ];
+
+    let result = assistant_content_to_anthropic(&content);
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0]["type"], "text");
+    assert_eq!(result[0]["text"], "opening");
+    assert_eq!(result[1]["type"], "text");
+    assert_eq!(result[1]["text"], "why I called it");
+    assert_eq!(result[2]["type"], "tool_use");
+    assert_eq!(result[2]["id"], "call_1");
+}
+
+#[test]
+fn assistant_placeholder_thinking_without_tools_is_dropped() {
+    let content = vec![
+        Content::Thinking {
+            thinking: "…".into(),
+            metadata: None,
+        },
+        Content::Text {
+            text: "answer".into(),
+        },
+    ];
+    let result = assistant_content_to_anthropic(&content);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["type"], "text");
+    assert_eq!(result[0]["text"], "answer");
+}
+
 // ---------------------------------------------------------------------------
 // Cache breakpoint edge cases (empty content blocks)
 // ---------------------------------------------------------------------------
@@ -714,6 +912,7 @@ fn empty_text_messages() -> Vec<Message> {
         Message::user("first message"),
         assistant("ok"),
         Message::User {
+            provenance: None,
             content: vec![Content::Text { text: "".into() }],
             timestamp: 0,
         },
@@ -754,6 +953,7 @@ fn test_cache_breakpoint_uses_second_to_last_after_empty_message_removal() {
             Message::user("first message"),
             assistant("ok"),
             Message::User {
+                provenance: None,
                 content: vec![Content::Text { text: "".into() }],
                 timestamp: 0,
             },
@@ -870,6 +1070,7 @@ fn test_empty_user_and_assistant_messages_are_skipped() {
         .cache_disabled()
         .messages(vec![
             Message::User {
+                provenance: None,
                 content: vec![Content::Text { text: "  ".into() }],
                 timestamp: 0,
             },

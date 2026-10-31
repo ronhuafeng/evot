@@ -1,28 +1,30 @@
-import type { Agent, SessionMeta, ConfigInfo } from '../../native/index.js'
+import type { ConfigInfo } from '../../native/contracts/config-info.js'
 import type { AppState } from './state.js'
 import type { OutputLine } from '../../render/output.js'
-import type { OverlayState } from '../viewmodel/index.js'
+import type { OverlayState } from './overlay-state.js'
 import { resolveCommand } from '../../commands/index.js'
+import { modelShareEvents } from '../../session/share-events.js'
 import { currentModelSpec, formatModelLabel, modelOptions } from './provider.js'
 
+export interface CommandModelClient {
+  model: string
+  setProvider(spec: string): void
+  configInfo(): Pick<ConfigInfo, 'provider'> & Partial<Pick<ConfigInfo, 'thinkingLevel'>>
+}
+
 export interface CommandContext {
-  agent: Agent
+  agent: CommandModelClient
   appState: AppState
   configInfo?: ConfigInfo
-  preloadedSessions: SessionMeta[]
-  planning: boolean
 }
 
 export interface CommandResult {
   appState: AppState
-  planning: boolean
   overlay?: OverlayState
-  clearScreen?: boolean
   clearContext?: boolean
   newSession?: boolean
   exit?: boolean
   restart?: boolean
-  resumeSession?: SessionMeta
   systemLines: OutputLine[]
 }
 
@@ -64,15 +66,6 @@ export function handleSlashCommand(text: string, ctx: CommandContext): CommandRe
     case '/restart':
       return { ...baseResult(ctx), restart: true }
 
-    case '/plan': {
-      const planning = !ctx.planning
-      return {
-        ...baseResult(ctx),
-        planning,
-        systemLines: [{ id: 'sys-p', kind: 'system', text: `  plan mode: ${planning ? 'on · write tools disabled' : 'off'}` }],
-      }
-    }
-
     case '/model': {
       if (args === 'n') {
         const models = modelOptions(ctx.configInfo, ctx.agent.model)
@@ -83,11 +76,13 @@ export function handleSlashCommand(text: string, ctx: CommandContext): CommandRe
         const idx = models.findIndex(option => option.spec === activeSpec)
         const next = models[(idx + 1) % models.length]!
         ctx.agent.setProvider(next.spec)
+        const config = ctx.agent.configInfo()
         const appState = { ...ctx.appState, model: next.model }
+        const shareEvents = modelShareEvents(next.provider, next.model, config.thinkingLevel)
         return {
           ...baseResult(ctx),
           appState,
-          systemLines: [{ id: 'sys-model', kind: 'system', text: `  Model → ${formatModelLabel(next.model, next.provider, next.group_label)}` }],
+          systemLines: [{ id: 'sys-model', kind: 'system', text: `  Model → ${formatModelLabel(next.model, next.provider, next.group_label)}`, shareEvents }],
         }
       }
       if (args) {
@@ -98,14 +93,16 @@ export function handleSlashCommand(text: string, ctx: CommandContext): CommandRe
           ctx.agent.model = args
         }
         const model = ctx.agent.model
-        const provider = ctx.agent.configInfo().provider
+        const config = ctx.agent.configInfo()
+        const provider = config.provider
         const appState = { ...ctx.appState, model }
         const selected = configured ?? ctx.configInfo?.availableModels.find(
           option => option.model === model && option.provider === provider)
+        const shareEvents = modelShareEvents(provider, model, config.thinkingLevel)
         return {
           ...baseResult(ctx),
           appState,
-          systemLines: [{ id: 'sys-model', kind: 'system', text: `  Model → ${formatModelLabel(model, provider, selected?.group_label)}` }],
+          systemLines: [{ id: 'sys-model', kind: 'system', text: `  Model → ${formatModelLabel(model, provider, selected?.group_label)}`, shareEvents }],
         }
       }
       // No arg — return empty result; handleSlashInput will show selector overlay
@@ -126,7 +123,6 @@ export function handleSlashCommand(text: string, ctx: CommandContext): CommandRe
 function baseResult(ctx: CommandContext): CommandResult {
   return {
     appState: ctx.appState,
-    planning: ctx.planning,
     systemLines: [],
   }
 }

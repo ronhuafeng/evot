@@ -292,7 +292,7 @@ fn nested_frontmatter_error_keeps_valid_siblings() -> Result<(), Box<dyn std::er
 #[test]
 fn builtin_directory_contains_all_builtin_skills() -> Result<(), Box<dyn std::error::Error>> {
     let root = ensure_builtin_skills_dir()?;
-    for name in ["harden", "memory"] {
+    for name in ["harden", "memory", "session-search"] {
         assert!(root.join(name).join("SKILL.md").is_file());
     }
     Ok(())
@@ -304,13 +304,34 @@ fn all_builtin_skills_load() -> Result<(), Box<dyn std::error::Error>> {
     let specs = load_skills(&empty)?;
     let names: Vec<&str> = specs.iter().map(|skill| skill.name.as_str()).collect();
 
-    assert_eq!(names, vec!["harden", "memory"]);
+    assert_eq!(names, vec!["harden", "memory", "session-search"]);
     assert!(specs.iter().all(|skill| !skill.description.is_empty()));
     Ok(())
 }
 
 #[test]
 fn stale_builtin_dirs_are_removed() -> Result<(), Box<dyn std::error::Error>> {
+    const CHILD: &str = "EVOT_STALE_BUILTIN_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let home = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "skill_loader_test::stale_builtin_dirs_are_removed",
+                "--nocapture",
+            ])
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env(CHILD, "1")
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Ok(());
+    }
     // `opencli` and `humanize` moved to the evot-skills catalog. An upgraded
     // binary must clear the copies it wrote in an earlier version, or they keep
     // loading and collide with the installed ones.
@@ -324,7 +345,7 @@ fn stale_builtin_dirs_are_removed() -> Result<(), Box<dyn std::error::Error>> {
 
     let root = ensure_builtin_skills_dir()?;
     assert!(!stale.exists(), "stale builtin dir should be removed");
-    for name in ["harden", "memory"] {
+    for name in ["harden", "memory", "session-search"] {
         assert!(root.join(name).join("SKILL.md").is_file());
     }
     Ok(())

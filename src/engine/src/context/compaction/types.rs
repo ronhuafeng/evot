@@ -14,6 +14,9 @@ pub enum CompactReason {
     Threshold,
     Overflow,
     Manual,
+    /// The provider refused the request (safety filter); the context was
+    /// compacted so the retry no longer carries the triggering content.
+    Refusal,
 }
 
 pub fn bounded_fallback_reason(reason: &str) -> String {
@@ -25,6 +28,8 @@ pub fn bounded_fallback_reason(reason: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMethod {
+    /// Lossless pruning of stale tool calls decided by a judge model; no summary.
+    Prune,
     /// Provider-native server-side compaction (opaque encrypted item).
     Remote,
     /// Local text summarization.
@@ -37,6 +42,8 @@ pub enum CompactionMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionPhase {
+    /// Asking the judge which tool calls still matter.
+    Pruning,
     Planning,
     Remote,
     LocalFallback,
@@ -44,11 +51,41 @@ pub enum CompactionPhase {
     Complete,
 }
 
-pub type CompactionObserver = Arc<dyn Fn(CompactionPhase) + Send + Sync>;
+/// Transient activity within an existing phase; the published phase vocabulary
+/// stays unchanged so older clients can still follow the lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionActivity {
+    Waiting,
+    Generating,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionUpdate {
+    pub phase: CompactionPhase,
+    pub activity: Option<CompactionActivity>,
+}
+
+pub type CompactionObserver = Arc<dyn Fn(CompactionUpdate) + Send + Sync>;
 
 pub fn notify_compaction_phase(observer: &Option<CompactionObserver>, phase: CompactionPhase) {
     if let Some(observer) = observer {
-        observer(phase);
+        observer(CompactionUpdate {
+            phase,
+            activity: None,
+        });
+    }
+}
+
+pub fn notify_compaction_activity(
+    observer: &Option<CompactionObserver>,
+    activity: CompactionActivity,
+) {
+    if let Some(observer) = observer {
+        observer(CompactionUpdate {
+            phase: CompactionPhase::Local,
+            activity: Some(activity),
+        });
     }
 }
 
@@ -94,6 +131,13 @@ pub enum TriggerDecision {
     /// attempted this turn. Do not retry — surface a user-visible message so
     /// the user can reduce context or switch to a larger-context model.
     OverflowExhausted { context_tokens: usize },
+    /// The provider refused the request (safety filter / refusal). Compact
+    /// the context so the triggering content leaves the active request, then
+    /// retry once.
+    Refusal { context_tokens: usize },
+    /// A refusal recurred after a compact-and-retry was already attempted
+    /// this turn. Do not retry again.
+    RefusalExhausted { context_tokens: usize },
 }
 
 // ---------------------------------------------------------------------------

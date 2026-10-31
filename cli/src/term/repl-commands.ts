@@ -1,16 +1,25 @@
-import chalk from 'chalk'
+import { existsSync } from 'fs'
+import { homedir } from 'os'
+import { join } from 'path'
 import type { Agent } from '../native/index.js'
 import type { ConfigInfo } from '../native/index.js'
 import { findLastAssistantMarkdown, findLastAssistantTurn } from '../session/assistant-markdown.js'
-import { resolveSessionByPrefix } from './app/resume.js'
+import { runShareCommand } from '../commands/share.js'
 import type { OutputLine } from '../render/output.js'
-import { defaultDeps, type LoginDeps } from '../commands/login-flow.js'
+import { defaultDeps, loginDeniedMessage, type LoginDeps } from '../commands/login-flow.js'
 import { createCommandOutput } from './command-output.js'
-import { renderCommandNotice } from '../render/command-notice.js'
+import { renderCommandNotice, renderErrorNotice } from '../render/command-notice.js'
 import type { RunResult } from '../update/types.js'
 
 export interface ReplCommandContext {
   agent: Agent
+  flushShareNotices?: () => Promise<void>
+  isBusy?: () => boolean
+  openShareList: () => Promise<void>
+  openShareLinks?: () => Promise<void>
+  cloudAcknowledged?: (sessionId: string, result: import('../native/index.js').CloudPushResult) => void
+  cloudForgotten?: (sessionId: string) => void
+  resumeSession?: (session: import('../native/index.js').SessionMeta) => Promise<void>
   getSessionId: () => string | null
   getCompactLines: () => import('../render/output.js').OutputLine[]
   getConfigInfo: () => ConfigInfo | null
@@ -25,16 +34,56 @@ export interface ReplCommandContext {
   requestRender: () => void
 }
 
-export function formatLogPaths(logPath: string | null, rendererPath: string | null = null): string | null {
+export function formatLogPaths(
+  logPath: string | null,
+  rendererPath: string | null = null,
+  renderSummary: string | null = null,
+  judgeTracePath: string | null = null,
+): string | null {
   if (!logPath) return null
   const lines = [`  Log: ${logPath}`]
+  if (judgeTracePath) lines.push(`  Judge trace: ${judgeTracePath}`)
   if (rendererPath) lines.push(`  Renderer run: ${rendererPath}`)
+  if (renderSummary) lines.push(renderSummary)
   return lines.join('\n')
+}
+
+/** `sessions/<id>/judge-trace.jsonl`, or null until the judge has been asked. */
+export function judgeTracePath(sessionId: string | null, exists: (path: string) => boolean = existsSync): string | null {
+  if (!sessionId) return null
+  const path = join(homedir(), '.evotai', 'sessions', sessionId, 'judge-trace.jsonl')
+  return exists(path) ? path : null
+}
+
+/**
+ * System prompt of a `/log <query>` fork. The screen log is what the user
+ * saw; the judge trace is the evidence behind every `[JEV]` line in it.
+ */
+export function logAnalysisPrompt(logPath: string, judgeTrace: string | null): string {
+  const files = [`Screen log file to analyze:\n${logPath}`]
+  if (judgeTrace) {
+    files.push(
+      `Judge trace (JSONL, one line per Jev request: the state text the judge read, the questions, and its answers):\n${judgeTrace}\n` +
+      'The screen log\'s "[JEV]" lines summarise these requests; read the trace to see why a call was kept, truncated or removed.',
+    )
+  }
+  return [
+    'You are in a temporary log analysis session.',
+    'This session is not persisted and does not affect the main session context.',
+    '',
+    files.join('\n\n'),
+    '',
+    'Rules:',
+    '- Read relevant log sections before answering; do not guess',
+    '- Prefer partial reads; avoid loading the entire file at once',
+    '- Use search to locate key information when needed',
+    '- Do not modify any files',
+  ].join('\n')
 }
 
 function failureText(label: string, err: unknown): string {
   const message = (err as { message?: string })?.message ?? String(err)
-  return chalk.red(`  ${label}: ${message}`)
+  return renderErrorNotice(`${label}: ${message}`)
 }
 
 /** Distinguishes concurrent reveals; see the comment at its use site. */
@@ -90,58 +139,8 @@ export async function handleClipCommand(ctx: ReplCommandContext): Promise<void> 
 }
 
 export async function handleShareCommand(ctx: ReplCommandContext, args: string): Promise<void> {
-  const target = args.trim()
-  const { importSharedSession, isSharedSessionUrl, shareSession } = await import('../commands/share.js')
-
-  if (target && isSharedSessionUrl(target)) {
-    ctx.commitSystem('sys-share-import', '  downloading and importing...')
-    ctx.requestRender()
-    try {
-      const result = await importSharedSession(target)
-      ctx.commitSystem('sys-share-import-ok', `  imported session: ${result.sessionId}\n  resume with: /resume ${result.sessionId.slice(0, 8)}`)
-    } catch (err) {
-      ctx.commitSystem('sys-share-err', failureText('Import failed', err))
-    }
-    return
-  }
-
-  let resolvedSid = ctx.getSessionId()
-  if (target) {
-    if (!/^[0-9a-f-]{1,36}$/i.test(target)) {
-      ctx.commitSystem('sys-share-err', '  Usage: /share [session-id | url#password]')
-      return
-    }
-    try {
-      const sessions = await ctx.agent.listSessions(0)
-      const resolved = resolveSessionByPrefix(sessions, target)
-      if (resolved.kind === 'none') {
-        ctx.commitSystem('sys-share-err', `  Session not found: ${target}`)
-        return
-      }
-      if (resolved.kind === 'ambiguous') {
-        ctx.commitSystem('sys-share-err', `  Ambiguous session id: ${target} (${resolved.matches.length} matches)`)
-        return
-      }
-      resolvedSid = resolved.session.session_id
-    } catch (err) {
-      ctx.commitSystem('sys-share-err', failureText('Failed to list sessions', err))
-      return
-    }
-  }
-
-  if (!resolvedSid) {
-    ctx.commitSystem('sys-share-err', '  No active session to share.')
-    return
-  }
-
-  ctx.commitSystem('sys-share', `  packing session ${resolvedSid.slice(0, 8)}...`)
-  ctx.requestRender()
-  try {
-    const result = await shareSession(resolvedSid)
-    ctx.commitSystem('sys-share-url', `  uploaded. share this link:\n  ${result.url}\n  ⏳ link expires in 60 minutes`)
-  } catch (err) {
-    ctx.commitSystem('sys-share-err', failureText('Share failed', err))
-  }
+  const output = createCommandOutput(ctx, 'share')
+  await runShareCommand({ ...ctx, progressBar: options => output.bar(options) }, args)
 }
 
 /**
@@ -273,10 +272,10 @@ export async function handleLoginCommand(
         return true
       }
       case 'denied':
-        ctx.commitSystem('sys-login-err', chalk.red('  ✗ login denied'))
+        ctx.commitSystem('sys-login-err', renderErrorNotice(loginDeniedMessage(outcome)))
         return false
       case 'timeout':
-        ctx.commitSystem('sys-login-err', chalk.red('  ✗ login timed out, try again'))
+        ctx.commitSystem('sys-login-err', renderErrorNotice('login timed out, try again'))
         return false
     }
   } catch (err) {
@@ -326,7 +325,7 @@ export async function handleUpdateCommand(
     const result = await (run ?? (async () => {
       const { runUpdate } = await import('../update/index.js')
       const { version } = await import('../native/index.js')
-      return runUpdate(version())
+      return runUpdate(version(), { onProgress: message => status.update(renderCommandNotice({ state: 'progress', label: 'update', message })) })
     }))()
     switch (result.kind) {
       case 'up_to_date':
@@ -359,6 +358,28 @@ export async function handleUpdateCommand(
       state: 'error', message: `update failed: ${(err as { message?: string })?.message ?? err}`,
     }))
   }
+}
+
+export async function handlePrivacyCommand(ctx: ReplCommandContext, args: string): Promise<void> {
+  const { runPrivacyCommand, USAGE } = await import('../commands/privacy.js')
+  const { privacyStatus, privacySave } = await import('../native/index.js')
+  const { buildPrivacyActionCard } = await import('../render/output.js')
+  const action = /^\s*term\b/.test(args)
+  try {
+    const text = await runPrivacyCommand({ status: privacyStatus, save: privacySave }, args)
+    // A status read is a plain notice; an action is a card, titled with the
+    // command so what changed is on record.
+    if (action) {
+      const refused = text === USAGE || /already listed|no such/.test(text)
+      ctx.commitLines(buildPrivacyActionCard(args, text, refused ? 'error' : 'success'))
+    } else {
+      ctx.commitSystem('sys-privacy', text)
+    }
+  } catch (err) {
+    if (action) ctx.commitLines(buildPrivacyActionCard(args, failureText('privacy failed', err), 'error'))
+    else ctx.commitSystem('sys-privacy-err', failureText('privacy failed', err))
+  }
+  ctx.requestRender()
 }
 
 export async function handleEnvCommand(ctx: ReplCommandContext, args: string): Promise<void> {

@@ -13,6 +13,13 @@ describe('isSlashCommand', () => {
     expect(isSlashCommand('/model gpt-4')).toBe(true)
   })
 
+  test('ignores case so caps lock does not send the command to the model', () => {
+    expect(isSlashCommand('/NEW')).toBe(true)
+    expect(isSlashCommand('/Resume abc')).toBe(true)
+    expect(resolveCommand('/NEW')).toEqual({ kind: 'resolved', name: '/new', args: '' })
+    expect(resolveCommand('/SESSIONS 小红书')).toEqual({ kind: 'resolved', name: '/resume', args: '小红书' })
+  })
+
   test('rejects non-commands', () => {
     expect(isSlashCommand('hello')).toBe(false)
     expect(isSlashCommand('')).toBe(false)
@@ -38,6 +45,15 @@ describe('resolveCommand', () => {
   test('resolves command with args', () => {
     const result = resolveCommand('/model gpt-4o')
     expect(result).toEqual({ kind: 'resolved', name: '/model', args: 'gpt-4o' })
+  })
+
+  test('resolves /task command', () => {
+    expect(resolveCommand('/task')).toEqual({ kind: 'resolved', name: '/task', args: '' })
+    expect(resolveCommand('/task send a daily report')).toEqual({
+      kind: 'resolved',
+      name: '/task',
+      args: 'send a daily report',
+    })
   })
 
   test('resolves /harden command', () => {
@@ -91,11 +107,16 @@ describe('resolveCommand', () => {
   })
 
   test('returns ambiguous for multiple prefix matches', () => {
-    // `/s` still spans several commands. `/p` no longer does: it used to collide
-    // with the background `/ps`, and now resolves straight to `/plan`.
+    // `/s` still spans several commands. Retired /plan no longer owns /p.
     const result = resolveCommand('/s')
     expect(result.kind).toBe('ambiguous')
-    expect(resolveCommand('/p')).toEqual({ kind: 'resolved', name: '/plan', args: '' })
+    expect(resolveCommand('/p')).toEqual({ kind: 'unknown' })
+  })
+
+  test('routes removed /plan command to the unknown-command handler', () => {
+    expect(resolveCommand('/plan')).toEqual({ kind: 'unknown' })
+    expect(resolveCommand('/plan review changes')).toEqual({ kind: 'unknown' })
+    expect(isSlashCommand('/plan')).toBe(true)
   })
 
   test('routes removed /history command to the unknown-command handler', () => {
@@ -118,25 +139,21 @@ describe('resolveCommand', () => {
     })
   })
 
-  test('resolves /copy command', () => {
-    const result = resolveCommand('/copy')
-    expect(result).toEqual({ kind: 'resolved', name: '/copy', args: '' })
-    expect(isSlashCommand('/copy')).toBe(true)
-  })
-
-  test('resolves /clip with its only supported subcommand', () => {
+  test('resolves /clip with its subcommands', () => {
     expect(resolveCommand('/clip')).toEqual({ kind: 'resolved', name: '/clip', args: '' })
     expect(resolveCommand('/clip all')).toEqual({ kind: 'resolved', name: '/clip', args: 'all' })
+    expect(resolveCommand('/clip copy')).toEqual({ kind: 'resolved', name: '/clip', args: 'copy' })
+    expect(resolveCommand('/copy')).toEqual({ kind: 'unknown' })
     expect(isSlashCommand('/clip')).toBe(true)
   })
 
-  test('resolves /share for upload and import targets', () => {
+  test('resolves /share for upload and management', () => {
     expect(resolveCommand('/share')).toEqual({ kind: 'resolved', name: '/share', args: '' })
     expect(resolveCommand('/share abcdef01')).toEqual({ kind: 'resolved', name: '/share', args: 'abcdef01' })
-    expect(resolveCommand('/share https://tmpfiles.org/id/file#key')).toEqual({
+    expect(resolveCommand('/share list')).toEqual({
       kind: 'resolved',
       name: '/share',
-      args: 'https://tmpfiles.org/id/file#key',
+      args: 'list',
     })
     expect(isSlashCommand('/share')).toBe(true)
   })
@@ -151,11 +168,11 @@ describe('resolveCommand', () => {
     expect(isSlashCommand('/logout')).toBe(true)
   })
 
-  test('/c is ambiguous between /clip, /copy, /compact, and /clear', () => {
+  test('/c is ambiguous between /clip, /compact, and /clear', () => {
     const result = resolveCommand('/c')
     expect(result.kind).toBe('ambiguous')
     if (result.kind === 'ambiguous') {
-      expect(result.candidates).toContain('/copy')
+      expect(result.candidates).toContain('/clip')
       expect(result.candidates).toContain('/clear')
     }
   })

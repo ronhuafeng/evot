@@ -4,6 +4,13 @@ DEV_CONFIG ?= $(HOME)/.evotai/evot.env
 CARGO ?= cargo
 BUN_DIR := $(HOME)/.bun/bin
 export PATH := $(BUN_DIR):$(PATH)
+# Prefer the standalone toolchain for local builds when available. Xcode beta
+# linkers can emit addons the host dyld cannot load. Explicit overrides win.
+ifeq ($(shell uname -s),Darwin)
+ifneq ($(wildcard /Library/Developer/CommandLineTools/usr/bin/clang),)
+export DEVELOPER_DIR ?= /Library/Developer/CommandLineTools
+endif
+endif
 NEXTEST := $(CARGO) nextest run --no-tests=pass
 COVERAGE_TARGETS := --workspace --exclude evot-napi
 COVERAGE_CMD := $(CARGO) llvm-cov nextest $(COVERAGE_TARGETS)
@@ -61,6 +68,8 @@ setup:
 check:
 	cargo fmt --all -- --check
 	cargo clippy --all-targets -- -D warnings
+	cargo check -p evotengine --no-default-features
+	cargo check -p evot --no-default-features
 	$(NEXTEST) --workspace --exclude evot-napi --no-fail-fast
 
 build: build-napi build-cli
@@ -111,10 +120,10 @@ ci: check test
 # -- TS CLI -------------------------------------------------------------------
 
 build-napi:
-	cd cli && bun install && bunx napi build --manifest-path addon/Cargo.toml --release --platform --output-dir .
+	cd cli && bun install && bun run build:napi
 
 build-cli: build-napi
-	cd cli && bun build src/index.ts --compile --define 'process.env.DEV="false"' --define 'process.env.NODE_ENV="production"' --outfile dist/evot
+	cd cli && bun run build:cli
 
 install: build-cli
 	@mkdir -p $(HOME)/.evotai/bin $(HOME)/.evotai/lib
@@ -176,7 +185,7 @@ install: build-cli
 	fi
 
 build-napi-dev:
-	cd cli && bun install && bunx napi build --manifest-path addon/Cargo.toml --platform --output-dir .
+	cd cli && bun install && bunx napi build --manifest-path addon/Cargo.toml --platform --output-dir . --no-js && bun scripts/check-native.ts
 
 dev: build-napi-dev
 	cd cli && bun install && bun run src/index.ts

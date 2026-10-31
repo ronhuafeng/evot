@@ -1,4 +1,7 @@
-import { TermRenderer, type RenderFrame } from './renderer.js'
+import { TermRenderer } from './renderer.js'
+import { RenderDiagnostics } from './render-diagnostics.js'
+import type { RenderFrame } from './render-frame.js'
+import { watchOutputFile } from './app/output-watch.js'
 import { readOutputTail } from './app/output-tail.js'
 import {
   enableRawMode,
@@ -9,46 +12,51 @@ import {
 } from './input.js'
 import { TerminalInputBuffer } from './input/buffer.js'
 import { schemeFromRgbColor } from './terminal-colors.js'
-import { getTheme, setDetectedThemeScheme } from '../render/theme/index.js'
-import { createSpinnerState, advanceSpinner, formatSpinnerLine, setSpinnerPhase, spinnerStatsFromLastUsage } from './spinner.js'
-import { createSelectorState, selectorExpandItems, selectorClearQuery, selectorFocusOn, warmSearchableText, SELECTOR_VIEWPORT, type SelectorItem, type SelectorState } from './selector.js'
+import { setDetectedThemeScheme } from '../render/theme/index.js'
+import { compactionToolName, createSpinnerState, advanceSpinner, formatSpinnerLine, setSpinnerPhase, spinnerStatsFromLastUsage } from './spinner.js'
+import { carryModelEfforts, createModelWindow, createResumeWindow } from './app/selector-windows.js'
+import { buildShellFrame } from './viewmodel/shell.js'
+import { buildRunStatusBlock } from './viewmodel/run-status.js'
+import type { PreviewViewport } from './preview-scroll.js'
+import { promptFromSnapshot } from './viewmodel/prompt-snapshot.js'
+import { forkTrailTitles } from './viewmodel/fork-trail.js'
+import { backNotice, exitLineageHint, forkNotice, resolveBackTarget } from './app/fork-nav.js'
+import { isCommandSelector, isBackgroundSelector, SELECTOR_OWNER } from './app/selector-identity.js'
+import { selectorExpandItems, selectorClearQuery, selectorReplaceItem, warmSearchableText, type SelectorItem, type SelectorState } from './selector.js'
 import { createAskState, handleAskKeyEvent, type AskQuestion } from './ask.js'
-import { buildAssistantLines, buildUserMessage, messagesToOutputLines, type OutputLine } from '../render/output.js'
-import { formatCompactionCompleted } from '../render/verbose.js'
-import { wrapTextWithAnsi } from '../render/wrap.js'
-import { Agent, QueryStream, fastExit, authNotices, type CompactionTask, type ManualCompactionOutcome, type SessionMeta, type SessionWithText, type ConfigInfo, type QueuedPrompt } from '../native/index.js'
+import { buildPrivacyCard, buildPrivacyHappeningCard, buildUserMessage, messagesToOutputLines, type OutputLine } from '../render/output.js'
+import { manualCompactionLines } from './viewmodel/manual-compaction.js'
+import { createHyperlink } from '../render/hyperlink.js'
+import { renderErrorNotice } from '../render/command-notice.js'
+import { Agent, QueryStream, fastExit, authNotices, privacyLive, privacySessionTags, taskShareId, type ManualCompactionOutcome, type SessionMeta, type ConfigInfo } from '../native/index.js'
 import { createInitialState, type AppState } from './app/state.js'
 import { assistantToolCalls } from './app/assistant-content.js'
 import type { UIAssistantBlock } from './app/types.js'
 import { assistantMessageToOutputLines } from '../render/assistant.js'
 import { HistoryManager } from '../session/history.js'
-import { ScreenLog } from '../session/screen-log.js'
+import { ScreenLog } from './diagnostics/screen-log.js'
+import { formatMemoryLine, memorySnapshot } from './diagnostics/memory.js'
 import { SessionHook } from '../session/hook.js'
-import { RendererTrace } from '../session/renderer-trace.js'
-import { findLastAssistantMarkdown, findLastAssistantTurn } from '../session/assistant-markdown.js'
+import { RendererTrace } from './diagnostics/renderer-trace.js'
 import { isSlashCommand, resolveCommand, buildHardenPrompt } from '../commands/index.js'
 import { BannerCache } from './banner-cache.js'
 import {
   buildOutputBlocks,
-  buildPromptBlocks,
-  buildPromptFooterBlocks,
-  buildOverlayBlocks,
-  buildSelectorRegionLines,
-  buildAskRegionLines,
   updateLiveHeight,
   formatQueuedMessageLines,
   blocksToLines,
-  type OverlayState,
   type PromptVMInput,
   type ViewBlock,
 } from './viewmodel/index.js'
-import { joinLeftRight, spansWidth } from './viewmodel/width.js'
+import { updateNoticeSpans, attachUpdateNotice, standaloneUpdateNotice } from './viewmodel/update-notice.js'
 import { createAdSlotState, tickAdSlot, nextAdSlotRenderDelay, triggerAdSlot, queueAdSlotTransition, buildAdSlotBlocks, campaignFingerprint, type AdSlotState } from './viewmodel/ad-slot.js'
 import { HistoryRenderCache } from './viewmodel/history-cache.js'
 import { Committer } from './committer.js'
 import {
   createEditorState,
   getEditorText,
+  editorCursorOffset,
+  replaceAfterCursor,
   isEditorEmpty,
   clearEditor,
   insertText,
@@ -63,6 +71,7 @@ import {
   moveCompletion,
   showCompletions,
   refreshGhostHint,
+  setGhostHintContext,
   createHistoryState,
   pushHistory,
   historyPrev,
@@ -83,6 +92,12 @@ import {
   type HistoryState,
 } from './input/editor.js'
 import { UndoStack } from './input/undo-stack.js'
+import { commandIdentity, validCommandInput, type CommandInventory } from './app/suggestion/arguments.js'
+import { SuggestionContext, type WorkflowRuntime } from './app/suggestion/context.js'
+import { activeWork } from './app/suggestion/activities.js'
+import { suggestionImages } from './app/suggestion/images.js'
+import { prepareSuggestion } from './app/suggestion/request.js'
+import { isLegacyContextSummary } from '../session/user-input.js'
 import {
   createStreamMachineState,
   reduceRunEvent,
@@ -90,71 +105,105 @@ import {
   type StreamMachineState,
 } from './app/stream.js'
 import { handleSlashCommand } from './app/commands.js'
-import { askStateToResponse } from './app/ask-user.js'
+import { askStateToResponse, prefixedAskLines } from './app/ask-user.js'
 import { RunOwnership } from './app/run-ownership.js'
+import { PromptSuggestion, SuggestionTicker, TaskWaitSuggestion, createSuggestionInput } from './app/suggestion.js'
+import { resolveComposerGuidance, allowedSuggestionCommand, type SuggestionTrigger } from './app/composer-guidance.js'
+import { PrivacyFeed } from './app/privacy-feed.js'
 import {
+  composeExtensions,
   dispatchHostToolCall,
   HOST_TOOL_SPECS_JSON,
   type AskUserAnswer,
   type AskUserParams,
+  type HostToolExtension,
 } from './host-tools.js'
-import { extractPlanItems, type PlanModeItem } from './plan-mode.js'
-import { currentModelSpec, formatModelLabel, formatModelOptionLabel, hasPremiumModel, isCloudModel, modelOptions, modelSelectorItems, providerDisplayName, selectModelOption } from './app/provider.js'
+import { currentModelSpec, formatModelLabel, formatModelOptionLabel, hasPremiumModel, isCloudModel, modelOptions, modelSelectorItems, selectModelOption } from './app/provider.js'
 import chalk from 'chalk'
 import {
-  shouldCollapse,
-  cleanPastedText,
-  formatPastedTextRef,
-  formatImageRef,
   parsePasteRefs,
   resolveHistoryText,
   deleteRefBackspace,
   resolveSubmitText,
 } from './input/paste_refs.js'
-import { getImageFromClipboard } from './input/clipboard_image.js'
-import { getTextFromClipboard } from './input/clipboard_text.js'
 import { InputImageHistory } from './input/image-history.js'
-import { storeImage, formatImageSourceText } from './input/image_store.js'
-import type { ContentBlock } from '../native/index.js'
-import { tryStartServer, type ServerState } from './app/server.js'
+import { tryStartServer, registerDashboard, stopOwnedServer, ownedDashboardPort, type ServerState } from './app/server.js'
+import { BackgroundScheduler } from '../background/scheduler.js'
+import { inspectConsole } from '../channels/console-client.js'
 import {
-  RESUME_SELECTOR_TITLE,
-  COMPACT_SUMMARY_PREFIX,
+  applySessionText,
+  formatRankedSessionItems,
   formatSessionItems,
-  formatSessionWithTextItems,
-  isResumeSelectorTitle,
+  isInteractiveSession,
   isSessionIdPrefix,
   normalizeResumeQuery,
   resolveSessionByPrefix,
   shortenSessionCwd,
 } from './app/resume.js'
 import { findPreviousSession, shouldPreloadStartupSessions, selectResumeMessages, resumeElidedLine, reloadResumeModel } from './app/session-view.js'
+import { saveSessionRename } from './app/session-rename.js'
 import { handleSelectorControl } from './app/selector-control.js'
 import { decideReplControl, type ReplControlAction } from './app/repl-control.js'
-import { replaceOrPushStatusLine } from './app/status-line.js'
+import { ShareNotices } from '../session/share-notices.js'
+import { CloudSessionSync, cloudBadge, cloudLabel, mergeRemoteSessions } from '../session/cloud-sessions.js'
+import { modelShareEvents } from '../session/share-events.js'
+import { ShareSelector } from './app/share-selector.js'
+import { openWebLink } from './open-link.js'
 import { AuthWatcher } from './app/auth-watch.js'
-import { mergeQueuedIntoEditorText } from './app/queue-restore.js'
+import { AuthIdentityTracker } from './app/auth-identity.js'
+import { RunInteraction, type RunInteractionInput } from './app/run-interaction.js'
+import { ManualCompaction } from './app/manual-compaction.js'
+import { busySubmissionAction } from './app/busy-submission.js'
+import { PendingImages } from './app/pending-images.js'
+import { createPasteHandlers, createPasteStore } from './app/paste-input.js'
+import { createQueueEdit } from './app/queue-edit.js'
 import { BackgroundTerminals } from './app/background-terminals.js'
-import { isBackgroundPanelShortcut, isBackgroundPanelTitle } from './app/background-panel.js'
+import { isBackgroundPanelShortcut } from './app/background-panel.js'
 import {
-  createQueueSelectorState,
   isQueueManageShortcut,
-  type ManagedQueuedPrompt,
 } from './app/queue-manage.js'
+import { FileCompletion } from './app/file-completion.js'
 import { extractAtPrefix, completeAtFile } from '../commands/file-completion.js'
-import { getSkillEntries } from '../commands/skill.js'
+import { getSkillEntries, OFFICIAL_SYNC_INTERVAL_MS, startOfficialSkillMaintenance, type OfficialSyncResult } from '../commands/skill.js'
 import { isCommandWindowBridge, isCommandWindowTypingEvent, resolveCommandWindowTrigger } from './app/command-window-trigger.js'
-import { createSkillSelectorState, isSkillSelectorTitle } from './app/skill-window.js'
+import { createSkillSelectorState } from './app/skill-window.js'
 import { transcriptToMessages } from '../session/transcript.js'
+import { buildCommandPrompt } from '../session/command-envelope.js'
 import { GitInfoProvider } from './git-info.js'
-import { CaretBlink } from './caret-blink.js'
+import { isHostToolEvent } from '../native/contracts/query-event.js'
+import { lastAssistantText, parseSessionSearchResults } from './app/session-search.js'
+import { ResumeSessionCache } from './app/resume-cache.js'
+import { ResumeItemCache } from './app/resume-items.js'
+import { CloudSync, ModelAnnouncer } from './app/cloud-sync.js'
+import { prepareResume } from './app/prepare-resume.js'
+import { campaignContent, refreshCampaigns } from './app/campaigns.js'
+import type { OverlayState } from './app/overlay-state.js'
+import { ResourceScope } from './resource-scope.js'
+import { RenderWakeup } from './render-wakeup.js'
 import { errorText } from '../render/format.js'
+import { buildRunFooterLine } from '../render/run-footer.js'
+import { RunThinking } from '../render/run-thinking.js'
+import { TaskSession } from '../task/session.js'
+import { LoopSession } from '../loop/session.js'
+import { formatLoopWaitLine } from '../loop/wait-line.js'
+import { ensureFeishuDelivery } from '../channels/feishu/setup.js'
+import { waitForSetup } from '../channels/setup-wait.js'
+import { TASK_RUNTIME_DEFAULT_MODEL } from '../task/types.js'
+import {
+  createTaskModelWindow,
+  refreshTaskModelWindow,
+  type TaskModelPickerRequest,
+  type TaskModelSelection,
+} from '../task/model-picker.js'
 import { TerminalTitle } from './title.js'
 import {
   formatLogPaths,
+  judgeTracePath,
+  logAnalysisPrompt,
   handleClipCommand,
   handleCopyCommand,
   handleEnvCommand,
+  handlePrivacyCommand,
   handleShareCommand,
   handleLoginCommand,
   handleLogoutCommand,
@@ -166,10 +215,10 @@ import {
 
 const SPINNER_INTERVAL_MS = 100
 
-type QueuedUserMessage = QueuedPrompt & { text: string; queue: 'steering' | 'follow_up' }
+import { type QueuedUserMessage } from './app/prompt-queue.js'
 type QueuedCompactionSubmission = { displayText: string; expandedText: string; contentJson?: string }
 type CommandWindowPreview =
-  | { kind: 'selector'; trigger: 'model' | 'resume' | 'skill'; sourceText: string; generation: number; state: SelectorState }
+  | { kind: 'selector'; trigger: 'model' | 'resume' | 'skill' | 'task' | 'share'; sourceText: string; generation: number; state: SelectorState }
   | { kind: 'help'; trigger: 'help'; sourceText: string; generation: number }
 
 
@@ -177,9 +226,14 @@ export interface ReplOptions {
   agent: Agent
   resumeSessionId?: string
   continueLatest?: boolean
+  /** Start in a fresh fork of the given session, or of the latest in cwd. */
+  forkFrom?: { sessionId?: string }
   serverPort?: number
   envFile?: string
 }
+
+/** Tab-title frames for a parked loop: a clock hand sweeping a quarter turn per tick. */
+const LOOP_TITLE_CLOCK = ['◴', '◷', '◶', '◵'] as const
 
 export async function startRepl(opts: ReplOptions): Promise<void> {
   const { agent } = opts
@@ -188,15 +242,27 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   const rendererTrace = new RendererTrace()
   const sessionHook = new SessionHook({ cwd: agent.cwd })
   sessionHook.startProcess(agent.cwd)
+  let historyRowCount = 0
+  // Created before the renderer so render diagnostics have a sink from the very
+  // first frame; both are read only while rendering, which starts later.
+  const screenLog = new ScreenLog()
+  const renderDiagnostics = new RenderDiagnostics({
+    log: lines => screenLog.logLines(lines),
+    regions: () => ({ historyRows: historyRowCount, liveRegionStart: liveRegionStartRow }),
+  })
   const renderer = new TermRenderer({
     trace: rendererTrace.isEnabled ? entry => rendererTrace.log(entry) : undefined,
+    onDiagnostic: diagnostic => renderDiagnostics.record(diagnostic),
   })
   renderer.init()
 
   // The composer paints its own caret, so the idle blink is ours to drive.
-  const caretBlink = new CaretBlink({ onChange: () => renderer.requestRender() })
+  const resources = new ResourceScope()
+  const backgroundJobs = new BackgroundScheduler()
+  resources.add(() => backgroundJobs.dispose())
+  const backgroundCleanup = new ResourceScope()
   // Armed by buildFrame only while visible text or its lifecycle needs a wakeup.
-  let adSlotTimer: ReturnType<typeof setTimeout> | undefined
+  const adSlotWakeup = new RenderWakeup(() => renderer.requestRender())
 
   let appState: AppState = {
     ...createInitialState(agent.model, agent.cwd),
@@ -212,6 +278,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   let backgroundWaitSpinner = setSpinnerPhase(createSpinnerState(), 'awaiting_background')
   let backgroundWaitSince: number | null = null
   let manualCompactionPhase: string | null = null
+  let manualCompactionActivity: string | null = null
   let editor: EditorState = createEditorState()
   // Undo stack lives outside EditorState so snapshots stay plain data. Cleared
   // on submit/clear so a previous prompt cannot be restored into a new one.
@@ -225,19 +292,199 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   let streamRef: QueryStream | null = null
   // Native abort settles asynchronously. Ownership is revoked before aborting
   // so an old Promise cannot report twice or clear a newer run's state.
+  const runInteraction = new RunInteraction()
+  function runInteractionInput(): RunInteractionInput {
+    return {
+      active: isLoading,
+      owner: manualCompaction.active ? manualCompaction : isLoading ? runOwnership.owner : null,
+      phase: spinnerState.phase,
+      compacting: manualCompaction.active,
+      localOperation: foregroundCommand !== null,
+      foregroundTasks: backgroundTerminals.foregroundCount(),
+      blockingWaits: backgroundTerminals.blockingWaitCount(),
+      backgroundTasks: backgroundTerminals.runningCount(),
+      backgroundOwner: backgroundTerminals.stopTarget(),
+      backgroundStopping: backgroundTerminals.isStopping(),
+      loopParked: !isLoading && loopSession.waiting,
+      // The start timestamp identifies one loop: `/loop` again, or a stop and
+      // restart, must not inherit an armed confirmation from the previous one.
+      loopOwner: loopSession.snapshot?.startedAt ?? null,
+    }
+  }
   const runOwnership = new RunOwnership()
-  const beginRun = (): number => runOwnership.begin()
+  let runStartedAt: number | null = null
+  let runTurnCount = 0
+  const runThinking = new RunThinking()
+  const beginRun = (): number => {
+    suggestionContext.begin()
+    suggestions.cancelAutomatic()
+    return runOwnership.begin()
+  }
   const ownsRun = (generation: number): boolean => runOwnership.owns(generation)
-  const revokeRun = (): void => runOwnership.revoke()
-  let compactionTask: CompactionTask | null = null
+  const revokeRun = (): void => {
+    suggestions.cancelAutomatic()
+    runOwnership.revoke()
+    taskSession.cancelSetup()
+  }
+  const manualCompaction = new ManualCompaction()
   let queuedCompactionSubmissions: QueuedCompactionSubmission[] = []
   let spinnerTimer: ReturnType<typeof setInterval> | null = null
-  const terminalTitle = new TerminalTitle(agent.cwd, () => serverState?.port ?? null)
+  const terminalTitle = new TerminalTitle(agent.cwd, () => ownedDashboardPort(serverState))
   const setTerminalTitle = terminalTitle.set.bind(terminalTitle)
   const freezeTerminalTitle = terminalTitle.freeze.bind(terminalTitle)
-  const unfreezeTerminalTitle = terminalTitle.unfreeze.bind(terminalTitle)
+  // Releasing a '?' freeze must also repaint — unfreeze() only clears the
+  // flag, so the glyph would linger on the tab until the next title write.
+  // An in-flight run repaints its own frames; otherwise restore the idle
+  // marker the same way overlays like /sessions leave it.
+  // The tab bar is drawn in the system UI font, where U+25CC `◌` (used in
+  // the transcript) often falls back to a bare dot; the clock faces are in
+  // every UI font, and the wait timer below animates them while parked.
+  const idleWaitTitle = (): string => {
+    if (loopSession.waiting) return `${LOOP_TITLE_CLOCK[0]} loop`
+    if (backgroundWaitSince !== null) return '○ bg'
+    return '✳'
+  }
+  const unfreezeTerminalTitle = () => {
+    terminalTitle.unfreeze()
+    if (!isLoading) setTerminalTitle(idleWaitTitle())
+  }
+  let shareSelector: ShareSelector | null = null
+  const loopSession = new LoopSession({
+    runTurn: (userLine, prompt, extension) => {
+      if (userLine) commitUserMessage(userLine)
+      void runQuery(prompt, undefined, undefined, extension)
+    },
+    canWake: () => !isLoading && !destroyed
+      && queuedUserMessages.length + queuedCompactionSubmissions.length === 0
+      && overlay.kind !== 'ask-user',
+    notify: text => commitSystem('sys-loop', `  ${text}`),
+    requestRender: () => renderer.requestRender(),
+    // Read at wakeup time; `backgroundTerminals` is initialised further down
+    // in this scope, long before the first wakeup can fire.
+    backgroundTasks: () => backgroundTerminals.runningProcesses().map(process => ({
+      taskId: process.task_id,
+      command: process.command,
+      elapsedMs: process.elapsed_ms,
+    })),
+    waitingChanged: waiting => {
+      suggestions.cancelAutomatic()
+      if (isLoading) return
+      if (waiting) requestProductSuggestion('loop_waiting')
+      sessionHook.state(waiting ? 'working' : 'idle')
+      setTerminalTitle(idleWaitTitle())
+    },
+  })
+  resources.add(() => loopSession.dispose())
+
+  const taskSession = new TaskSession({
+    privacyStopped: stop => {
+      commitLines(buildPrivacyCard(stop))
+      renderer.requestRender()
+    },
+    dimensions: () => ({ columns: renderer.termCols, rows: renderer.termRows }),
+    envFile: opts.envFile,
+    ensureDelivery: async signal => {
+      const ask = (questions: AskQuestion[]) => presentAskQuestions(questions, 'working', true)
+      return ensureFeishuDelivery({
+        signal, ask,
+        consoleUrl: new URL('/feishu', serverState?.address ?? `http://127.0.0.1:${opts.serverPort ?? 8082}`).href,
+        envFile: () => configInfo?.envPath,
+        console: async () => {
+          await backgroundJobs.trigger('dashboard')
+          if (serverState) return serverState
+          // Setup may explicitly inspect another console even when it is
+          // not eligible for same-config Dashboard reuse.
+          const address = `http://127.0.0.1:${opts.serverPort ?? 8082}`
+          const snapshot = await inspectConsole(address)
+          return { address, envFile: snapshot.env_file_path }
+        },
+        wait: (message, check, signal) => {
+          const owner = Symbol('setup-wait')
+          return waitForSetup({
+            ask: questions => presentAskQuestions(questions, 'working', true, owner),
+            dismiss: () => {
+              if (overlay.kind !== 'ask-user' || overlay.state.owner !== owner) return
+              resolvePendingAsk()
+              overlay = { kind: 'none' }
+              unfreezeTerminalTitle()
+              renderer.requestRender()
+            },
+          }, message, check, signal)
+        },
+      })
+    },
+    configInfo: () => configInfo,
+    activeModelSpec: () => currentModelSpec(configInfo, agent.model),
+    activeModel: () => agent.model,
+    modelOptionLabel: formatModelOptionLabel,
+    isTaskOverlay: () =>
+      overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.task,
+    taskOverlayState: () =>
+      overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.task
+        ? overlay.state
+        : null,
+    showSelector: state => { overlay = { kind: 'selector', state } },
+    currentSessionId: () => sessionId,
+    loadRunTranscript: async id => await agent.findSession(id) ? agent.loadTranscript(id) : null,
+    closeOverlay: () => { overlay = { kind: 'none' } },
+    requestRender: () => renderer.requestRender(),
+    notifyError: text => commitSystem('sys-task-err', renderErrorNotice(text)),
+    notify: text => commitSystem('sys-task', `  ${text}`),
+    hyperlink: url => createHyperlink(url),
+    collectAnswers: questions => presentAskQuestions(questions, 'idle'),
+    presentModelPicker: presentTaskModelPicker,
+    runTaskTurn: (userLine, prompt, extension) => {
+      commitUserMessage(userLine)
+      runQuery(prompt, undefined, undefined, extension)
+    },
+    primeInput: text => {
+      clearAll()
+      editor = insertText(editor, text)
+    },
+    destroyed: () => destroyed,
+  })
+  const taskIdentity = new AuthIdentityTracker(() => taskSession.resetIdentity())
+  const shareNotices = new ShareNotices((sid, notices) => agent.recordShareNotices(sid, notices))
+  // Sessions on the cloud follow the user across machines: pushed after each
+  // run, listed beside local rows, pulled before resume. Never blocks input.
+  let refreshOpenSessionList: (() => void) | undefined
+  const cloudSessions = new CloudSessionSync({
+    indexUpdated: () => refreshOpenSessionList?.(),
+    push: (sid, force) => agent.cloudPushSession(sid, force),
+    list: () => agent.cloudListSessions(),
+    notify: (text, level) => {
+      if (destroyed) return
+      commitSystem('sys-cloud-sync', level === 'error' ? chalk.dim(`  ${text}`) : `  ${text}`)
+      renderer.requestRender()
+    },
+    privacyStopped: (_sid, stop) => {
+      if (destroyed) return
+      commitLines(buildPrivacyCard(stop))
+      renderer.requestRender()
+    },
+  })
+  resources.add(() => cloudSessions.dispose())
+  const sessionCloudLabel = (session: SessionMeta) =>
+    cloudLabel(cloudSessions.stateFor(session), session.cloud?.visibility, session.cloud?.team)
   const replCommands: ReplCommandContext = {
     agent,
+    flushShareNotices: () => shareNotices.flush(),
+    isBusy: () => isLoading,
+    // `/share` is the sessions list narrowed to cloud rows: one list, one
+    // set of keys, rather than a second selector to learn.
+    openShareList: async () => { invalidateResumeSessionCache(); openResumeSelector(undefined, { cloudOnly: true }) },
+    openShareLinks,
+    cloudAcknowledged: (sid, result) => {
+      cloudSessions.acknowledge(sid, result)
+      invalidateResumeSessionCache()
+      if (sid === sessionId) void refreshForkTrail(sid).then(() => renderer.requestRender())
+    },
+    cloudForgotten: sid => {
+      cloudSessions.forget(sid)
+      invalidateResumeSessionCache()
+      if (sid === sessionId) void refreshForkTrail(sid).then(() => renderer.requestRender())
+    },
+    resumeSession: session => resumeSession(session),
     getSessionId: () => sessionId,
     getCompactLines: () => compactLines,
     getConfigInfo: () => configInfo ?? null,
@@ -249,14 +496,98 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     requestRender: () => renderer.requestRender(),
   }
   let destroyed = false
+  let composerRevision = 0
+  let suggestionContextId = 0
+  const suggestionContext = new SuggestionContext()
+  // What masking did this process, shown as it happens.
+  const privacyFeed = new PrivacyFeed(privacyLive)
+  function commitPrivacyHappenings(): void {
+    for (const { notice, fresh } of privacyFeed.poll(sessionId)) commitLines(buildPrivacyHappeningCard(notice, fresh))
+  }
+  let suggestionsReady = false
+  let startupSuggestion: SuggestionTrigger | null = null
+  function composerPolicy() {
+    const interaction = runInteraction.snapshot(runInteractionInput())
+    return resolveComposerGuidance({ interaction,
+      mode: logMode ? 'log' : 'normal',
+      queuedCount: queuedUserMessages.length + queuedCompactionSubmissions.length })
+  }
+  // Explicit Tab can wait for referenced image bytes without blocking input.
+  // A submit already parked on an image load still owns the composer.
+  function suggestionInputReady(): boolean {
+    return suggestionsReady && !destroyed && overlay.kind === 'none' && !commandWindowPreview
+      && !editor.completion && !pendingImages.awaiting
+  }
+  function automaticSuggestionEligible(): boolean {
+    // Run interaction distinguishes active work from a blocking tool wait;
+    // isLoading alone cannot, since both still own the same agent turn.
+    // A loop between its timer and its run is neither parked nor waiting.
+    return (isLoading || !loopSession.active || loopSession.waiting) && composerPolicy().allowSuggestion
+  }
+  function suggestionInventory(): CommandInventory {
+    return {
+      models: modelOptions(configInfo, agent.model).map(model => ({ value: model.spec, label: formatModelOptionLabel(model) })),
+      sessions: (resumeCache.metadata ?? []).filter(session => session.session_id !== sessionId)
+        .map(session => ({ value: session.session_id, label: session.title || session.session_id })),
+    }
+  }
+  function requestProductSuggestion(trigger: SuggestionTrigger): void {
+    if (!suggestionsReady) { startupSuggestion = trigger; return }
+    suggestions.start(trigger)
+  }
+  const suggestionTicker = new SuggestionTicker({
+    pending: () => suggestions.pending(),
+    changed: () => renderer.requestRender(),
+  })
+  const suggestions = new PromptSuggestion({
+    // Only session/mode/composer changes invalidate explicit input assistance;
+    // foreground run ownership and progress are deliberately not part of it.
+    key: () => `${suggestionContextId}:${!!logMode}`,
+    eligible: suggestionInputReady,
+    automaticEligible: automaticSuggestionEligible,
+    context: () => suggestionContext.snapshot(liveWorkflowRuntime()),
+    validate: text => validCommandInput(text, suggestionInventory),
+    identity: text => commandIdentity(text, suggestionInventory),
+    allowsCommand: text => allowedSuggestionCommand(text, composerPolicy().allowedCommands),
+    start: (messages, hints) => {
+      const draft = (hints?.draft ?? '') + (hints?.suffix ?? '')
+      if (!parsePasteRefs(draft).some(ref => ref.type === 'image')) return agent.suggestNextPrompt(messages, hints)
+      return prepareSuggestion(async signal => {
+        const images = await suggestionImages(draft, pastedImages, pendingImages, signal)
+        signal.throwIfAborted()
+        if (getEditorText(editor) !== draft || editorCursorOffset(editor) !== (hints?.draft?.length ?? 0)) throw new Error('Suggestion input changed')
+        return agent.suggestNextPrompt(messages, { ...hints, images })
+      })
+    },
+    draft: () => getEditorText(editor),
+    cursor: () => editorCursorOffset(editor),
+    changed: () => { suggestionTicker.sync(); renderer.requestRender() },
+    // Automatic sampling is otherwise invisible; a rejected key would stay
+    // silent for days. Say it once, then pause until credentials change.
+    unauthorized: () => commitSystem('sys-suggestion-auth',
+      chalk.dim('  Inline suggestions paused: the suggestion service rejected its key. /login refreshes it; ⇥ retries.')),
+  })
+  const suggestionTaskWait = new TaskWaitSuggestion(suggestions)
+  const suggestionInput = createSuggestionInput({
+    controller: suggestions,
+    eligible: suggestionInputReady,
+    editor: () => editor,
+    replace: text => mutateEditor(state => replaceAfterCursor(state, text)),
+    changed: () => renderer.requestRender(),
+    dismissed: () => runInteraction.clear(),
+    inventory: suggestionInventory,
+    showArguments: completion => { editor = showCompletions(editor, completion.items, completion.start, completion.end, completion.note) },
+  })
+  resources.add(() => { suggestions.cancel(); suggestionTicker.dispose() })
   let disableRaw: (() => void) | null = null
   let enhancedKeyboard: EnhancedKeyboardSession | null = null
   let inputBuffer: TerminalInputBuffer | null = null
   let escapeFlushTimer: ReturnType<typeof setTimeout> | undefined
   let onInputData: ((data: Buffer | string) => void) | null = null
   let sessionId: string | null = null
+  /** Fork ancestry of the current session, root → current; for exit hints. */
+  let lastLineage: SessionMeta[] = []
   let nextBackgroundLineId = 1
-  let planning = false
   let logMode: import('../native/index.js').ForkedAgent | null = null
   let exitHint = false
   let exitHintTimer: ReturnType<typeof setTimeout> | null = null
@@ -266,32 +597,66 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   let focusedCommandWindowGeneration: number | null = null
   let commandWindowContentLines: string[] | null = null
   let commandWindowContentWidth: number | null = null
+  let selectorPreviewViewport: PreviewViewport | undefined
   let deferredCloudModelNotice: string | null = null
   let deferredCloudCampaignId: string | null = null
+  let deferredSkillNotice: string | null = null
   let enrichedResumeMetadataGeneration: number | null = null
   let enrichedResumeTextGeneration: number | null = null
   let resumeCommandLoadTimer: ReturnType<typeof setTimeout> | undefined
   let resumeSearchEnrichmentTimer: ReturnType<typeof setTimeout> | undefined
   /** Cancels the in-progress search-text warm-up, if one is running. */
   let cancelSearchTextWarmup: (() => void) | null = null
-  let resumeSessionsCache: SessionMeta[] | null = null
-  let resumeSessionsCacheComplete = false
-  let resumeSessionsCacheGeneration = 0
-  let resumeSessionsPreviewLoad: Promise<SessionMeta[]> | null = null
-  let resumeSessionsLoad: Promise<SessionMeta[]> | null = null
-  let resumeSessionsWithTextCache: SessionWithText[] | null = null
-  let resumeSessionsWithTextLoad: Promise<SessionWithText[]> | null = null
+  let preloadedSessions: SessionMeta[] = []
+  const resumeCache = new ResumeSessionCache(agent, rows => { preloadedSessions = rows })
+  resources.add(() => resumeCache.dispose())
+  // Reuses formatted rows across the rekey that every `/sessions` keystroke
+  // performs, which also preserves the selector's lowercased-search cache.
+  const resumeItems = new ResumeItemCache()
+  resources.add(() => resumeItems.clear())
   /** Invalidates callbacks belonging to an explicitly submitted `/resume`. */
   let explicitResumeSelectorGeneration = 0
   // Assigned after configInfo below, which decides the premium intake filter.
   let adSlot: AdSlotState
-  // Promise-based bridge for the ask-user overlay. Both the `ask_user` host
-  // tool and the plan-review flow present questions through the same overlay
-  // and await the user's answers here. Resolves with the collected answers, or
-  // null when the user cancels/skips.
+  // Promise-based bridge for ask-user overlays (host tools and task actions).
+  // Resolves with the collected answers, or null when the user cancels/skips.
   let pendingAsk: ((answers: AskUserAnswer[] | null) => void) | null = null
+  let pendingTaskModel: ((selection: TaskModelSelection | null) => void) | null = null
 
-  /** Resolve any awaiting ask/plan-review overlay as cancelled. Safe to call
+  function resolvePendingTaskModel(selection: TaskModelSelection | null = null) {
+    if (!pendingTaskModel) return
+    const resolve = pendingTaskModel
+    pendingTaskModel = null
+    sessionHook.state('working')
+    unfreezeTerminalTitle()
+    resolve(selection)
+  }
+
+  function presentTaskModelPicker(
+    request: TaskModelPickerRequest,
+  ): Promise<TaskModelSelection | null> {
+    resolvePendingTaskModel()
+    // Match /model: open immediately from the latest local config, then let a
+    // cloud sync refresh the catalog in place without blocking interaction.
+    refreshConfigInfo()
+    sessionHook.state('blocked')
+    overlay = {
+      kind: 'selector',
+      state: createTaskModelWindow(
+        configInfo,
+        agent.model,
+        request.preferredSpec,
+        request.preferredThinkingLevel,
+        request.note,
+      ),
+    }
+    freezeTerminalTitle('?')
+    renderer.requestRender()
+    void syncCloudNow(true)
+    return new Promise(resolve => { pendingTaskModel = resolve })
+  }
+
+  /** Resolve any awaiting ask-user overlay as cancelled. Safe to call
    *  on every teardown path (interrupt, cancel, overlay close, re-present) so a
    *  suspended host-tool dispatch never strands the run loop. */
   function resolvePendingAsk() {
@@ -304,12 +669,14 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   function presentAskQuestions(
     questions: AskQuestion[],
     resumeState: 'working' | 'idle' = 'working',
+    transient = false,
+    owner?: symbol,
   ): Promise<AskUserAnswer[] | null> {
     // Only one ask overlay can be active at a time; resolve any prior one as
     // cancelled before opening the next.
     resolvePendingAsk()
     sessionHook.state('blocked')
-    overlay = { kind: 'ask-user', state: createAskState(questions) }
+    overlay = { kind: 'ask-user', state: { ...createAskState(questions), transient, owner } }
     freezeTerminalTitle('?')
     renderer.requestRender()
     return new Promise(resolve => {
@@ -329,82 +696,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       })),
     )
 
-  // Plan-mode state (pi-style): `/plan` enters read-only planning, the model
-  // writes a `Plan:` section, and after the turn the extracted steps drive an
-  // Execute / Stay / Refine review. Progress is not rendered as a sticky
-  // checklist (it only advances on turn-end [DONE:n] tags and is easy to stick
-  // when a step is never tagged). The review overlay owns the plan display.
-  let planModeItems: PlanModeItem[] = []
-  let lastReviewedPlanMarkdown = ''
-
-  function latestAssistantMarkdown(): string | null {
-    return findLastAssistantMarkdown(compactLines)?.rawMarkdown ?? null
-  }
-
-  async function maybeReviewPlanAfterTurn(): Promise<void> {
-    if (!planning) return
-    const markdown = latestAssistantMarkdown()
-    if (!markdown || markdown === lastReviewedPlanMarkdown) return
-    const extracted = extractPlanItems(markdown)
-    if (extracted.length === 0) return
-
-    lastReviewedPlanMarkdown = markdown
-    planModeItems = extracted
-    renderer.requestRender()
-
-    const planList = planModeItems.map(item => `${item.step}. ☐ ${item.text}`).join('\n')
-    const answers = await presentAskQuestions([
-      {
-        header: 'Plan',
-        question: `Plan mode - what next?\n${planList}\n\nChoose an action, or type refinement feedback as custom text.`,
-        options: [
-          { label: 'Execute the plan', description: 'Leave plan mode and restore write tools.' },
-          { label: 'Stay in plan mode', description: 'Keep planning without executing yet.' },
-          { label: 'Refine the plan', description: 'Return to the prompt to enter refinement feedback.' },
-        ],
-      },
-    ], 'idle')
-    if (!answers || answers.length === 0) return
-
-    const choice = answers[0]!.answer
-    if (choice === 'Execute the plan') {
-      planning = false
-      commitSystem('sys-plan-exec', '  planning: off · executing plan')
-      const remaining = planModeItems
-        .map(item => `${item.step}. ${item.text}`)
-        .join('\n')
-      // Drop the sticky checklist for execution: it only advanced on turn-end
-      // [DONE:n] tags and stuck when a step was never tagged.
-      planModeItems = []
-      const execMessage = `Execute the plan.\n\nRemaining steps:\n${remaining}\n\nExecute each step in order.`
-      commitLines(buildUserMessage(execMessage))
-      await runQuery(execMessage)
-      return
-    }
-
-    if (choice === 'Stay in plan mode' || choice === 'Skipped') {
-      commitSystem('sys-plan-stay', '  planning: on · staying in plan mode')
-      renderer.requestRender()
-      return
-    }
-
-    if (choice === 'Refine the plan') {
-      editor = insertText(clearEditor(editor), 'Refine the plan: ')
-      commitSystem('sys-plan-refine', '  planning: on · enter refinement feedback')
-      renderer.requestRender()
-      return
-    }
-
-    commitLines(buildUserMessage(choice))
-    await runQuery(choice)
-  }
   let streamMachine: StreamMachineState | null = null
   // Messages sent mid-stream: held in the prompt zone (pi-style ❯ queue) and
   // committed to history when steering consumes them at the next safe boundary,
   // so they never render above the still-streaming reply.
   let queuedUserMessages: QueuedUserMessage[] = []
-  let editingQueuedPrompt: ManagedQueuedPrompt | null = null
-  let stashedQueueEditDraft = ''
   let expanded = false
   // Rendered-history cache — see HistoryRenderCache. Committed history is
   // append-only (or fully cleared), never mutated in place, so the flattened
@@ -415,9 +711,20 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   // source arrays are appended independently (expanded-only progress/thinking).
   const compactHistoryCache = new HistoryRenderCache()
   const expandedHistoryCache = new HistoryRenderCache()
+  /**
+   * Height of the committed prefix's two parts as last painted. The renderer
+   * treats that prefix as append-only by index, so a reshape must be announced.
+   * Tracked separately because only history may grow: a banner gaining a row
+   * pushes history down, which is a shift, not an append.
+   */
+  let committedBannerRows: number | null = null
+  let committedHistoryRows = 0
+  let committedPrefixMayReshape = false
   function resetHistoryCache() {
     compactHistoryCache.reset()
     expandedHistoryCache.reset()
+    // A rebuild can lay the same history out at a different height.
+    committedPrefixMayReshape = true
   }
 
   function nextCommandWindowGeneration(): number {
@@ -439,15 +746,35 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (commandWindowMounted()) return
     const modelNotice = deferredCloudModelNotice
     const campaignId = deferredCloudCampaignId
+    const skillNotice = deferredSkillNotice
     deferredCloudModelNotice = null
     deferredCloudCampaignId = null
+    deferredSkillNotice = null
     if (modelNotice) commitSystem('sys-cloud-models', chalk.dim(modelNotice))
+    if (skillNotice) commitSystem('sys-skills-sync', chalk.dim(skillNotice))
     if (campaignId) showCloudCampaign(campaignId)
+  }
+
+  /** The official catalog moved and this device followed it. Said once, in one
+   *  dim line, and never over an open command window. */
+  function noteOfficialSkillSync(result: OfficialSyncResult): void {
+    const parts = [
+      result.installed.length ? `new: ${result.installed.join(', ')}` : '',
+      result.updated.length ? `updated: ${result.updated.join(', ')}` : '',
+      result.removed.length ? `removed: ${result.removed.join(', ')}` : '',
+    ].filter(Boolean)
+    if (!parts.length) return
+    const notice = `  ↻ Official skills ${parts.join(' · ')}`
+    refreshBannerData()
+    if (commandWindowMounted()) deferredSkillNotice = notice
+    else commitSystem('sys-skills-sync', chalk.dim(notice))
+    renderer.requestRender()
   }
 
   function releaseCommandWindowLayout(): void {
     commandWindowContentLines = null
     commandWindowContentWidth = null
+    selectorPreviewViewport = undefined
     // The window is gone, so its search-text warm-up has nothing left to serve.
     // Cancelling here rather than per keystroke keeps warming alive across
     // typing inside an open window, which is exactly when it is needed.
@@ -456,20 +783,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   function modelSelectorState(): SelectorState {
-    const models = modelOptions(configInfo, agent.model)
-    const activeSpec = currentModelSpec(configInfo, agent.model)
-    return selectorFocusOn(
-      {
-        ...createSelectorState('Models', modelSelectorItems(models, activeSpec)),
-        presentation: 'model',
-        circularNavigation: true,
-        // Same contract as every other command window: the composer keeps
-        // focus while this previews, so the search input must not claim the
-        // caret before an arrow promotes the list.
-        listFocused: false,
-      },
-      item => item.id === activeSpec,
-    )
+    return createModelWindow(configInfo, agent.model)
   }
 
   function skillSelectorState(): SelectorState {
@@ -477,85 +791,13 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   function resumeSelectorState(items: SelectorItem[], initialQuery?: string): SelectorState {
-    const state = createSelectorState(RESUME_SELECTOR_TITLE, items, items, initialQuery)
-    return {
-      ...state,
-      // The slash-command composer owns focus until the first arrow. Keeping
-      // this explicit prevents the filter caret and a session pointer from
-      // appearing active at the same time.
-      listFocused: false,
-      ...(state.query.length === 0 && state.items.length === 0 && state.allItems.some(item => !item.header)
-        ? { emptyMessage: 'No sessions in current cwd · type to search all sessions' }
-        : {}),
-    }
+    // An explicitly opened list owns `e`/`d`; the command preview below does not.
+    return createResumeWindow(items, initialQuery, true)
   }
 
-  function isStableCommandSelector(state: SelectorState): boolean {
-    return isResumeSelectorTitle(state.title)
-      || state.presentation === 'model'
-      || isSkillSelectorTitle(state.title)
-  }
-
-  function fullResumeSelectorSlotState(): SelectorState {
-    const items = Array.from({ length: SELECTOR_VIEWPORT + 2 }, (_, index) => ({
-      id: `command-window-slot-${index}`,
-      label: `session-${index}`,
-      detail: 'source title [1 turn] now',
-      preview: ['Session title', 'model · 1 turn · now'],
-    }))
-    return {
-      ...createSelectorState(RESUME_SELECTOR_TITLE, items),
-      subtitle: 'Recent sessions',
-      focusIndex: 1,
-      scrollOffset: 1,
-    }
-  }
-
-  function fullModelSelectorSlotState(): SelectorState {
-    const items = Array.from({ length: 7 }, (_, groupIndex) => {
-      const group = `Provider ${groupIndex}`
-      return [
-        { label: group, header: true, focusable: false, group },
-        { id: `provider-${groupIndex}:model`, label: `Model ${groupIndex}`, group },
-      ]
-    }).flat()
-    return {
-      ...createSelectorState('Models', items),
-      presentation: 'model',
-      circularNavigation: true,
-      // Center a model row in an overflowing viewport. Alternating one-model
-      // groups exercise every separator row the model renderer can insert.
-      focusIndex: 7,
-    }
-  }
-
-  function commandSelectorRegionLines(state: SelectorState, active: boolean): string[] {
-    const lines = buildSelectorRegionLines(
-      state,
-      renderer.termCols,
-      renderer.termRows,
-      active,
-    )
-    const fullResumeHeight = buildSelectorRegionLines(
-      fullResumeSelectorSlotState(),
-      renderer.termCols,
-      renderer.termRows,
-      false,
-    ).length
-    const fullModelHeight = buildSelectorRegionLines(
-      fullModelSelectorSlotState(),
-      renderer.termCols,
-      renderer.termRows,
-      false,
-    ).length
-    const slotHeight = Math.max(fullResumeHeight, fullModelHeight)
-    // Reserve the fully populated selector geometry from the first loading
-    // frame. Session rows can then arrive asynchronously without growing the
-    // live region, and bridge/model transitions replace content in place.
-    return [
-      ...Array(Math.max(0, slotHeight - lines.length)).fill(''),
-      ...lines,
-    ]
+  /** The `/share` list keeps its details pane: the link it is opened for lives there. */
+  function cloudSelectorState(items: SelectorItem[]): SelectorState {
+    return createResumeWindow(items, undefined, true, true)
   }
 
   function currentResumeCommandWindowState(generation: number): SelectorState | null {
@@ -571,7 +813,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (
       focusedCommandWindowGeneration === generation
       && overlay.kind === 'selector'
-      && isResumeSelectorTitle(overlay.state.title)
+      && overlay.state.owner === SELECTOR_OWNER.resume
+      && overlay.state.sessionScope !== 'cloud'
     ) {
       return overlay.state
     }
@@ -592,7 +835,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (
       focusedCommandWindowGeneration === generation
       && overlay.kind === 'selector'
-      && isResumeSelectorTitle(overlay.state.title)
+      && overlay.state.owner === SELECTOR_OWNER.resume
+      && overlay.state.sessionScope !== 'cloud'
     ) {
       overlay = { kind: 'selector', state }
       renderer.requestRender()
@@ -605,19 +849,22 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // Keep every keystroke bounded: the composer preview is recognition aid,
     // not the full search surface. Never format transcript text here, and cap
     // metadata work to the same recent-session budget used at startup.
-    const recent = (resumeSessionsCache ?? []).slice(0, 20)
-    if (recent.length > 0) {
-      const items = formatSessionItems(recent, agent.cwd)
+    const snapshot = resumeCache.metadata ?? []
+    if (snapshot.length > 0) {
+      const items = resumeItems.format(
+        { sessions: snapshot, cwd: agent.cwd, textVersion: resumeCache.textVersion, limit: 20, openSessionId: sessionId },
+        id => resumeCache.sessionText(id),
+      )
       return resumeSelectorState(items)
     }
-    if (resumeSessionsCacheComplete) {
+    if (resumeCache.complete) {
       return {
-        ...createSelectorState(RESUME_SELECTOR_TITLE, []),
+        ...createResumeWindow([]),
         emptyMessage: 'No sessions found',
       }
     }
     return {
-      ...createSelectorState(RESUME_SELECTOR_TITLE, []),
+      ...createResumeWindow([]),
       emptyMessage: 'Loading sessions…',
     }
   }
@@ -628,9 +875,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     limit?: number,
   ): boolean {
     const current = currentResumeCommandWindowState(generation)
-    if (!current) return false
-    const visibleSessions = limit === undefined ? sessions : sessions.slice(0, limit)
-    const items = formatSessionItems(visibleSessions, agent.cwd)
+    if (!current || current.rename) return false
+    const items = resumeItems.format(
+      { sessions, cwd: agent.cwd, textVersion: resumeCache.textVersion, limit, openSessionId: sessionId },
+      id => resumeCache.sessionText(id),
+    )
     const {
       emptyMessage: _loadingMessage,
       subtitle: _loadingSubtitle,
@@ -646,13 +895,44 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
             ? 'No sessions in current cwd · type to search all sessions'
             : 'No sessions found',
         }
-    return updateResumeCommandWindow(generation, next)
+    const applied = updateResumeCommandWindow(generation, next)
+    if (applied) {
+      loadFocusedResumePreview(next)
+    }
+    return applied
   }
 
   function cancelResumeCommandLoad(): void {
     if (!resumeCommandLoadTimer) return
     clearTimeout(resumeCommandLoadTimer)
     resumeCommandLoadTimer = undefined
+  }
+
+  /** Unmount callback of the `/task` preview, while one is showing. */
+  let unmountTaskPreview: (() => void) | null = null
+
+  /** Stop every command preview's background work: a window is going away
+   *  or changing identity, so nothing started for it may repaint. */
+  function cancelCommandWindowLoads(): void {
+    cancelResumeCommandLoad()
+    unmountTaskPreview?.()
+    unmountTaskPreview = null
+  }
+
+  /** Mount the Task list under the composer. The session repaints through
+   *  the listener for as long as it stays mounted: typing on within `/task`
+   *  rekeys the window's generation but keeps this mount, and every teardown
+   *  goes through `cancelCommandWindowLoads`, so no generation check is
+   *  needed here. */
+  function taskPreviewState(): SelectorState {
+    const mounted = taskSession.preview(() => {
+      if (commandWindowPreview?.kind === 'selector' && commandWindowPreview.trigger === 'task') {
+        commandWindowPreview = { ...commandWindowPreview, state: taskSession.previewState() }
+        renderer.requestRender()
+      }
+    })
+    unmountTaskPreview = mounted.unmount
+    return mounted.state
   }
 
   function isActiveResumePreview(generation: number): boolean {
@@ -668,7 +948,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (!isActiveResumePreview(generation)) return
 
     const current = currentResumeCommandWindowState(generation)
-    if (current && resumeSessionsCache === null) {
+    if (current && resumeCache.metadata === null) {
       updateResumeCommandWindow(
         generation,
         current.items.length === 0
@@ -689,11 +969,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     resumeCommandLoadTimer = setTimeout(() => {
       resumeCommandLoadTimer = undefined
       if (!isActiveResumePreview(generation)) return
-      void loadResumeSessionPreview().then(sessions => {
+      void resumeCache.preview().then(sessions => {
         if (!isActiveResumePreview(generation)) return
         applyResumeSessions(generation, sessions, 20)
 
-        void loadResumeSessions().then(allSessions => {
+        void resumeCache.all().then(allSessions => {
           if (!isActiveResumePreview(generation)) return
           if (applyResumeSessions(generation, allSessions)) {
             enrichedResumeMetadataGeneration = generation
@@ -745,6 +1025,9 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   function scheduleFocusedResumeEnrichment(generation: number, includeText = false): void {
+    // Share uses the same navigation owner, but must never load the full
+    // local catalog when arrow keys or search request resume enrichment.
+    if (!currentResumeCommandWindowState(generation)) return
     cancelResumeCommandLoad()
     cancelResumeSearchEnrichment()
     if (
@@ -762,21 +1045,19 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       resumeSearchEnrichmentTimer = undefined
       if (!currentResumeCommandWindowState(generation)) return
 
-      const metadata = resumeSessionsCacheComplete && resumeSessionsCache !== null
-        ? Promise.resolve(resumeSessionsCache)
-        : loadResumeSessions()
+      const metadata = resumeCache.all()
       void metadata.then(sessions => {
         if (!applyResumeSessions(generation, sessions)) return
         enrichedResumeMetadataGeneration = generation
         if (!includeText) return
 
-        const withText = resumeSessionsWithTextCache !== null
-          ? Promise.resolve(resumeSessionsWithTextCache)
-          : loadResumeSessionsWithText()
-        return withText.then(sessionsWithText => {
+        return resumeCache.text().then(sessionsWithText => {
           const current = currentResumeCommandWindowState(generation)
-          if (!current) return
-          const fullItems = formatSessionWithTextItems(sessionsWithText, agent.cwd)
+          if (!current || current.rename) return
+          const fullItems = resumeItems.format(
+            { sessions: sessionsWithText, cwd: agent.cwd, textVersion: resumeCache.textVersion, openSessionId: sessionId },
+            id => resumeCache.sessionText(id),
+          )
           if (updateResumeCommandWindow(generation, selectorExpandItems(current, fullItems))) {
             enrichedResumeTextGeneration = generation
             // Transcript text just became searchable. Lowercase it in idle
@@ -795,14 +1076,58 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }, 160)
   }
 
+  /**
+   * The resume list currently on screen, with the setter that owns it.
+   *
+   * A resume list lives either in the composer preview or in the promoted
+   * overlay. Both need the focused row's preview filled in, so the loader
+   * addresses whichever one is mounted instead of only the overlay.
+   */
+  function resumeSurface(): { state: SelectorState; apply: (state: SelectorState) => void } | null {
+    if (commandWindowPreview?.kind === 'selector' && commandWindowPreview.trigger === 'resume') {
+      const mounted = commandWindowPreview
+      return { state: mounted.state, apply: state => { commandWindowPreview = { ...mounted, state } } }
+    }
+    if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.resume) {
+      return { state: overlay.state, apply: state => { overlay = { kind: 'selector', state } } }
+    }
+    return null
+  }
+
+  /**
+   * Fill the focused row's preview from its own transcript.
+   *
+   * The pane shows one session at a time, so only that session is read. Reading
+   * the whole catalog to render one pane costs a transcript read per session,
+   * which on a large history left the pane empty long enough to look broken.
+   */
+  function loadFocusedResumePreview(state: SelectorState): void {
+    if (state.rename) return
+    const focused = state.items[state.focusIndex]
+    // One-line rows have no pane to fill; skip the transcript read.
+    if (!focused || focused.header || !focused.id || !focused.preview) return
+    const id = focused.id
+    void resumeCache.loadSessionText(id).then(text => {
+      if (!text) return
+      const surface = resumeSurface()
+      const stillFocused = surface?.state.items[surface.state.focusIndex]
+      // Focus moved on, or the list was replaced: a later focus reloads from
+      // the cache, so there is nothing to reconcile here.
+      if (!surface || surface.state.rename || !stillFocused || stillFocused.id !== id) return
+      surface.apply(selectorReplaceItem(surface.state, id,
+        applySessionText(stillFocused, text, agent.cwd, sessionId, surface.state.sessionScope === 'cloud')))
+      renderer.requestRender()
+    })
+  }
+
   function refreshCommandWindowPreview(allowMount: boolean): void {
-    if (overlay.kind !== 'none' || isLoading || editingQueuedPrompt) {
+    if (overlay.kind !== 'none' || isLoading || queueEdit.editingEntry()) {
       // A promoted command window continues to own its generation so an
       // in-flight resume load can update the focused selector. Other overlays
       // invalidate any stale preview request.
       if (commandWindowPreview) {
         commandWindowPreview = null
-        cancelResumeCommandLoad()
+        cancelCommandWindowLoads()
         nextCommandWindowGeneration()
         releaseCommandWindowLayout()
       } else if (focusedCommandWindowGeneration === null) {
@@ -826,13 +1151,13 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         const preview = commandWindowPreview
         const generation = nextCommandWindowGeneration()
         commandWindowPreview = { ...preview, sourceText, generation }
-        cancelResumeCommandLoad()
+        cancelCommandWindowLoads()
         renderer.requestRender()
         return
       }
       if (commandWindowPreview) {
         commandWindowPreview = null
-        cancelResumeCommandLoad()
+        cancelCommandWindowLoads()
         nextCommandWindowGeneration()
         releaseCommandWindowLayout()
         renderer.requestRender()
@@ -846,10 +1171,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       commandWindowPreview = { ...preview, sourceText, generation }
       renderer.requestRender()
       if (trigger === 'resume') scheduleResumeCommandLoad(generation)
+      if (trigger === 'share') loadShareCommandWindow(generation)
       return
     }
 
-    cancelResumeCommandLoad()
+    cancelCommandWindowLoads()
     const generation = nextCommandWindowGeneration()
     if (trigger === 'help') {
       commandWindowPreview = { kind: 'help', trigger, sourceText, generation }
@@ -878,16 +1204,90 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       renderer.requestRender()
       return
     }
+    if (trigger === 'share') {
+      commandWindowPreview = {
+        kind: 'selector', trigger, sourceText, generation,
+        state: {
+          ...cloudSelectorState([]), title: 'Cloud sessions', sessionScope: 'cloud', listFocused: false,
+          emptyMessage: 'Loading sessions…',
+        },
+      }
+      renderer.requestRender()
+      loadShareCommandWindow(generation)
+      return
+    }
+    if (trigger === 'task') {
+      commandWindowPreview = {
+        kind: 'selector',
+        trigger,
+        sourceText,
+        generation,
+        state: taskPreviewState(),
+      }
+      renderer.requestRender()
+      return
+    }
 
     commandWindowPreview = {
       kind: 'selector',
       trigger,
       sourceText,
       generation,
-      state: resumeSelectorStateFromCache(),
+      // The composer holds the text here, so typing stays search.
+      state: { ...resumeSelectorStateFromCache(), listFocused: false },
     }
     renderer.requestRender()
     scheduleResumeCommandLoad(generation)
+  }
+
+  /** The cloud list previews while typing, without invoking /share actions. */
+  function loadShareCommandWindow(generation: number): void {
+    const current = (): SelectorState | null => {
+      if (generation !== commandWindowPreviewGeneration) return null
+      if (commandWindowPreview?.kind === 'selector'
+        && commandWindowPreview.trigger === 'share'
+        && commandWindowPreview.generation === generation
+        && resolveCommandWindowTrigger(commandWindowPreview.sourceText) === 'share') {
+        return commandWindowPreview.state
+      }
+      if (focusedCommandWindowGeneration === generation
+        && overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.resume
+        && overlay.state.sessionScope === 'cloud') {
+        return overlay.state
+      }
+      return null
+    }
+    const repaint = () => {
+      const state = current()
+      if (!state) return
+      const sessions = mergeRemoteSessions(resumeCache.metadata ?? [], cloudSessions.remoteSessions)
+        .filter(session => sessionCloudLabel(session) !== '')
+      // Every shared session, whichever project or machine it came from.
+      const items = formatSessionItems(sessions, agent.cwd, id => resumeCache.sessionText(id), sessionId, sessionCloudLabel,
+        { showOtherCwds: true, cloudFirst: true })
+      const next = {
+        ...selectorExpandItems(state, items),
+        emptyMessage: 'No shared sessions yet · /share private to sync, /share public to publish',
+      }
+      if (commandWindowPreview?.kind === 'selector' && commandWindowPreview.trigger === 'share') {
+        commandWindowPreview = { ...commandWindowPreview, state: next }
+      } else {
+        overlay = { kind: 'selector', state: next }
+      }
+      renderer.requestRender()
+    }
+    refreshOpenSessionList = repaint
+    void Promise.all([resumeCache.all(), cloudSessions.refreshIndex()]).then(repaint).catch((error: unknown) => {
+      const state = current()
+      if (!state) return
+      const next = { ...state, emptyMessage: `Failed to list sessions: ${errorText(error)}` }
+      if (commandWindowPreview?.kind === 'selector' && commandWindowPreview.trigger === 'share') {
+        commandWindowPreview = { ...commandWindowPreview, state: next }
+      } else {
+        overlay = { kind: 'selector', state: next }
+      }
+      renderer.requestRender()
+    })
   }
 
   function activateCommandWindow(event: KeyEvent): boolean {
@@ -899,7 +1299,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (preview.kind === 'selector') {
       // Use the same navigation path as an open selector so the first arrow
       // both focuses the list and moves from the preview's highlighted row.
-      const action = handleSelectorControl(preview.state, event)
+      const action = handleSelectorControl(preview.state, event, renderer.termCols, renderer.termRows, selectorPreviewViewport)
       if (action.kind !== 'update') return false
       overlay = { kind: 'selector', state: action.state }
     } else {
@@ -909,9 +1309,27 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // Help remains a modal rather than participating in the stable
     // selector/composer layout. Consume its command on activation so closing
     // the modal cannot immediately recreate the same preview from `/help`.
-    if (preview.kind === 'help') clearAll()
+    // Once the task picker owns the keyboard, `/task` is no longer a draft.
+    // Leaving it in the editor made a background task edit look like it was
+    // responding while the same command was still waiting to be submitted.
+    if (preview.kind === 'help' || preview.trigger === 'task') clearAll()
     renderer.requestRender()
-    if (preview.trigger === 'resume') scheduleFocusedResumeEnrichment(preview.generation)
+    if (preview.trigger === 'resume') {
+      scheduleFocusedResumeEnrichment(preview.generation)
+      if (overlay.kind === 'selector') {
+        loadFocusedResumePreview(overlay.state)
+      }
+    }
+    if (preview.trigger === 'share' && overlay.kind === 'selector') {
+      loadFocusedResumePreview(overlay.state)
+    }
+    if (preview.trigger === 'task') {
+      // The list is now the overlay: from here the session owns refresh,
+      // detail loading and keys exactly as after `/task` + Enter.
+      unmountTaskPreview?.()
+      unmountTaskPreview = null
+      if (overlay.kind === 'selector') taskSession.open(overlay.state.items[overlay.state.focusIndex]?.id)
+    }
     return true
   }
 
@@ -934,16 +1352,21 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
   const compactLines: OutputLine[] = []
   const expandedLines: OutputLine[] = []
-  let fdAbort: AbortController | null = null
-  const screenLog = new ScreenLog()
+  const fileCompletion = new FileCompletion(completeAtFile)
+  resources.add(() => fileCompletion.dispose())
   const committer = new Committer({
     compactLines,
     expandedLines,
     isExpanded: () => expanded,
     columns: () => renderer.termCols,
     logLines: lines => screenLog.logLines(lines),
+    notices: lines => shareNotices.record(sessionId, lines),
     requestRender: () => renderer.requestRender(),
-    invalidateHistory: () => resetHistoryCache(),
+    invalidateHistory: () => {
+      resetHistoryCache()
+      // An in-place edit (erasing a revealed secret) must reach scrollback too.
+      renderer.invalidateScrollback()
+    },
   })
   let liveContentMaxHeight = 0
   let liveContentWidth = renderer.termCols
@@ -954,16 +1377,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
    */
   let liveRegionStartRow = 0
 
-  // Server state
+  // Dashboard state
   let serverState: ServerState | null = null
-  try {
-    serverState = await tryStartServer(opts.serverPort, opts.envFile)
-  } catch { /* server start failed — continue without it */ }
 
   // Paste ref state
-  const pastedChunks = new Map<number, string>()
-  const pastedImages = new Map<number, { id: number; base64: string; mediaType: string; filePath?: string }>()
-  let nextPasteId = 1
+  const pasteStore = createPasteStore()
+  const { chunks: pastedChunks, images: pastedImages } = pasteStore
+  // Images whose bytes are still being extracted. The ref is already visible in
+  // the composer, so a submit has to await these before reading pastedImages.
+  const pendingImages = new PendingImages()
 
   // Update info
   let updateAvailable: { version: string } | null = null
@@ -1012,7 +1434,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   const historyMgr = new HistoryManager(agent.cwd)
   const inputImageHistory = new InputImageHistory()
-  const entries = historyMgr.load().map(text => inputImageHistory.deserialize(text, () => nextPasteId++))
+  const entries = historyMgr.load().map(text => inputImageHistory.deserialize(text, () => pasteStore.allocId()))
   historyState = createHistoryState(entries)
 
   let configInfo: ConfigInfo | undefined
@@ -1023,18 +1445,35 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // Re-read backend config after a model switch so the footer reflects the
     // new provider's effective thinking level (it can differ per provider).
     try { configInfo = agent.configInfo() } catch {}
+    if (appState.judge !== configInfo?.judge) appState = { ...appState, judge: configInfo?.judge }
   }
   refreshConfigInfo()
 
+  /** Save the highlighted picker row as the account default (Space in the
+   *  picker). Nothing else moves: the live model stays, the picker stays open,
+   *  and only the ★ marker jumps to the newly pinned row. */
+  async function pinDefaultModel(spec: string): Promise<void> {
+    const option = selectModelOption(configInfo, spec)
+    if (!option) return
+    const label = formatModelLabel(option.model, option.provider, option.group_label)
+    try {
+      const pinned = await agent.pinDefaultModel(option.provider, option.model)
+      if (pinned === null) {
+        commitSystem('sys-model-pin', chalk.dim(`  ${label} is a local provider — its default lives in evot.env, not on your account`))
+      } else {
+        refreshConfigInfo()
+        refreshOpenModelSelector()
+        commitSystem('sys-model-pin', chalk.dim(`  ★ ${label} is now the default for new sessions on this account`))
+      }
+    } catch (err) {
+      commitSystem('sys-model-pin', renderErrorNotice(`Could not save default model: ${errorText(err)}`))
+    }
+    renderer.requestRender()
+  }
+
   const premiumAccount = hasPremiumModel(configInfo)
   adSlot = createAdSlotState(
-    authNotices().map(n => ({
-      id: n.id,
-      kind: n.kind,
-      priority: n.priority,
-      title: n.title,
-      body: n.body_md ?? '',
-    })),
+    campaignContent(authNotices()),
     { premium: premiumAccount },
   )
   // Logged-in users see the slot from the start — no need to wait for a
@@ -1055,21 +1494,31 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
    * the reload actually moved.
    */
   function reloadAfterAuthChange(): boolean {
-    const previousSpec = currentModelSpec(configInfo, appState.model)
-    const hasModel = agent.reloadSelection()
+    taskIdentity.refresh()
+    suggestions.credentialsChanged()
+    const previousModel = agent.model
+    const outcome = agent.reloadSelectionOutcome()
     refreshConfigInfo()
     reloadCloudContent()
-    if (!hasModel) return false
+    if (outcome === 'unconfigured') return false
 
     appState = { ...appState, model: agent.model }
+    // Only a different model is worth a line. `kept` and `followed` both
+    // leave the user on the same model (`followed` just re-homed it to another
+    // catalog group, which is routing, not something they chose or can see).
+    // A run in flight keeps repainting its pinned model into `appState`, so
+    // diffing display state here would re-announce the same landing on every
+    // external catalog write.
+    if (outcome !== 'switched') return true
     const next = configInfo?.availableModels.find(model => model.spec === currentModelSpec(configInfo, agent.model))
-    if (next && next.spec !== previousSpec) {
-      commitStatusLine({
-        id: 'sys-model',
-        kind: 'system',
-        text: `  Model → ${formatModelLabel(agent.model, next.provider, next.group_label)}`,
-      })
-    }
+    const provider = next?.provider ?? configInfo?.provider ?? ''
+    const label = formatModelLabel(agent.model, provider, next?.group_label)
+    commitStatusLine({
+      id: 'sys-model',
+      kind: 'system',
+      text: `  Model → ${label}${chalk.dim(` · ${previousModel} is no longer available`)}`,
+      shareEvents: modelShareEvents(provider, agent.model, configInfo?.thinkingLevel),
+    })
     return true
   }
 
@@ -1126,112 +1575,16 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     return active !== undefined && isCloudModel(active)
   }
 
-  let preloadedSessions: SessionMeta[] = []
   if (shouldPreloadStartupSessions(opts)) {
     try {
-      preloadedSessions = await agent.listSessions(opts.continueLatest ? 0 : 20)
-      resumeSessionsCache = preloadedSessions
-      resumeSessionsCacheComplete = Boolean(opts.continueLatest)
+      preloadedSessions = await agent.listSessions(opts.continueLatest || opts.forkFrom ? 0 : 20)
+      resumeCache.replace(preloadedSessions, Boolean(opts.continueLatest))
     } catch {}
-  }
-
-  function loadResumeSessionPreview(): Promise<SessionMeta[]> {
-    // A non-empty bounded cache is immediately useful. An empty cache is only
-    // authoritative when a full listing completed; otherwise it means “not
-    // loaded yet” and the prefix must still trigger a native lookup.
-    if (
-      resumeSessionsCache !== null
-      && (resumeSessionsCacheComplete || resumeSessionsCache.length > 0)
-    ) {
-      return Promise.resolve(resumeSessionsCache.slice(0, 20))
-    }
-    if (resumeSessionsPreviewLoad) return resumeSessionsPreviewLoad
-
-    const cacheGeneration = resumeSessionsCacheGeneration
-    const load = agent.listSessions(20).then(sessions => {
-      if (cacheGeneration !== resumeSessionsCacheGeneration) {
-        return (resumeSessionsCache ?? []).slice(0, 20)
-      }
-      // A full-list request may have completed while this bounded request was
-      // in flight. Never replace that complete cache with only 20 rows.
-      if (!resumeSessionsCacheComplete) {
-        resumeSessionsCache = sessions
-        preloadedSessions = sessions
-        return sessions
-      }
-      return (resumeSessionsCache ?? sessions).slice(0, 20)
-    })
-    resumeSessionsPreviewLoad = load
-    void load.finally(() => {
-      if (resumeSessionsPreviewLoad === load) resumeSessionsPreviewLoad = null
-    }).catch(() => {})
-    return load
-  }
-
-  function loadResumeSessions(): Promise<SessionMeta[]> {
-    if (resumeSessionsCacheComplete && resumeSessionsCache !== null) {
-      return Promise.resolve(resumeSessionsCache)
-    }
-    if (resumeSessionsLoad) return resumeSessionsLoad
-
-    const cacheGeneration = resumeSessionsCacheGeneration
-    const load = agent.listSessions(0).then(sessions => {
-      if (cacheGeneration !== resumeSessionsCacheGeneration) {
-        return resumeSessionsCache ?? []
-      }
-      resumeSessionsCache = sessions
-      resumeSessionsCacheComplete = true
-      preloadedSessions = sessions
-      return sessions
-    })
-    resumeSessionsLoad = load
-    void load.finally(() => {
-      if (resumeSessionsLoad === load) resumeSessionsLoad = null
-    }).catch(() => {})
-    return load
-  }
-
-  function loadResumeSessionsWithText(): Promise<SessionWithText[]> {
-    if (resumeSessionsWithTextCache !== null) return Promise.resolve(resumeSessionsWithTextCache)
-    if (resumeSessionsWithTextLoad) return resumeSessionsWithTextLoad
-
-    const cacheGeneration = resumeSessionsCacheGeneration
-    const load = agent.listSessionsWithText(0).then(sessions => {
-      if (cacheGeneration !== resumeSessionsCacheGeneration) {
-        return resumeSessionsWithTextCache ?? []
-      }
-      resumeSessionsWithTextCache = sessions
-      resumeSessionsCache = sessions
-      resumeSessionsCacheComplete = true
-      preloadedSessions = sessions
-      return sessions
-    })
-    resumeSessionsWithTextLoad = load
-    void load.finally(() => {
-      if (resumeSessionsWithTextLoad === load) resumeSessionsWithTextLoad = null
-    }).catch(() => {})
-    return load
-  }
-
-  function replaceResumeSessionCache(sessions: SessionMeta[], complete = false): void {
-    resumeSessionsCacheGeneration++
-    resumeSessionsCache = sessions
-    resumeSessionsCacheComplete = complete
-    resumeSessionsPreviewLoad = null
-    resumeSessionsWithTextCache = null
-    resumeSessionsLoad = null
-    resumeSessionsWithTextLoad = null
   }
 
   /** Drop snapshots after a run changes session visibility, title, or recency. */
   function invalidateResumeSessionCache(): void {
-    resumeSessionsCacheGeneration++
-    resumeSessionsCache = null
-    resumeSessionsCacheComplete = false
-    resumeSessionsPreviewLoad = null
-    resumeSessionsLoad = null
-    resumeSessionsWithTextCache = null
-    resumeSessionsWithTextLoad = null
+    resumeCache.invalidate()
     enrichedResumeMetadataGeneration = null
     enrichedResumeTextGeneration = null
     cancelSearchTextWarm()
@@ -1239,6 +1592,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   function invalidateExplicitResumeSelector(): void {
     explicitResumeSelectorGeneration++
+    refreshOpenSessionList = undefined
   }
 
   // Git info is watched so the footer follows external `git switch` / checkout
@@ -1248,12 +1602,30 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   setTerminalTitle('✳')
 
-  if (opts.continueLatest) {
+  if (opts.forkFrom) {
+    const wanted = opts.forkFrom.sessionId
+    const source = wanted
+      ? preloadedSessions.find(s => s.session_id === wanted || s.session_id.startsWith(wanted))
+      : findPreviousSession(preloadedSessions, agent.cwd)
+    if (!source) {
+      commitSystem('sys-fork-err', renderErrorNotice(wanted ? `Session not found: ${wanted}` : 'No session in this directory to fork'))
+      cleanup()
+      await sessionHook.close()
+      fastExit(1)
+    } else {
+      try {
+        const fork = await agent.forkSession(source.session_id)
+        await resumeSession(fork, forkNotice(fork, source, chalk.dim, chalk.cyan))
+      } catch (err) {
+        commitSystem('sys-fork-err', renderErrorNotice(`Fork failed: ${errorText(err)}`))
+      }
+    }
+  } else if (opts.continueLatest) {
     const match = findPreviousSession(preloadedSessions, agent.cwd)
     if (match) {
       await resumeSession(match)
     } else {
-      commitSystem('sys-continue-err', chalk.red('No conversation found to continue'))
+      commitSystem('sys-continue-err', renderErrorNotice('No conversation found to continue'))
       cleanup()
       await sessionHook.close()
       fastExit(1)
@@ -1265,45 +1637,49 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (match) {
       await resumeSession(match)
     } else {
-      commitSystem('sys-resume-err', chalk.red(`Session not found: ${opts.resumeSessionId}`))
+      commitSystem('sys-resume-err', renderErrorNotice(`Session not found: ${opts.resumeSessionId}`))
     }
   }
 
   renderer.requestRender()
 
   function getPromptVM(): PromptVMInput {
-    return {
-      lines: editor.lines,
-      cursorLine: editor.cursorLine,
-      cursorCol: editor.cursorCol,
+    suggestions.reconcile()
+    const interaction = runInteraction.snapshot(runInteractionInput())
+    // While a loop is parked, Esc stops the loop (the placeholder says so),
+    // so the chip must not advertise a second meaning for the same key.
+    const loopParked = interaction.kind === 'waiting-loop'
+    const backgroundStopHint = overlay.kind !== 'none' || editor.completion || loopParked ? undefined
+      : interaction.kind === 'waiting-background' && interaction.backgroundStopping ? 'Stopping…'
+      : interaction.interruptTarget === 'background'
+        ? interaction.interruptPending ? `esc again to stop all ${interaction.backgroundTasks} task${interaction.backgroundTasks === 1 ? '' : 's'}` : 'esc twice to stop all'
+        : undefined
+    return promptFromSnapshot({
+      editor,
+      session: appState,
+      config: configInfo,
       active: overlay.kind === 'none',
-      caretVisible: caretBlink.visible,
-      model: appState.model,
-      provider: providerDisplayName(
-        configInfo?.availableModels.find(
-          m => m.model === appState.model && m.provider === (configInfo?.provider ?? ''))
-          ?? configInfo?.availableModels.find(m => m.model === appState.model),
-        configInfo?.provider ?? '',
-      ),
-      planning,
       logMode: logMode !== null,
       dashboardUrl: serverState?.address ?? null,
       exitHint,
-      completion: editor.completion,
-      ghostHint: editor.ghostHint,
       columns: renderer.termCols,
       rows: renderer.termRows,
-      placeholder: isEditorEmpty(editor),
-      cwd: appState.cwd,
       gitBranch: gitInfo.getBranch(),
-      // Footer shows session state only (context/model/thinking). Per-call
-      // token usage renders on the spinner; session totals belong to logs.
-      contextTokens: appState.sessionTokens.contextTokens,
-      contextWindow: appState.sessionTokens.contextWindow,
       backgroundProcessCount: backgroundTerminals.runningCount(),
-      backgroundPanelDownAvailable: backgroundTerminals.hintVisible(isEditorEmpty(editor)),
-      thinkingLevel: configInfo?.thinkingLevel ?? '',
-    }
+      backgroundStopHint,
+      backgroundStopPending: interaction.interruptPending,
+      busy: isLoading,
+      interaction,
+      suggestion: suggestions.completing() ? '' : suggestions.text(),
+      suggestionPosition: suggestions.position(),
+      suggestionCompletion: suggestions.completing() ? suggestions.text() : '',
+      suggestionReplacing: suggestions.replacing(),
+      suggestionStatus: suggestions.feedback(),
+      suggestionExplicit: suggestions.isExplicit(),
+      suggestionFrame: suggestionTicker.frame,
+      loopParked,
+      queuedCount: queuedUserMessages.length + queuedCompactionSubmissions.length,
+    })
   }
 
   // Release notes (shown once after update)
@@ -1332,8 +1708,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     if (bannerCache.refresh(agent.cwd, agent.skillsDirs())) renderer.requestRender()
   }
   // Catch edits made by other sessions without filesystem work in buildFrame.
-  const bannerRefreshTimer = setInterval(refreshBannerData, 15_000)
-  bannerRefreshTimer.unref?.()
+  resources.add(backgroundJobs.register({ name: 'banner', intervalMs: 15_000, immediate: false, run: refreshBannerData }))
 
   function currentBannerText(): string {
     return bannerCache.render({
@@ -1346,6 +1721,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       serverState,
       releaseNotes,
       installDrift,
+      startupWarning: agent.startupWarning,
     })
   }
 
@@ -1360,10 +1736,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     expanded: boolean
     streaming: boolean
     columns: number
+    prevKind: string | undefined
     blocks: ViewBlock[]
   } | null = null
 
-  function buildPartialAssistantBlocks(): ViewBlock[] {
+  function buildPartialAssistantBlocks(prevKind: string | undefined): ViewBlock[] {
     const content = streamMachine?.appState.currentAssistantContent ?? EMPTY_ASSISTANT_CONTENT
     // Only provider deltas are provisional. The entire partial message stays in
     // the dynamic zone and is reparsed on every content delta, matching pi: a
@@ -1376,18 +1753,24 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       && partialBlocksMemo.expanded === expanded
       && partialBlocksMemo.streaming === streaming
       && partialBlocksMemo.columns === columns
+      && partialBlocksMemo.prevKind === prevKind
     ) {
       return partialBlocksMemo.blocks
     }
-    // Use the exact ordered committed-output pipeline for the live partial. This
-    // keeps thinking/text/tool positions, margins, and prefixes stable through
-    // completion instead of rendering tool calls in a detached layer.
+    // Use the exact ordered committed-output pipeline for the live partial,
+    // including the committed tail's kind as layout context. This keeps
+    // thinking/text/tool positions, margins, and prefixes byte-identical through
+    // completion, so committing the message never changes any rendered row.
+    // The one exception is a reasoning block that is still streaming when the
+    // run ends: its tail window collapses to a summary row at commit, which the
+    // renderer absorbs as an in-viewport shrink above the footer.
     const blocks = buildOutputBlocks(assistantMessageToOutputLines(content, expanded, {
       streaming,
     }), {
+      prevKind,
       columns,
     })
-    partialBlocksMemo = { content, expanded, streaming, columns, blocks }
+    partialBlocksMemo = { content, expanded, streaming, columns, prevKind, blocks }
     return blocks
   }
 
@@ -1396,39 +1779,48 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
     // An overlay owns the screen, so hold the caret solid rather than
     // animating behind a modal.
-    caretBlink.setEnabled(overlay.kind === 'none')
-
-    const blocks: ViewBlock[] = []
 
     // 1. Banner
     const banner = currentBannerText()
-    if (banner) {
-      blocks.push({ lines: banner.split('\n').map(l => ({ spans: [{ text: l }] })), marginTop: 0 })
-    }
+    const bannerLines = banner ? banner.split('\n') : []
 
     // 2. History (committed output lines) — incrementally cached so the
     // high-frequency spinner/delta/keystroke renders skip re-flattening the
     // whole transcript. The cache extends in place on append and rebuilds only
     // on reset (clear/replace), width change, or shrink. See HistoryRenderCache.
     const cols = renderer.termCols
-    if (cols !== liveContentWidth) {
+    const widthChanged = cols !== liveContentWidth
+    if (widthChanged) {
       liveContentWidth = cols
       liveContentMaxHeight = 0
     }
     const cache = expanded ? expandedHistoryCache : compactHistoryCache
     const cachedHistoryLines = cache.sync(expanded ? expandedLines : compactLines, cols)
-    if (cachedHistoryLines.length > 0) {
-      blocks.push({ lines: cachedHistoryLines.map(l => ({ spans: [{ text: l }] })), marginTop: 0 })
+    const bannerRows = bannerLines.length
+    // Rows above this index are committed transcript; render diagnostics use it
+    // to attribute a repaint to history, the live partial, or the live region.
+    historyRowCount = bannerRows + cachedHistoryLines.length
+    // The renderer cannot patch scrollback, so a prefix that shifts instead of
+    // appending must be announced or it leaves a duplicated row and a lost one.
+    if (committedBannerRows !== null) {
+      const shifted = bannerRows !== committedBannerRows
+        || cachedHistoryLines.length < committedHistoryRows
+        || (committedPrefixMayReshape && cachedHistoryLines.length !== committedHistoryRows)
+      // A resize reflows the viewport without replaying history. Explicit
+      // edits still take precedence, including an edit concurrent with resize.
+      if (shifted && (!widthChanged || committedPrefixMayReshape)) renderer.invalidateScrollback()
     }
+    committedBannerRows = bannerRows
+    committedHistoryRows = cachedHistoryLines.length
+    committedPrefixMayReshape = false
 
     // 3. Ordered partial assistant message (thinking/text/tool calls). Markdown
     // prefixes can legitimately reparse into fewer rows as a fence/list/table
     // becomes complete. Track history + partial as one region: when completion
     // moves the same content from partial into history its total height remains
     // continuous, and any transient parser shrink is absorbed above the footer.
-    const partialBlocks = buildPartialAssistantBlocks()
-    blocks.push(...partialBlocks)
-    const livePartialHeight = blocksToLines(partialBlocks).length
+    const partialLines = blocksToLines(buildPartialAssistantBlocks(cache.trailingKind))
+    const livePartialHeight = partialLines.length
     const liveContentHeight = cachedHistoryLines.length + livePartialHeight
     // The monotonic-height guard is only needed while visible partial content is
     // being reparsed. At the start of a fresh LLM call currentAssistantContent is
@@ -1440,22 +1832,24 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       isLoading && livePartialHeight > 0,
     )
     liveContentMaxHeight = liveHeight.maxHeight
-    if (liveHeight.padding > 0) {
-      blocks.push({
-        lines: Array.from({ length: liveHeight.padding }, () => ({ spans: [{ text: '' }] })),
-        marginTop: 0,
-      })
-    }
+    const paddingLines: string[] = liveHeight.padding > 0
+      ? new Array<string>(liveHeight.padding).fill('')
+      : []
 
-    const latestContentLines = blocksToLines(blocks)
+    // The cached history is already flattened ANSI; it joins the frame as-is.
+    // Re-wrapping it in spans and re-flattening every frame costs three
+    // allocations and a fresh string per transcript row, which in a long
+    // session is tens of milliseconds and hundreds of MB/s of garbage. The
+    // renderer reuses the same string objects to skip finalizing those rows.
+    const latestContentLines = bannerLines.concat(cachedHistoryLines, partialLines, paddingLines)
     const commandWindowIsMounted = commandWindowMounted()
     if (
       commandWindowIsMounted
       && (commandWindowContentLines === null || commandWindowContentWidth !== cols)
     ) {
       // Background commits stay frozen while the command window is mounted,
-      // but a resize must rebuild wrapping before the renderer performs its
-      // unavoidable width-change redraw.
+      // but a resize must rebuild wrapping before the renderer repaints the
+      // new viewport without replaying history.
       commandWindowContentLines = latestContentLines
       commandWindowContentWidth = cols
     }
@@ -1476,14 +1870,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       // Usage arrives only when the provider completes this call. During an
       // active call, show only its live output estimate; retaining the previous
       // call here would present stale cache/input values as if they were current.
-      const compactToolName = manualCompactionPhase === 'remote'
-        ? 'compact_remote'
-        : manualCompactionPhase === 'local_fallback'
-          ? 'compact_local_fallback'
-          : manualCompactionPhase === 'local'
-            ? 'compact_local'
-            : 'compact'
-      const spinnerForDisplay = compactionTask
+      const compactToolName = compactionToolName(manualCompactionPhase, manualCompactionActivity)
+      const spinnerForDisplay = manualCompaction.active
         ? { ...spinnerState, toolName: compactToolName }
         : spinnerState
       const spinnerText = formatSpinnerLine(
@@ -1491,7 +1879,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         Date.now(),
         // Manual compaction and local commands report no per-call usage of their
         // own; showing the previous run's tokens would misattribute them.
-        compactionTask || foregroundCommand
+        manualCompaction.active || foregroundCommand
           ? undefined
           : spinnerStatsFromLastUsage(
               appState.currentRunStats.lastLlmUsage,
@@ -1499,19 +1887,26 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
               usagePending,
             ),
         {
-          interruptible: foregroundCommand === null,
           model: appState.model,
-          // Ctrl+B can move this work aside without killing it, so the hint
-          // advertises that key alongside esc. Esc itself always interrupts.
-          backgroundable: backgroundTerminals.canReclaimTurn(),
+          columns: renderer.termCols,
+          interaction: runInteraction.snapshot(runInteractionInput()),
         },
       )
-      spinnerBlock = {
-        lines: wrapTextWithAnsi(spinnerText, renderer.termCols).map(text => ({ spans: [{ text }] })),
-        // Separating blank above the status row; queue rows bring their own.
-        marginTop: 1,
+      spinnerBlock = buildRunStatusBlock(spinnerText, renderer.termCols)
+    } else if (!isLoading && overlay.kind !== 'ask-user' && loopSession.waiting) {
+      // Parked between loop ticks. The wakeup card in the transcript says why;
+      // this row says until when, and that a running shell can end it early.
+      const wait = loopSession.waitRemaining()
+      if (wait) {
+        const waitText = formatLoopWaitLine({
+          remainingMs: wait.remainingMs,
+          earlyWake: wait.earlyWake,
+          stopPending: runInteraction.snapshot(runInteractionInput()).interruptPending,
+        })
+        spinnerBlock = buildRunStatusBlock(waitText, renderer.termCols)
       }
     } else if (backgroundWaitSince !== null && overlay.kind !== 'ask-user') {
+      //
       // Idle, but a detached task is still running and will wake the agent when
       // it finishes. Without a status row here the transcript looks finished, so
       // a user watching a long build would conclude the work had stopped.
@@ -1524,12 +1919,9 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         // No per-call usage belongs to a wait: nothing is being spent while the
         // agent is parked.
         undefined,
-        { model: appState.model },
+        { model: appState.model, columns: renderer.termCols, interaction: runInteraction.snapshot(runInteractionInput()), hideInteractionHint: true },
       )
-      spinnerBlock = {
-        lines: wrapTextWithAnsi(waitText, renderer.termCols).map(text => ({ spans: [{ text }] })),
-        marginTop: 1,
-      }
+      spinnerBlock = buildRunStatusBlock(waitText, renderer.termCols)
     }
 
     // Match pi's sibling order before editorContainer: pending messages, then
@@ -1539,20 +1931,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // until its rotation deadline instead of repainting at animation cadence.
     const adSlotNow = Date.now()
     const adSlotTick = tickAdSlot(adSlot, adSlotNow)
-    if (adSlotTimer !== undefined) clearTimeout(adSlotTimer)
-    adSlotTimer = undefined
-    const adSlotDelay = nextAdSlotRenderDelay(adSlot, adSlotTick, adSlotNow,
+    adSlotWakeup.replace(nextAdSlotRenderDelay(adSlot, adSlotTick, adSlotNow,
       overlay.kind === 'none' && !isLoading && !spinnerBlock
-      && !commandWindowIsMounted && renderer.termCols >= 30)
-    if (adSlotDelay !== null) {
-      adSlotTimer = setTimeout(() => {
-        adSlotTimer = undefined
-        renderer.requestRender()
-      }, adSlotDelay)
-      adSlotTimer.unref?.()
-    }
+      && !commandWindowIsMounted && renderer.termCols >= 30))
     const preEditorBlocks: ViewBlock[] = []
-    const queueManagerOpen = overlay.kind === 'selector' && overlay.state.title === 'Prompt queue'
+    const queueManagerOpen = overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.queue
     const queueLines = queueManagerOpen
       ? []
       : formatQueuedMessageLines([
@@ -1572,33 +1955,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // because it wants to be seen: "restart when convenient". Downloading
     // and manual-only-available are dim background noise. Failures stay
     // silent; the manual /update reports them with full context.
-    let updateNotice: ViewBlock['lines'][number]['spans'] | null = null
-    if (overlay.kind === 'none' && !commandWindowIsMounted) {
-      if (updateStatus === 'staged' && updateVersion) {
-        updateNotice = [
-          { text: '✔ ', hex: getTheme().brandHex },
-          { text: `Update installed v${updateVersion}`, hex: getTheme().brandHex },
-          { text: ' · /restart to apply', dim: true },
-        ]
-      } else if (updateStatus === 'downloading' && updateVersion) {
-        updateNotice = [{ text: `⬇ Auto-updating to v${updateVersion}…`, dim: true }]
-      } else if (updateStatus === 'idle' && updateAvailable && !spinnerBlock) {
-        updateNotice = [
-          { text: `↑ evot v${updateAvailable.version} available`, dim: true },
-          { text: ' — run /update', dim: true },
-        ]
-      }
-    }
+    let updateNotice = updateNoticeSpans({
+      status: updateStatus,
+      version: updateVersion,
+      availableVersion: updateAvailable?.version ?? null,
+      visible: overlay.kind === 'none' && !commandWindowIsMounted,
+      busy: spinnerBlock !== null,
+    })
     if (spinnerBlock && updateNotice) {
-      const last = spinnerBlock.lines.length - 1
-      const left = spinnerBlock.lines[last]?.spans ?? []
-      spinnerBlock = {
-        ...spinnerBlock,
-        lines: [
-          ...spinnerBlock.lines.slice(0, last),
-          { spans: joinLeftRight(left, updateNotice, renderer.termCols) },
-        ],
-      }
+      spinnerBlock = attachUpdateNotice(spinnerBlock, updateNotice, renderer.termCols)
       updateNotice = null
     }
     if (spinnerBlock) preEditorBlocks.push(spinnerBlock)
@@ -1608,101 +1973,49 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       preEditorBlocks.push(...buildAdSlotBlocks(adSlot, adSlotTick, renderer.termCols, adSlotNow))
     }
     if (updateNotice) {
-      const pad = Math.max(0, renderer.termCols - spansWidth(updateNotice))
-      preEditorBlocks.push({
-        lines: [{ spans: [{ text: ' '.repeat(pad) }, ...updateNotice] }],
-        // Sit on the frame: no blank row between this and the composer.
-        // Keep a blank above only when nothing else already occupies the slot.
-        marginTop: preEditorBlocks.length > 0 ? 0 : 1,
-      })
+      preEditorBlocks.push(standaloneUpdateNotice(updateNotice, renderer.termCols, preEditorBlocks.length > 0))
     }
 
-    // A promoted command window keeps the exact preview geometry: selector
-    // above, composer below. Focus only changes active styling/cursor ownership,
-    // so the first arrow never shrinks the frame or makes the terminal erase
-    // and re-anchor the composer before the list can respond.
-    if (
-      overlay.kind === 'selector'
-      && focusedCommandWindowGeneration !== null
-      && isStableCommandSelector(overlay.state)
-    ) {
-      const preEditorLines = blocksToLines(preEditorBlocks)
-      const selectorLines = commandSelectorRegionLines(overlay.state, true)
-      const promptLines = blocksToLines(buildPromptBlocks(getPromptVM(), {
-        attachedAbove: true,
-        reservedAboveRows: preEditorLines.length + selectorLines.length,
-      }))
-      return {
-        lines: [...contentLines, ...preEditorLines, ...selectorLines, ...promptLines],
-        bottomAnchor: true,
-        bottomAnchorStart: contentLines.length,
-        transientRows: selectorLines.length,
-        stableViewport: true,
-      }
-    }
-
-    // Other selectors replace only pi's editorContainer. Their preceding
-    // queue/status siblings and following footer sibling remain in normal flow.
-    if (overlay.kind === 'selector') {
-      const selectorLines = buildSelectorRegionLines(overlay.state, renderer.termCols, renderer.termRows)
-      return {
-        lines: [
-          ...contentLines,
-          ...blocksToLines(preEditorBlocks),
-          ...selectorLines,
-          ...blocksToLines(buildPromptFooterBlocks(getPromptVM())),
-        ],
-        bottomAnchor: true,
-        bottomAnchorStart: contentLines.length,
-        transientRows: selectorLines.length,
-      }
-    }
-
-    if (overlay.kind === 'ask-user') {
-      const askLines = buildAskRegionLines(overlay.state, renderer.termCols)
-      return {
-        lines: [
-          ...contentLines,
-          ...blocksToLines(preEditorBlocks),
-          ...askLines,
-          ...blocksToLines(buildPromptFooterBlocks(getPromptVM())),
-        ],
-        bottomAnchor: true,
-        bottomAnchorStart: contentLines.length,
-        transientRows: askLines.length,
-      }
-    }
-
-    const modalLines = blocksToLines(buildOverlayBlocks(overlay, renderer.termCols))
-    const previewLines = commandWindowPreview
-      ? commandWindowPreview.kind === 'selector'
-        ? commandSelectorRegionLines(commandWindowPreview.state, false)
-        : blocksToLines(buildOverlayBlocks({ kind: 'help' }, renderer.termCols))
-      : []
-    const preEditorLines = blocksToLines(preEditorBlocks)
-    const promptLines = blocksToLines(buildPromptBlocks(getPromptVM(), {
-      attachedAbove: preEditorLines.length > 0 || previewLines.length > 0,
-      reservedAboveRows: preEditorLines.length + previewLines.length,
-    }))
-
-    return {
-      lines: [...contentLines, ...preEditorLines, ...previewLines, ...promptLines],
-      bottomAnchor: true,
-      bottomAnchorStart: contentLines.length,
-      transientRows: previewLines.length,
-      ...(commandWindowPreview?.kind === 'selector' ? { stableViewport: true } : {}),
-      ...(modalLines.length > 0 ? { overlay: { lines: modalLines } } : {}),
-    }
+    const frame = buildShellFrame({
+      contentLines,
+      committedRows: historyRowCount,
+      preEditorBlocks,
+      prompt: getPromptVM(),
+      overlay,
+      commandFocused: focusedCommandWindowGeneration !== null,
+      preview: commandWindowPreview,
+    })
+    selectorPreviewViewport = frame.previewViewport
+    return frame
   }
 
   renderer.setRenderCallback(buildFrame)
 
-  function outputContextFor(lines: OutputLine[]): { prevKind?: string; columns?: number } {
-    return committer.contextFor(lines)
-  }
-
   function restoreLines(outputLines: OutputLine[], expandedOutputLines: OutputLine[] = outputLines) {
     committer.restore(outputLines, expandedOutputLines)
+  }
+
+  /** Runtime facts as the suggestion layer sees them; also recorded as the
+   * stage a user acted from, so the trajectory carries real transitions. */
+  function liveWorkflowRuntime(): WorkflowRuntime {
+    const background = backgroundTerminals.runningProcesses()
+    const loop = loopSession.snapshot
+    const toolWait = isLoading && runInteraction.snapshot(runInteractionInput()).kind === 'waiting-task'
+    return {
+      toolWait,
+      execution: isLoading ? (toolWait ? 'waiting'
+        : ['retrying', 'quota_waiting', 'outage_waiting'].includes(spinnerState.phase) ? 'retrying' : 'running')
+        : loop?.active || background.length > 0 ? 'waiting' : 'idle',
+      mode: logMode ? 'log' : 'normal',
+      queued: queuedUserMessages.length + queuedCompactionSubmissions.length,
+      background: background.length,
+      activities: activeWork(background, loop, loopSession.runInFlight),
+    }
+  }
+
+  function commitUserMessage(text: string): void {
+    suggestionContext.user(text, liveWorkflowRuntime())
+    commitLines(buildUserMessage(text))
   }
 
   function commitLines(outputLines: OutputLine[]) {
@@ -1711,6 +2024,24 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   function commitSystem(id: string, text: string, kind: OutputLine['kind'] = 'system') {
     committer.system(id, text, kind)
+  }
+
+  function commitRunFooter() {
+    if (runStartedAt === null) return
+    const line = buildRunFooterLine(runStartedAt, Date.now(), runTurnCount, runThinking.finish())
+    runStartedAt = null
+    if (line) commitLines([line])
+    // One memory line per run in the screen log: a report of a bloated
+    // process then comes with the trend and what this client retained.
+    screenLog.logLines([memoryLine()])
+  }
+
+  function memoryLine(): string {
+    return formatMemoryLine(memorySnapshot({
+      compactRows: compactLines.length,
+      expandedRows: expandedLines.length,
+      messages: appState.messages.length,
+    }))
   }
 
   /**
@@ -1730,15 +2061,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
    *  stay single-line. Only the trailing line is eligible for replacement, so a
    *  later user message or other output freezes the prior status into history. */
   function commitStatusLine(line: OutputLine) {
-    const replaced = replaceOrPushStatusLine(compactLines, line)
-    replaceOrPushStatusLine(expandedLines, line)
-    // In-place mutation invalidates the append-only history cache prefix.
-    if (replaced) resetHistoryCache()
-    const context = outputContextFor(compactLines.slice(0, -1))
-    const blocks = buildOutputBlocks([line], context)
-    const rendered = blocksToLines(blocks)
-    screenLog.logLines(rendered)
-    renderer.requestRender()
+    committer.commitStatus(line)
   }
 
   /** Commit slash-command system lines, collapsing model/thinking status in place. */
@@ -1747,7 +2070,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       if (line.kind === 'system' && (line.id === 'sys-model' || line.id === 'sys-think')) {
         commitStatusLine(line)
       } else {
-        commitLines([line])
+        committer.commitNotice([line])
       }
     }
   }
@@ -1756,14 +2079,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   function commitFlushResult(flushed: { lines: OutputLine[]; expandedLines?: OutputLine[] }) {
     if (flushed.lines.length === 0) return
     if (flushed.expandedLines) {
-      compactLines.push(...flushed.lines)
-      expandedLines.push(...flushed.expandedLines)
-      const visible = expanded ? flushed.expandedLines : flushed.lines
-      const context = outputContextFor(compactLines.slice(0, -flushed.lines.length))
-      const blocks = buildOutputBlocks(visible, context)
-      const rendered = blocksToLines(blocks)
-      screenLog.logLines(rendered)
-      renderer.requestRender()
+      committer.commitDual(flushed.lines, flushed.expandedLines)
     } else {
       commitLines(flushed.lines)
     }
@@ -1779,10 +2095,10 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // (e.g. the tool output you just ran) sits in the viewport, the renderer
     // repaints in place from the first changed line down, so the view stays
     // put instead of clearing and re-anchoring to the bottom (which is what
-    // made the screen jump). A swap large enough to change history above the
-    // viewport still falls back to a full redraw via the renderer's own
-    // off-viewport guard. Mirrors pi, which toggles with requestRender().
-    renderer.requestRender()
+    // made the screen jump). The toggle applies to the whole transcript, so a
+    // swap that also changes history above the viewport is allowed to replay
+    // it: the user asked for a different view of that history.
+    renderer.invalidateScrollback()
   }
 
   /** Cycle the model's reasoning effort (Shift+Tab) and reflect it in the footer. */
@@ -1799,7 +2115,9 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }
     refreshConfigInfo()
     const label = level === 'off' ? 'off' : level
-    commitStatusLine({ id: 'sys-think', kind: 'system', text: `  Thinking level → ${label}` })
+    commitStatusLine({ id: 'sys-think', kind: 'system', text: `  Thinking level → ${label}`,
+      shareEvents: [{ kind: 'thinking_level_change', data: { thinking_level: level } }],
+    })
     renderer.requestRender()
   }
 
@@ -1811,7 +2129,10 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     titleFrame = 0
     spinnerTimer = setInterval(() => {
       spinnerState = advanceSpinner(spinnerState)
-      if (compactionTask) manualCompactionPhase = compactionTask.phase
+      if (manualCompaction.active) {
+        manualCompactionPhase = manualCompaction.phase
+        manualCompactionActivity = manualCompaction.activity
+      }
       if (streamMachine) {
         streamMachine = { ...streamMachine, spinnerState }
       }
@@ -1827,6 +2148,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   function stopSpinner() {
+    runInteraction.clear()
     if (spinnerTimer) {
       clearInterval(spinnerTimer)
       spinnerTimer = null
@@ -1834,27 +2156,61 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // Always replace the final animated glyph. An ask overlay can keep the
     // title frozen while the run settles; normal title writes are correctly
     // blocked then, but the completed state must not remain stuck on ·/⠂/⠐.
-    setTerminalTitle('✳', true)
+    setTerminalTitle(idleWaitTitle(), true)
   }
 
-  async function resumeSession(session: SessionMeta) {
+  /** Load the fork ancestry for the footer breadcrumb. Never fatal: a failed
+   *  lookup just shows the session as a root. */
+  async function refreshForkTrail(id: string): Promise<SessionMeta[]> {
+    let lineage: SessionMeta[] = []
+    try { lineage = await agent.sessionLineage(id) } catch {}
+    if (sessionId !== id) return lineage
+    lastLineage = lineage
+    setGhostHintContext({ forked: lineage.length > 1 })
+    const cloud = lineage.find(meta => meta.session_id === id)?.cloud
+    appState = {
+      ...appState,
+      forkTrail: forkTrailTitles(lineage),
+      cloudBadge: cloud ? cloudBadge('synced', cloud.visibility, cloud.team) : '',
+    }
+    return lineage
+  }
+
+  /** Switch to `session`. `notice` replaces the default `resumed session`
+   *  line when the switch is a fork or a `/back`. */
+  /**
+   * A cloud session may have moved on another machine: catch the local copy
+   * up before the transcript is read. Divergence is not resolved here; the
+   * local copy is resumed and the choice is spelled out.
+   */
+  async function pullBeforeResume(sessionId: string): Promise<OutputLine[]> {
+    const remote = cloudSessions.remoteFor(sessionId)
+    if (!remote) return []
+    const local = (resumeCache.metadata ?? []).find(row => row.session_id === sessionId)
+    const state = cloudSessions.stateFor(local, sessionId)
+    if (state !== 'remote_only' && state !== 'pull_pending' && state !== 'diverged') return []
+    const result = await agent.cloudPullSession(sessionId)
+    invalidateResumeSessionCache()
+    switch (result.kind) {
+      case 'pulled':
+        return [{ id: 'sys-cloud-pulled', kind: 'system', text: chalk.dim(`  ☁ pulled ${result.appended} entries from cloud${remote.origin_host ? ` (${remote.origin_host})` : ''}`) }]
+      case 'diverged':
+        return [{ id: 'sys-cloud-diverged', kind: 'system', text: chalk.yellow(`  ☁! changed on both machines · resumed local. /share cloud takes the cloud copy · /share local overwrites it with this one`) }]
+      default:
+        return []
+    }
+  }
+
+  async function resumeSession(session: SessionMeta, notice?: OutputLine[]) {
+    const revision = ++composerRevision
+    suggestionContextId++
+    suggestions.cancel()
+    taskSession.cancelFlow()
+    loopSession.reset()
     try {
-      const transcript = await agent.loadResumeTranscript(session.session_id)
-      // Fields may be missing when the caller passes a partial SessionMeta
-      // (e.g. the resume selector only knows the id); fetch the full record.
-      let model = session.model
-      let provider = session.provider
-      let thinkingLevel = session.thinking_level
-      let sessionCwd = session.cwd
-      if (!model || !provider || thinkingLevel === undefined || !sessionCwd) {
-        const full = await agent.findSession(session.session_id)
-        if (full) {
-          if (!model) model = full.model
-          if (!provider) provider = full.provider
-          if (thinkingLevel === undefined) thinkingLevel = full.thinking_level
-          if (!sessionCwd) sessionCwd = full.cwd
-        }
-      }
+      const cloudNotice = await pullBeforeResume(session.session_id)
+      const { transcript, model, provider, thinkingLevel, cwd: sessionCwd } = await prepareResume(agent, session)
+      if (revision !== composerRevision || destroyed) return
 
       // Restore model selection from current config, then the session's
       // recorded thinking level (session wins over the config default).
@@ -1870,10 +2226,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       const { messagesToOutputLines } = await import('../render/output.js')
       const { transcriptToMessages } = await import('../session/transcript.js')
       const messages = transcriptToMessages(transcript)
-      // A resumed session starts with no active plan; plan mode is re-entered
-      // via /plan on the live conversation.
-      planModeItems = []
-      lastReviewedPlanMarkdown = ''
+      suggestionContext.restore(transcript)
+      // The history was masked in earlier processes; its placeholders are not
+      // news. Best effort: without them the first card over-reports once.
+      privacyFeed.forget(session.session_id)
+      void privacySessionTags(session.session_id).then(tags => privacyFeed.seed(session.session_id, tags)).catch(() => {})
       renderer.clearScreen()
       compactLines.length = 0
       expandedLines.length = 0
@@ -1889,8 +2246,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       restoreLines(messagesToOutputLines(shown), messagesToOutputLines(shown, true))
       restoreLines([
         { id: 'sys-resumed-gap', kind: 'system', text: '' },
-        { id: 'sys-resumed', kind: 'system', text: chalk.dim(`  resumed session ${session.session_id.slice(0, 8)}`) },
+        ...(notice ?? [{ id: 'sys-resumed', kind: 'system' as const, text: chalk.dim(`  resumed session ${session.session_id.slice(0, 8)}`) }]),
+        ...cloudNotice,
       ])
+      await refreshForkTrail(session.session_id)
+      if (revision !== composerRevision || destroyed) return
       if (sessionCwd && sessionCwd !== agent.cwd) {
         restoreLines([{
           id: 'sys-resume-cwd',
@@ -1901,6 +2261,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       if (modelRestoreNote) {
         restoreLines([{ id: 'sys-resume-model', kind: 'system', text: chalk.dim(modelRestoreNote) }])
       }
+      if (revision === composerRevision) requestProductSuggestion('resume')
     } catch (err) {
       commitSystem('sys-err', `Failed to resume: ${errorText(err)}`, 'error')
     }
@@ -1909,10 +2270,9 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   async function rebuildAfterManualCompaction(outcome: Extract<ManualCompactionOutcome, { status: 'compacted' }>) {
     if (!sessionId) return
     const transcript = await agent.loadContextTranscript(sessionId)
-    const messages = transcriptToMessages(transcript).filter(message =>
-      !(message.role === 'user' && message.text.startsWith(COMPACT_SUMMARY_PREFIX)),
-    )
+    const messages = transcriptToMessages(transcript.filter(item => !isLegacyContextSummary(item)))
     const { shown, hidden } = selectResumeMessages(messages)
+    suggestionContext.replaceHistory(transcript)
 
     appState = {
       ...appState,
@@ -1928,70 +2288,19 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     expandedLines.length = 0
     resetHistoryCache()
     if (hidden > 0) restoreLines([resumeElidedLine(hidden)])
-    restoreLines(messagesToOutputLines(shown))
+    // Both views, as on resume: otherwise ctrl+o could no longer open the
+    // tool cards or lift the reasoning folds of the messages kept on screen.
+    restoreLines(messagesToOutputLines(shown), messagesToOutputLines(shown, true))
 
-    const method = outcome.method === 'remote'
-      ? 'remote'
-      : outcome.method === 'remote_failed_local'
-        ? 'remote_failed_local'
-        : 'local'
-    const details = formatCompactionCompleted({
-      reason: 'manual',
-      context_window: outcome.context_window,
-      result: {
-        type: 'compacted',
-        before_message_count: outcome.messages_before,
-        after_message_count: outcome.messages_after,
-        before_tokens: outcome.tokens_before,
-        after_tokens: outcome.tokens_after,
-        messages_evicted: outcome.messages_evicted,
-        current_run_reclaimed: outcome.current_run_reclaimed,
-        compaction_level: outcome.compaction_level,
-        method,
-        remote_blob_bytes: outcome.remote_blob_bytes,
-        fallback_reason: outcome.fallback_reason,
-      },
-    })
-    const detailLines = details.split('\n')
-    const headline = detailLines[0]?.replace(/^\[COMPACT\] ✓ · /, '') ?? 'manual'
-    const label = { id: 'sys-compact-label', kind: 'system' as const, text: '  [compaction]' }
-    const status = {
-      id: 'sys-compact-result',
-      kind: 'system' as const,
-      text: `  Compacted · ${headline} (ctrl+o to expand)`,
-    }
-    compactLines.push(label, status)
-    expandedLines.push(
-      label,
-      { ...status, text: `  ${details}` },
-      ...buildAssistantLines(outcome.summary),
-    )
-    if (outcome.used_fallback) {
-      const fallback = {
-        id: 'sys-compact-fallback',
-        kind: 'system' as const,
-        text: '  Note: the LLM summary was unavailable; a deterministic fallback summary was used.',
-      }
-      compactLines.push(fallback)
-      expandedLines.push(fallback)
-    }
-    if (outcome.context_window > 0 && outcome.tokens_after >= outcome.context_window) {
-      const warning = {
-        id: 'sys-compact-warning',
-        kind: 'error' as const,
-        text: `Context is still ${outcome.tokens_after.toLocaleString()} tokens, above this model's ${outcome.context_window.toLocaleString()}-token window. Switch to a larger-context model or start a new session.`,
-      }
-      compactLines.push(warning)
-      expandedLines.push(warning)
-    }
-    renderer.requestRender()
+    const lines = manualCompactionLines(outcome)
+    committer.commitDual(lines.compact, lines.expanded)
   }
 
   async function submitQueuedAfterCompaction() {
     const submissions = queuedCompactionSubmissions
     queuedCompactionSubmissions = []
     for (const submission of submissions) {
-      commitLines(buildUserMessage(submission.displayText))
+      commitUserMessage(submission.displayText)
       await runQuery(submission.expandedText, submission.contentJson)
     }
   }
@@ -2005,23 +2314,30 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     isLoading = true
     spinnerState = setSpinnerPhase(createSpinnerState(), 'executing', 'compact')
     startSpinner()
-    compactionTask = agent.compact(sessionId, customInstructions || undefined)
-    manualCompactionPhase = compactionTask.phase
-    renderer.requestRender()
+    const targetSession = sessionId
     try {
-      const outcome = await compactionTask.result()
-      if (outcome.status === 'compacted') {
-        await rebuildAfterManualCompaction(outcome)
-      } else if (outcome.status === 'cancelled') {
-        commitSystem('sys-compact-cancelled', '  Compaction cancelled.')
-      } else {
-        commitSystem('sys-compact-empty', '  Nothing to compact.')
-      }
+      await manualCompaction.run(
+        () => agent.compact(targetSession, customInstructions || undefined),
+        () => {
+          manualCompactionPhase = manualCompaction.phase
+          manualCompactionActivity = manualCompaction.activity
+          renderer.requestRender()
+        },
+        async outcome => {
+          if (outcome.status === 'compacted') {
+            await rebuildAfterManualCompaction(outcome)
+          } else if (outcome.status === 'cancelled') {
+            commitSystem('sys-compact-cancelled', '  Compaction cancelled.')
+          } else {
+            commitSystem('sys-compact-empty', '  Nothing to compact.')
+          }
+        },
+      )
     } catch (err) {
       commitSystem('sys-compact-err', `Compact failed: ${errorText(err)}`, 'error')
     } finally {
-      compactionTask = null
       manualCompactionPhase = null
+      manualCompactionActivity = null
       isLoading = false
       stopSpinner()
       renderer.requestRender()
@@ -2053,7 +2369,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   /** Clear editor and paste state. */
   function clearAll() {
-    cancelResumeCommandLoad()
+    cancelCommandWindowLoads()
     cancelResumeSearchEnrichment()
     editor = clearEditor(editor)
     editorUndo.clear()
@@ -2067,13 +2383,16 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   const backgroundTerminals = new BackgroundTerminals({
+    columns: () => renderer.termCols,
+    rows: () => renderer.termRows,
     client: agent,
     sessionId: () => sessionId,
     commit: commitBackgroundLine,
     requestRender: () => renderer.requestRender(),
     errorText,
-    paintError: text => chalk.red(text),
+    paintError: text => renderErrorNotice(text.trimStart()),
     readOutput: path => readOutputTail(path),
+    watchOutput: watchOutputFile,
     openPanel: state => {
       overlay = { kind: 'selector', state }
       renderer.requestRender()
@@ -2081,13 +2400,13 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     updatePanel: state => {
       // Only ever touch the overlay while the panel owns it: an async stop
       // landing after the user moved on must not close a different overlay.
-      if (overlay.kind !== 'selector' || !isBackgroundPanelTitle(overlay.state.title)) return
+      if (overlay.kind !== 'selector' || !isBackgroundSelector(overlay.state)) return
       overlay = state ? { kind: 'selector', state } : { kind: 'none' }
       renderer.requestRender()
     },
-    panelOpen: () => overlay.kind === 'selector' && isBackgroundPanelTitle(overlay.state.title),
+    panelOpen: () => overlay.kind === 'selector' && isBackgroundSelector(overlay.state),
     panelState: () =>
-      overlay.kind === 'selector' && isBackgroundPanelTitle(overlay.state.title) ? overlay.state : null,
+      overlay.kind === 'selector' && isBackgroundSelector(overlay.state) ? overlay.state : null,
     // A run drains the notification queue itself between turns, so waking is
     // only for the idle case.
     runInFlight: () => isLoading,
@@ -2104,8 +2423,14 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     },
   })
 
+  backgroundCleanup.add(() => backgroundTerminals.killAllNow())
+
   function refreshBackgroundProcesses(): void {
     backgroundTerminals.refresh()
+    // The native blocking-wait count is already polled here. Entering a wait
+    // offers steering without a final answer; leaving it cancels only that
+    // wait's automatic request, never explicit Tab assistance.
+    suggestionTaskWait.sync(runInteraction.snapshot(runInteractionInput()).kind === 'waiting-task')
     // Track the idle wait alongside the poll that discovers it. A live
     // background task will wake the agent when it finishes, so while one is
     // running the agent is genuinely parked rather than done.
@@ -2115,6 +2440,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       renderer.requestRender()
     } else if (!waiting && backgroundWaitSince !== null) {
       backgroundWaitSince = null
+      if (!isLoading) setTerminalTitle(idleWaitTitle())
       renderer.requestRender()
     }
   }
@@ -2123,93 +2449,66 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   // the ad-slot ticker stops whenever an overlay owns the screen, so neither can
   // be relied on to keep this glyph moving.
   const backgroundWaitTimer = setInterval(() => {
-    if (isLoading || backgroundWaitSince === null) return
+    if (isLoading) return
+    const loopWaiting = loopSession.waiting
+    if (!loopWaiting && backgroundWaitSince === null) return
     backgroundWaitSpinner = advanceSpinner(backgroundWaitSpinner)
+    if (backgroundWaitSpinner.frame % TITLE_INTERVAL_FRAMES === 0) {
+      // A running turn blinks two braille dots in the tab. A parked loop is a
+      // different state, waiting for a clock, so it gets a clock: the hand
+      // sweeps a quarter turn per tick and is unmistakable next to the dots.
+      // A background wait keeps the dots: the agent is waiting on work.
+      const frame = titleFrame++
+      if (loopWaiting) {
+        setTerminalTitle(`${LOOP_TITLE_CLOCK[frame % LOOP_TITLE_CLOCK.length]} loop`)
+      } else {
+        setTerminalTitle(`${['⠂', '⠐'][frame % 2]} bg ${backgroundTerminals.runningCount()}`)
+      }
+    }
     renderer.requestRender()
   }, SPINNER_INTERVAL_MS)
   ;(backgroundWaitTimer as unknown as { unref?: () => void }).unref?.()
+  resources.add(() => clearInterval(backgroundWaitTimer))
 
-  /** Insert pasted text, collapsing large pastes into refs. */
-  function insertPaste(raw: string) {
-    const cleaned = cleanPastedText(raw)
-    if (shouldCollapse(cleaned)) {
-      const id = nextPasteId++
-      const numLines = (cleaned.match(/\n/g) || []).length
-      pastedChunks.set(id, cleaned)
-      const ref = formatPastedTextRef(id, numLines)
-      mutateEditor(state => insertText(state, ref))
-    } else {
-      mutateEditor(state => insertText(state, cleaned))
-    }
-  }
+  const {
+    insertPaste,
+    tryPasteImage,
+    tryPasteClipboard,
+    withDraftImages,
+    buildImageContentBlocks,
+  } = createPasteHandlers({
+    store: pasteStore,
+    pendingImages,
+    getEditor: () => editor,
+    mutateEditor,
+    isDestroyed: () => destroyed,
+    requestRender: () => renderer.requestRender(),
+    getDisplayText,
+    getExpandedText,
+  })
 
-  /** Try to paste image from clipboard (Ctrl+V). */
-  async function tryPasteImage() {
-    const img = await getImageFromClipboard()
-    if (img) {
-      const id = nextPasteId++
-      // Store to disk immediately so images survive past session memory
-      const filePath = await storeImage(img.base64, img.mediaType)
-      pastedImages.set(id, { id, base64: img.base64, mediaType: img.mediaType, filePath: filePath ?? undefined })
-      mutateEditor(state => insertText(state, formatImageRef(id)))
-      renderer.requestRender()
-    }
-  }
-
-  /** Paste clipboard contents (Cmd+V). Image wins when both are present. */
-  async function tryPasteClipboard() {
-    const img = await getImageFromClipboard()
-    if (img) {
-      await tryPasteImage()
-      return
-    }
-    const text = await getTextFromClipboard()
-    if (text) {
-      insertPaste(text)
-      renderer.requestRender()
-    }
-  }
-
-  /** Build content blocks for images. Returns blocks and resolved image IDs. */
-  function buildImageContentBlocks(): { blocks: ContentBlock[]; resolvedIds: Set<number> } | null {
-    const displayText = getDisplayText()
-    const imageRefs = parsePasteRefs(displayText).filter(r => r.type === 'image')
-    const resolved: { id: number; base64: string; mediaType: string; filePath?: string }[] = []
-    const unresolvedIds = new Set<number>()
-    for (const ref of imageRefs) {
-      const img = pastedImages.get(ref.id)
-      if (img) {
-        resolved.push(img)
-      } else {
-        unresolvedIds.add(ref.id)
-      }
-    }
-    if (resolved.length === 0) return null
-    const blocks: ContentBlock[] = []
-    // Only strip resolved image refs from text — unresolved ones stay as [Image #N]
-    const text = getExpandedText(new Set(resolved.map(r => r.id)))
-    // Annotate with image source paths so the model can reference files on disk
-    const sourceAnnotations = resolved
-      .filter(r => r.filePath)
-      .map(r => formatImageSourceText(r.id, r.filePath!))
-      .join('\n')
-    const fullText = sourceAnnotations ? `${text}\n${sourceAnnotations}` : text
-    if (fullText) blocks.push({ type: 'text', text: fullText })
-    for (const img of resolved) {
-      blocks.push({
-        type: 'image',
-        mimeType: img.mediaType,
-        source: img.filePath
-          ? { type: 'path', path: img.filePath }
-          : { type: 'base64', data: img.base64 },
-      })
-    }
-    return { blocks, resolvedIds: new Set(resolved.map(r => r.id)) }
-  }
-
-  async function runQuery(text: string, contentJson?: string, prebuiltStream?: QueryStream) {
+  async function runQuery(
+    text: string,
+    contentJson?: string,
+    prebuiltStream?: QueryStream,
+    hostToolExtension?: HostToolExtension,
+  ) {
     if (queryBlockedByCloudLogin()) return
+    // Only a turn the loop itself launched is a loop run. A message the user
+    // types while the loop is parked runs as an ordinary turn: the wakeup
+    // timer keeps counting and the loop's reschedule contract does not apply.
+    // The tool is still offered, so "make it hourly" or "stop the loop" said
+    // in plain words takes effect now instead of at the next wakeup.
+    const loopRun = loopSession.runInFlight
+    if (loopSession.active) hostToolExtension = composeExtensions(hostToolExtension, loopSession.extension)
+    // Notification-only wakeups continue the same user task; don't hide its
+    // newly completed background work when the engine reads the result.
+    if (text || contentJson || prebuiltStream) backgroundTerminals.beginRun()
+    composerRevision++
     const generation = beginRun()
+    runStartedAt = Date.now()
+    runTurnCount = 0
+    runThinking.reset()
     liveContentMaxHeight = 0
     isLoading = true
     spinnerState = createSpinnerState()
@@ -2220,7 +2519,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     let completed = false
     try {
       const stream = prebuiltStream
-        ?? await agent.query(text, sessionId ?? undefined, planning ? 'planning_interactive' : 'interactive', contentJson, HOST_TOOL_SPECS_JSON)
+        ?? await agent.query(text, sessionId ?? undefined, 'interactive', contentJson, hostToolExtension?.specsJson ?? HOST_TOOL_SPECS_JSON)
       if (!ownsRun(generation)) {
         stream.abort()
         return
@@ -2228,6 +2527,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       streamRef = stream
       sessionId = stream.sessionId ?? sessionId
       if (sessionId) {
+        taskSession.bindFlowSession(sessionId, hostToolExtension)
         sessionHook.startSession(sessionId, agent.cwd)
         // The query may have just persisted a formerly unbound first session,
         // and every run can change its title, turn count, and recency.
@@ -2241,6 +2541,25 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         if (destroyed || !ownsRun(generation)) break
         if (!streamMachine) break
 
+        if (isHostToolEvent(event)) {
+          suggestions.cancelAutomatic()
+          const response = await dispatchHostToolCall(
+            event.payload,
+            collectAskUserAnswers,
+            hostToolExtension,
+          )
+          // A cancelled ask_user aborts an in-progress edit. Do not route the
+          // next ordinary prompt back into a flow the user dismissed.
+          if (hostToolExtension && /^(ask_user|AskUser)$/i.test(event.payload.tool_name)
+              && response.content.some(part =>
+            (response.is_error && part.text === 'User cancelled the question.')
+            || /→ Cancel(?:\n|$)/.test(part.text))) {
+            taskSession.cancelFlow()
+          }
+          if (ownsRun(generation)) await stream.respondHostTool(JSON.stringify(response))
+          continue
+        }
+
         if (event.kind === 'run_started') {
           sessionHook.startSession(event.session_id, agent.cwd)
           sessionHook.runStarted(event.run_id)
@@ -2250,36 +2569,20 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
           sessionHook.runFailed(event.run_id, String(event.payload?.message ?? ''))
         }
 
-        if (event.kind === 'host_tool_call') {
-          // The engine delegated a host-owned tool (ask_user). Dispatch it and
-          // send a response even when execution fails so the run cannot hang.
-          const call = (event.payload ?? {}) as {
-            tool_name?: string
-            tool_call_id?: string
-            arguments?: Record<string, unknown>
-          }
-          if (call.tool_name && call.tool_call_id) {
-            const response = await dispatchHostToolCall({
-              tool_name: call.tool_name,
-              tool_call_id: call.tool_call_id,
-              arguments: call.arguments ?? {},
-            }, collectAskUserAnswers)
-            if (ownsRun(generation)) {
-              await stream.respondHostTool(JSON.stringify(response))
-            }
-          }
-          continue
-        }
-
+        runThinking.observe(event)
         const update = reduceRunEvent(streamMachine!, event, {
           termRows: renderer.termRows,
           cloudProvider: activeProviderIsCloud(),
+          privacyDetail: () => privacyFeed.lastBlocked(sessionId),
         })
 
         streamMachine = update.state
         appState = update.state.appState
+        suggestionContext.observe(event)
         spinnerState = update.state.spinnerState
+        if (['turn_started', 'error', 'llm_call_retry', 'quota_waiting', 'outage_waiting', 'context_compaction_started'].includes(event.kind)) suggestions.cancelAutomatic()
         if (update.sessionRevoked) handleCloudSessionRevoked()
+        shareNotices.record(sessionId, update.noticeLines)
 
         // Git commands run inside tool subprocesses. Refresh synchronously when
         // any tool settles instead of waiting for the debounced HEAD watcher;
@@ -2296,23 +2599,22 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
             // Dual-commit: compact in compactLines, expanded in expandedLines
             const compact = update.commitLines
             const exp = update.expandedCommitLines
-            compactLines.push(...compact)
-            expandedLines.push(...exp)
-            const visible = expanded ? exp : compact
-            const context = outputContextFor(compactLines.slice(0, -compact.length))
-            const blocks = buildOutputBlocks(visible, context)
-            const rendered = blocksToLines(blocks)
-            screenLog.logLines(rendered)
-            renderer.requestRender()
+            committer.commitDual(compact, exp)
           } else {
-            commitLines(update.commitLines)
+            committer.commitDual(update.commitLines, update.commitLines)
           }
         }
+        // After this step's own lines, so a masked request's card follows the
+        // text it produced rather than splitting it.
+        if (['llm_call_completed', 'tool_finished', 'run_finished', 'error'].includes(event.kind)) commitPrivacyHappenings()
 
         // Reconcile against the native queue instead of draining the visible
         // copy wholesale: OneAtATime mode may consume only the first of several
         // queued prompts at this boundary.
-        if (event.kind === 'turn_started') reconcileQueuedUserMessages()
+        if (event.kind === 'turn_started') {
+          runTurnCount++
+          reconcileQueuedUserMessages()
+        }
 
         // writeLines are log-only: LLM/COMPACT/SPILL stats that don't render in
         // the TUI. Run them through the same formatting pipeline so screen.log
@@ -2349,6 +2651,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         commitFlushResult(final)
       }
       const message = errorText(err)
+      suggestionContext.fail()
       commitSystem('sys-err', message, 'error')
       sessionHook.runFailed(undefined, message)
       reconcileQueuedUserMessages()
@@ -2363,9 +2666,19 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         isLoading = false
         streamMachine = null
         stopSpinner()
+        // The run no longer holds a wait; do not leave its suggestion until the next poll.
+        suggestionTaskWait.sync(false)
+        if (!completed) suggestions.cancelAutomatic()
+        if (loopRun) loopSession.endRun(completed ? 'ok' : 'error')
+        else if (completed && suggestionContext.hasAnswer) requestProductSuggestion('answer')
+        commitRunFooter()
+        if (taskSession.unfinishedFlow(hostToolExtension)) {
+          commitSystem('sys-task-incomplete', '  Task change not saved yet · reply to continue editing, or /task cancel')
+        }
         // Fresh ads/models belong in the background: awaiting the catalog here
         // stalled the prompt for the whole HTTP round-trip after every turn.
         void syncCloudNow(true)
+        if (sessionId) cloudSessions.schedulePush(sessionId)
         triggerAdSlot(adSlot, Date.now())
         renderer.requestRender()
       }
@@ -2377,19 +2690,22 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // observe those values even if some background consumer repopulated a
     // snapshot while the run was active.
     invalidateResumeSessionCache()
-    await maybeReviewPlanAfterTurn()
   }
 
   function handleKey(event: KeyEvent) {
+    if (suggestionInput.handle(event)) return
+    if (event.type !== 'escape' || overlay.kind !== 'none' || editor.completion || queueEdit.editingEntry()) {
+      runInteraction.clear()
+    }
     // Typing keeps focus in the composer while refreshing the formal window
     // above it. Up/down is the explicit gesture that promotes that same state.
-    if (activateCommandWindow(event)) return
+    if (activateCommandWindow(event)) { suggestions.reconcile(); return }
     handleKeyInner(event)
     refreshCommandWindowPreview(isCommandWindowTypingEvent(event))
+    suggestions.reconcile()
   }
 
   function handleKeyInner(event: KeyEvent) {
-    caretBlink.bump()
 
     // Mouse dragging creates a native terminal selection outside our editor
     // state. Most keypresses repaint the whole live region to release it. A
@@ -2398,7 +2714,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // though only two choice rows changed. Let the renderer diff those rows.
     const commandSelectorNavigation = overlay.kind === 'selector'
       && focusedCommandWindowGeneration !== null
-      && isStableCommandSelector(overlay.state)
+      && isCommandSelector(overlay.state)
       && (event.type === 'up' || event.type === 'down' || event.type === 'tab' || event.type === 'shift-tab')
     // While the composer owns a mounted command window, ordinary text edits
     // should likewise remain differential. Invalidating from the live-region
@@ -2413,7 +2729,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       renderer.invalidateRowsFrom(liveRegionStartRow)
     }
 
-    if (editingQueuedPrompt) {
+    if (queueEdit.editingEntry()) {
       if (event.type === 'escape' || (event.type === 'ctrl' && event.key === 'c')) {
         cancelQueueEdit()
         return
@@ -2424,7 +2740,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       }
     }
     if (isQueueManageShortcut(event)) {
-      if (overlay.kind === 'selector' && overlay.state.title === 'Prompt queue') {
+      if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.queue) {
         overlay = { kind: 'none' }
         renderer.requestRender()
       } else if (streamRef && queuedUserMessages.length > 0) {
@@ -2440,7 +2756,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // The panel claims its own gestures (enter / x / X / esc) before the
     // generic selector handling, which would otherwise treat them as filter
     // input or a plain selection.
-    if (overlay.kind === 'selector' && isBackgroundPanelTitle(overlay.state.title)) {
+    if (overlay.kind === 'selector' && isBackgroundSelector(overlay.state)) {
       if (backgroundTerminals.handlePanelKey(event)) return
     }
 
@@ -2453,8 +2769,8 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       exitHint,
       logMode: logMode !== null,
       hasQueuedPrompt: queuedUserMessages.length > 0,
-      isCompacting: compactionTask !== null,
-      canReclaimTurn: backgroundTerminals.canReclaimTurn(),
+      isCompacting: manualCompaction.active,
+      interaction: runInteraction.snapshot(runInteractionInput()),
     })
 
     for (const action of actions) {
@@ -2472,22 +2788,47 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         // actually released (it all finished in the same tick) say so rather
         // than falling through to an interrupt — this key must never be the one
         // that ends a run.
+        const wasForeground = backgroundTerminals.foregroundCount() > 0
         const freed = backgroundTerminals.reclaimTurn()
         if (freed === 0) {
           commitSystem('sys-reclaim-turn', '  Nothing to move to the background.')
           renderer.requestRender()
           return true
         }
-        commitSystem(
-          'sys-reclaim-turn',
-          '  ■ Running in the background; use esc to interrupt.',
-        )
+        if (wasForeground) {
+          commitSystem('sys-reclaim-turn', '  ● Shell moved to background; it keeps running.')
+        }
         renderer.requestRender()
         return true
       }
+      case 'stop-background': {
+        backgroundTerminals.refresh(false)
+        const input = runInteractionInput()
+        if (runInteraction.requestInterrupt(input) === 'interrupt') {
+          backgroundTerminals.stopAll(input.backgroundOwner ?? null)
+        }
+        renderer.requestRender()
+        return true
+      }
+      case 'stop-loop':
+        // Parked between loop ticks: Esc stops the loop, behind the same
+        // two-press window as a running turn. The wait row shows "esc again"
+        // after the first press; the second one is `/loop stop` without typing.
+        if (runInteraction.requestInterrupt(runInteractionInput()) === 'interrupt') {
+          loopSession.cancelWait()
+        }
+        renderer.requestRender()
+        return true
       case 'interrupt':
-        if (compactionTask) {
-          compactionTask.abort()
+        // Same gesture as opencode: the first Esc arms a short window and the
+        // spinner switches to "esc again to interrupt"; only the second press
+        // within that window stops the work.
+        if (runInteraction.requestInterrupt(runInteractionInput()) !== 'interrupt') {
+          renderer.requestRender()
+          return true
+        }
+        if (manualCompaction.active) {
+          manualCompaction.abort()
           return true
         }
         interruptStream('sys-int', '  Interrupted.')
@@ -2496,7 +2837,9 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         cleanup()
         if (sessionId) {
           process.stdout.write(`\n\x1b[90m${'─'.repeat(80)}\x1b[0m\n`)
-          process.stdout.write(`\x1b[90mResume: evot --resume ${sessionId}\x1b[0m\n\n`)
+          process.stdout.write(`\x1b[90mResume: evot --resume ${sessionId}\x1b[0m\n`)
+          for (const hint of exitLineageHint(lastLineage)) process.stdout.write(`\x1b[90m${hint}\x1b[0m\n`)
+          process.stdout.write('\n')
         }
         exitAfterCleanup(0)
         return true
@@ -2532,8 +2875,20 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         // path remains stable; only this explicit close is allowed to shrink.
         const closesCommandWindow = focusedCommandWindowGeneration !== null
           && overlay.kind === 'selector'
-          && isStableCommandSelector(overlay.state)
-        if (overlay.kind === 'ask-user') resolvePendingAsk()
+          && isCommandSelector(overlay.state)
+        // Ask and task-model overlays froze the tab title on a '?'. Every way
+        // of leaving them must release it, or the glyph outlives the prompt and
+        // no later overlay or run can repaint the title.
+        if (overlay.kind === 'ask-user') {
+          resolvePendingAsk()
+          unfreezeTerminalTitle()
+        }
+        if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.taskModel) {
+          resolvePendingTaskModel()
+        }
+        if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.task) {
+          taskSession.invalidate()
+        }
         invalidateExplicitResumeSelector()
         overlay = { kind: 'none' }
         focusedCommandWindowGeneration = null
@@ -2545,8 +2900,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         return true
       }
       case 'exit-log-mode':
-        logMode = null
-        commitSystem('sys-log-exit', '  [log mode] exited')
+        leaveLogMode()
         renderer.requestRender()
         return true
       case 'selector-key':
@@ -2559,7 +2913,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         toggleExpanded()
         return true
       case 'loading-enter':
-        handleLoadingEnter()
+        withDraftImages(handleLoadingEnter)
         return true
       case 'loading-char':
         if (event.type === 'char' || event.type === 'shift-char') {
@@ -2590,15 +2944,21 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   function interruptStream(id: string, text: string) {
+    suggestionContext.interrupt()
     unfreezeTerminalTitle()
     // Revoke ownership before aborting: native abort settles asynchronously,
     // and its rejected Promise must not later emit a second Interrupted/error
     // or clear a newer query that the user starts immediately afterward.
     revokeRun()
-    // If an ask/plan-review overlay is awaiting, resolve it as cancelled so the
-    // suspended host-tool dispatch in runQuery unblocks instead of hanging the
+    // Esc cancels this turn, not the recurring task. Only an explicit loop
+    // stop (or confirmed Esc while parked) should cancel future wakeups.
+    loopSession.endRun('interrupted')
+    if (loopSession.active) text += ' Loop remains active; /loop stop to stop.'
+    // If an interactive host-tool overlay is awaiting, resolve it as cancelled
+    // so the suspended dispatch in runQuery unblocks instead of hanging the
     // run loop forever.
     resolvePendingAsk()
+    resolvePendingTaskModel()
     const interruptedStream = streamRef
     streamRef = null
     interruptedStream?.abort()
@@ -2610,137 +2970,42 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // editor so the user can edit and press Enter, instead of committing it as
     // history under the cancellation notice.
     restoreQueuedUserMessagesToEditor()
-    commitLines([{ id, kind: 'cancelled', text }])
-    // Ownership was revoked above, so the aborted run's own finally block will
-    // not settle the hook. Settle here or an external adapter would stay stuck
-    // on working/blocked after every interrupt.
+    // The transcript has no record of a user-side interrupt, so this line is
+    // captured as a client notice and survives into a shared session.
+    committer.commitNotice([{ id, kind: 'cancelled', text }])
+    commitRunFooter()
+    backgroundTerminals.parkUntilBackground()
     sessionHook.settleRun()
   }
 
-  function queueEntryText(entry: QueuedPrompt): string {
-    const message = entry.message as { role?: string; content?: Array<{ type?: string; text?: string }> }
-    const text = message.content
-      ?.filter(content => content.type === 'text' && typeof content.text === 'string')
-      .map(content => content.text)
-      .join('\n')
-      .trim()
-    return text || '(non-text prompt)'
-  }
+  const queueEdit = createQueueEdit({
+    getStream: () => streamRef,
+    getQueued: () => queuedUserMessages,
+    setQueued: messages => { queuedUserMessages = messages },
+    getEditor: () => editor,
+    setEditor: next => { editor = next },
+    getOverlay: () => overlay,
+    setOverlay: next => { overlay = next },
+    commitSystem,
+    commitLines,
+    commitUser: commitUserMessage,
+    clearAll,
+    requestRender: () => renderer.requestRender(),
+  })
+  const {
+    openQueueSelector,
+    editQueuedPrompt,
+    cancelQueueEdit,
+    saveQueueEdit,
+    removeQueuedPrompt,
+    restoreLastQueuedUserMessageToEditor,
+    restoreQueuedUserMessagesToEditor,
+    reconcileQueuedUserMessages,
+  } = queueEdit
 
-  function managedQueueEntries(): ManagedQueuedPrompt[] {
-    if (!streamRef) return []
-    const visible = new Map(queuedUserMessages.map(message => [message.id, message.text]))
-    try {
-      const collect = (queue: 'steering' | 'follow_up') => streamRef!
-        .queuedPrompts(queue)
-        .map(entry => ({
-          queue,
-          id: entry.id,
-          version: entry.version,
-          text: visible.get(entry.id) ?? queueEntryText(entry),
-        }))
-      return [...collect('steering'), ...collect('follow_up')]
-    } catch {
-      return []
-    }
-  }
-
-  function openQueueSelector() {
-    const entries = managedQueueEntries()
-    if (entries.length === 0) {
-      overlay = { kind: 'none' }
-      commitSystem('sys-queue-empty', '  No queued prompts.')
-      return
-    }
-    overlay = { kind: 'selector', state: createQueueSelectorState(entries) }
-    renderer.requestRender()
-  }
-
-  function editQueuedPrompt(entry: ManagedQueuedPrompt) {
-    if (!streamRef) return
-    editingQueuedPrompt = entry
-    stashedQueueEditDraft = getEditorText(editor)
-    clearAll()
-    editor = insertText(editor, entry.text)
-    overlay = { kind: 'none' }
-    commitSystem('sys-queue-edit', '  Editing queued prompt · Enter save · Esc discard')
-    renderer.requestRender()
-  }
-
-  function finishQueueEdit() {
-    editingQueuedPrompt = null
-    clearAll()
-    editor = insertText(editor, stashedQueueEditDraft)
-    stashedQueueEditDraft = ''
-    renderer.requestRender()
-  }
-
-  function cancelQueueEdit() {
-    finishQueueEdit()
-    commitSystem('sys-queue-edit-cancel', '  Queue edit discarded.')
-  }
-
-  function saveQueueEdit(text: string) {
-    if (!streamRef || !editingQueuedPrompt || !text.trim()) return
-    const entry = editingQueuedPrompt
-    try {
-      const updated = streamRef.updateQueuedPrompt(entry.queue, entry.id, entry.version, text)
-      queuedUserMessages = queuedUserMessages.map(message => message.id === entry.id
-        ? { ...message, version: updated.version, text }
-        : message)
-      finishQueueEdit()
-      commitSystem('sys-queue-edit-save', '  Queued prompt updated.')
-    } catch (err) {
-      const current = managedQueueEntries().find(candidate => candidate.id === entry.id)
-      if (current) editingQueuedPrompt = { ...current, text }
-      else finishQueueEdit()
-      commitSystem('sys-queue-err', chalk.red(`  Queue edit failed: ${errorText(err)}`))
-      renderer.requestRender()
-    }
-  }
-
-  function removeQueuedPrompt(entry: ManagedQueuedPrompt) {
-    if (!streamRef) return
-    try {
-      streamRef.removeQueuedPrompt(entry.queue, entry.id, entry.version)
-      queuedUserMessages = queuedUserMessages.filter(message => message.id !== entry.id)
-      openQueueSelector()
-    } catch (err) {
-      reconcileQueuedUserMessages()
-      commitSystem('sys-queue-err', chalk.red(`  Queue remove failed: ${errorText(err)}`))
-      openQueueSelector()
-    }
-  }
-
-  /** Pull the newest queued prompt back into the editor without
-   *  aborting the active run. Native optimistic version matching prevents an
-   *  already-consumed prompt from being silently edited. */
-  function restoreLastQueuedUserMessageToEditor() {
-    if (!streamRef || queuedUserMessages.length === 0) return
-    const queued = queuedUserMessages[queuedUserMessages.length - 1]!
-    try {
-      streamRef.removeQueuedPrompt(queued.queue, queued.id, queued.version)
-      queuedUserMessages = queuedUserMessages.slice(0, -1)
-      const next = mergeQueuedIntoEditorText([queued.text], getEditorText(editor))
-      editor = insertText(clearEditor(editor), next)
-      renderer.requestRender()
-    } catch {
-      // The engine already consumed it at a turn boundary; normal event handling
-      // will commit the visible copy to history.
-    }
-  }
-
-  /** Move mid-stream queued messages into the input box after an interrupt. */
-  function restoreQueuedUserMessagesToEditor() {
-    if (queuedUserMessages.length === 0) return
-    const messages = queuedUserMessages.map(message => message.text)
-    queuedUserMessages = []
-    const next = mergeQueuedIntoEditorText(messages, getEditorText(editor))
-    editor = insertText(clearEditor(editor), next)
-    renderer.requestRender()
-  }
 
   function handleLoadingEnter() {
+    suggestions.cancel()
     const displayText = getDisplayText()
     const historyText = getHistoryText()
     const imageResult = buildImageContentBlocks()
@@ -2749,19 +3014,20 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       ? getExpandedText(imageResult.resolvedIds)
       : getExpandedText()
 
-    const trimmed = (expandedText || '').trim()
-    // A slash command may be typed with images attached; probe the visible
-    // draft too so "/compact" plus an image ref is still treated as a command.
-    const commandProbe = trimmed || displayText.trim()
-    if (compactionTask) {
-      if (commandProbe && isSlashCommand(commandProbe)) {
+    const action = busySubmissionAction({
+      displayText, expandedText, hasImages: imageBlocks !== null,
+      compacting: manualCompaction.active, editingQueue: queueEdit.editingEntry() !== null,
+      hasRun: streamRef !== null,
+    })
+    if (manualCompaction.active) {
+      if (action === 'blocked_compaction_command') {
         // Not silently swallowed: commands cannot run mid-compaction and are
         // not queueable prompts. Keep the draft in the editor for later.
         commitSystem('sys-compact-cmd', "  Commands don't run during compaction. Press Esc to cancel it, or wait for it to finish.")
         renderer.requestRender()
         return
       }
-      if (trimmed || imageBlocks) {
+      if (action === 'queue_compaction') {
         const queuedDisplay = displayText || '(image prompt)'
         queuedCompactionSubmissions.push({
           displayText: queuedDisplay,
@@ -2776,15 +3042,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       }
       return
     }
-    if (editingQueuedPrompt) {
+    if (action === 'edit_queue') {
       saveQueueEdit(expandedText)
       return
     }
-    if (trimmed === '/log') {
+    if (action === 'show_log') {
       clearAll()
       const logPath = screenLog.filePath
       if (logPath) {
-        const text = formatLogPaths(logPath, rendererTrace.filePath)
+        const text = formatLogPaths(logPath, rendererTrace.filePath, renderDiagnostics.summary(), judgeTracePath(sessionId))
         commitSystem('sys-log', text ?? `  Log: ${logPath}`)
       }
       else commitSystem('sys-log', '  No active screen log.')
@@ -2792,16 +3058,23 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       return
     }
 
+    if (action === 'run_readonly_command') {
+      if (historyText) saveInputHistory(historyText)
+      clearAll()
+      void handleSlashInput(expandedText)
+      return
+    }
+
     // Slash commands are not model input: queueing one as follow-up text
     // would send "/compact" to the LLM as conversation. Keep the draft in the
     // editor and tell the user instead.
-    if (commandProbe && isSlashCommand(commandProbe) && streamRef) {
+    if (action === 'blocked_run_command') {
       commitSystem('sys-cmd-busy', "  Commands don't queue while a response is running. Press Esc to interrupt, or wait for the turn to finish.")
       renderer.requestRender()
       return
     }
 
-    if ((expandedText || imageBlocks) && streamRef) {
+    if (action === 'steer' && streamRef) {
       if (imageBlocks) {
         const contentJson = JSON.stringify(imageBlocks)
         const queued = streamRef.steer('', contentJson)
@@ -2831,58 +3104,13 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   }
 
   /** Commit queued prompts that are no longer present in either native queue. */
-  function reconcileQueuedUserMessages() {
-    if (queuedUserMessages.length === 0 || !streamRef) return
-    let remainingIds: Set<string>
-    try {
-      remainingIds = new Set([
-        ...streamRef.queuedPrompts('steering'),
-        ...streamRef.queuedPrompts('follow_up'),
-      ].map(entry => entry.id))
-    } catch {
-      return
-    }
-    const remaining: QueuedUserMessage[] = []
-    for (const message of queuedUserMessages) {
-      if (remainingIds.has(message.id)) remaining.push(message)
-      else commitLines(buildUserMessage(message.text))
-    }
-    queuedUserMessages = remaining
-    if (remaining.length === 0 && overlay.kind === 'selector' && overlay.state.title === 'Prompt queue') {
-      overlay = { kind: 'none' }
-    }
-    if (editingQueuedPrompt && !remainingIds.has(editingQueuedPrompt.id)) {
-      finishQueueEdit()
-      commitSystem('sys-queue-edit-consumed', '  Queued prompt was already consumed; edit closed.')
-    }
-  }
-
   function refreshFileCompletions(acceptSingle: boolean): void {
-    const lineIndex = editor.cursorLine
-    const cursorCol = editor.cursorCol
-    const beforeCursor = editor.lines[lineIndex]!.slice(0, cursorCol)
-    const prefix = extractAtPrefix(beforeCursor)
-    if (!prefix) return
-
-    fdAbort?.abort()
-    const controller = new AbortController()
-    fdAbort = controller
-    completeAtFile(beforeCursor, appState.cwd, controller.signal).then(result => {
-      if (controller.signal.aborted) return
-      const currentBefore = editor.lines[lineIndex]?.slice(0, cursorCol)
-      if (editor.cursorLine !== lineIndex || editor.cursorCol !== cursorCol || currentBefore !== beforeCursor) return
-      if (!result) {
-        editor = closeCompletion(editor)
-      } else {
-        const items = result.items.map(item => ({
-          label: item.label,
-          value: item.value + (item.isDirectory ? '' : ' '),
-        }))
-        editor = showCompletions(editor, items, result.prefixStart, cursorCol, result.note)
-        if (acceptSingle && items.length === 1) editor = acceptCompletion(editor)
-      }
+    const beforeCursor = editor.lines[editor.cursorLine]?.slice(0, editor.cursorCol) ?? ''
+    if (!extractAtPrefix(beforeCursor)) return
+    void fileCompletion.refresh(editor, appState.cwd, acceptSingle, () => editor, next => {
+      editor = next
       renderer.requestRender()
-    }).catch(() => {})
+    })
   }
 
   function deleteAtCursor() {
@@ -2979,6 +3207,12 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         case 'o':
           toggleExpanded()
           return
+        case 'y':
+          // Keyboard twin of `/clip copy`: last reply's Markdown source to the
+          // clipboard. Ctrl+Y is the one free Ctrl letter with a clipboard
+          // connotation (readline yank).
+          void handleCopyCommand(replCommands)
+          return
         case '-':
           if (undoEditor()) renderer.requestRender()
           return
@@ -2997,34 +3231,44 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
           renderer.requestRender()
           return
         }
-        const displayText = getDisplayText()
-        const historyText = getHistoryText()
-        const imageResult = buildImageContentBlocks()
-        const imageBlocks = imageResult?.blocks ?? null
-        // expandedText: only strip image refs that have resolved data.
-        // Unresolved ones (e.g. from history) stay as [Image #N] text markers.
-        const expandedText = imageResult
-          ? getExpandedText(imageResult.resolvedIds)
-          : getExpandedText()
-        // Allow image-only or text-only submissions
-        if (!expandedText && !imageBlocks) return
-        if (historyText) saveInputHistory(historyText)
-        clearAll()
-        renderer.requestRender()
-        if (isSlashCommand(expandedText || rawText)) {
-          handleSlashInput(expandedText || rawText)
-        } else if (logMode) {
-          // In log mode, send to forked agent
-          runLogQuery(logMode, expandedText)
-        } else {
-          commitLines(buildUserMessage(displayText))
-          if (imageBlocks) {
-            const contentJson = JSON.stringify(imageBlocks)
-            runQuery('', contentJson)
+        withDraftImages(() => {
+          // Re-read: keys keep dispatching while a pending image load parks the
+          // submit, so text captured before the wait can already be stale.
+          const submitRaw = getEditorText(editor).trim()
+          const displayText = getDisplayText()
+          const historyText = getHistoryText()
+          const imageResult = buildImageContentBlocks()
+          const imageBlocks = imageResult?.blocks ?? null
+          // expandedText: only strip image refs that have resolved data.
+          // Unresolved ones (e.g. from history) stay as [Image #N] text markers.
+          const expandedText = imageResult
+            ? getExpandedText(imageResult.resolvedIds)
+            : getExpandedText()
+          // Allow image-only or text-only submissions
+          if (!expandedText && !imageBlocks) return
+          suggestions.cancel()
+          if (historyText) saveInputHistory(historyText)
+          clearAll()
+          renderer.requestRender()
+          if (isSlashCommand(expandedText || submitRaw)) {
+            handleSlashInput(expandedText || submitRaw)
+          } else if (logMode) {
+            // In log mode, send to forked agent
+            runLogQuery(logMode, expandedText)
           } else {
-            runQuery(expandedText)
+            commitUserMessage(displayText)
+            // If the model stopped the task edit with a plain-text question,
+            // the next reply is still in that edit flow, not a normal coding
+            // turn. Keep its task tool available until confirmation/cancel.
+            const taskExtension = taskSession.followUpExtension(sessionId)
+            if (imageBlocks) {
+              const contentJson = JSON.stringify(imageBlocks)
+              runQuery('', contentJson, undefined, taskExtension)
+            } else {
+              runQuery(expandedText, undefined, undefined, taskExtension)
+            }
           }
-        }
+        })
         break
       }
       case 'shift-enter':
@@ -3184,6 +3428,18 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }
   }
 
+  function leaveLogMode(): void {
+    if (!logMode) {
+      commitSystem('sys-mode', '  already in normal conversation mode')
+      return
+    }
+    composerRevision++
+    suggestions.cancel()
+    logMode = null
+    commitSystem('sys-log-exit', '  log mode: off · normal conversation')
+    requestProductSuggestion('mode_changed')
+  }
+
   async function handleSlashInput(text: string) {
     const pendingCommand = resolveCommand(text)
     if (pendingCommand.kind === 'resolved' && backgroundTerminals.guardSessionSwitch(pendingCommand.name)) {
@@ -3196,7 +3452,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       try {
         configInfo = agent.configInfo()
       } catch (err) {
-        commitSystem('sys-model-config', chalk.red(`  Failed to reload model config: ${errorText(err)}`))
+        commitSystem('sys-model-config', renderErrorNotice(`Failed to reload model config: ${errorText(err)}`))
         renderer.requestRender()
         return
       }
@@ -3206,27 +3462,25 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     let result
     try {
       result = handleSlashCommand(text, {
-      agent,
-      appState,
-      configInfo,
-      preloadedSessions,
-      planning,
-    })
+        agent,
+        appState,
+        configInfo,
+      })
     } catch (err) {
-      commitSystem('sys-command-err', chalk.red(`  Command failed: ${errorText(err)}`))
+      commitSystem('sys-command-err', renderErrorNotice(`Command failed: ${errorText(err)}`))
       renderer.requestRender()
       return
     }
     appState = result.appState
-    planning = result.planning
     if (result.overlay) overlay = result.overlay
-    if (result.clearScreen) {
-      renderer.clearScreen()
-      compactLines.length = 0
-      expandedLines.length = 0
-      resetHistoryCache()
-    }
     if (result.clearContext) {
+      composerRevision++
+      suggestionContextId++
+      suggestionContext.clear()
+      privacyFeed.forget(sessionId)
+      suggestions.cancel()
+      taskSession.cancelFlow()
+      loopSession.reset()
       // Abort any in-flight streaming and clear local context view without switching sessions.
       if (isLoading && streamRef) {
         revokeRun()
@@ -3237,11 +3491,10 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         flushStreamContent()
         streamMachine = null
         stopSpinner()
+        runStartedAt = null
       }
       sessionHook.endSession('context_cleared')
       sessionId = null
-      planModeItems = []
-      lastReviewedPlanMarkdown = ''
       appState = { ...createInitialState(appState.model, agent.cwd) }
       gitInfo.setCwd(agent.cwd)
       renderer.clearScreen()
@@ -3249,9 +3502,16 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       expandedLines.length = 0
       resetHistoryCache()
       try { preloadedSessions = await agent.listSessions(20) } catch {}
-      replaceResumeSessionCache(preloadedSessions)
+      resumeCache.replace(preloadedSessions)
     }
     if (result.newSession) {
+      composerRevision++
+      suggestionContextId++
+      suggestionContext.clear()
+      privacyFeed.forget(sessionId)
+      suggestions.cancel()
+      taskSession.cancelFlow()
+      loopSession.reset()
       // Abort any in-flight streaming.
       if (isLoading && streamRef) {
         revokeRun()
@@ -3262,14 +3522,15 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         flushStreamContent()
         streamMachine = null
         stopSpinner()
+        runStartedAt = null
       }
-      planModeItems = []
-      lastReviewedPlanMarkdown = ''
       // Leave the session unbound until the first real prompt. The query path
       // creates and returns the session id, so abandoning /new no longer leaves
       // an empty, untitled session in persistent storage or /resume.
       sessionHook.endSession('new_session')
       sessionId = null
+      lastLineage = []
+      setGhostHintContext({ forked: false })
       appState = { ...createInitialState(appState.model, agent.cwd) }
       gitInfo.setCwd(agent.cwd)
       renderer.clearScreen()
@@ -3280,7 +3541,6 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }
     if (result.exit) { exitAfterCleanup(0); return }
     if (result.restart) { restartAfterCleanup(); return }
-    if (result.resumeSession) await resumeSession(result.resumeSession)
     if (result.systemLines.length > 0) commitSystemLines(result.systemLines)
 
     // Handle async commands that the simple handleSlashCommand can't do
@@ -3293,32 +3553,47 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
     if (name === '/model' && args) {
       refreshConfigInfo()
+      // The current-model suggestion route now carries this provider's key.
+      suggestions.credentialsChanged()
       appState = { ...appState, model: agent.model }
     }
 
-    if (name === '/plan') {
-      planModeItems = []
-      lastReviewedPlanMarkdown = ''
-      renderer.requestRender()
-    }
-
-    if (name === '/compact') {
+    if (name === '/task') {
+      if (args === 'cancel') {
+        commitSystem('sys-task-cancel', taskSession.cancelFlow()
+          ? '  Task edit cancelled · nothing was saved'
+          : '  No task edit in progress')
+      } else if (!args || args === 'list') {
+        taskSession.open()
+      } else if (taskShareId(args) !== null) {
+        // A pasted share link is an import, not a request to interpret.
+        commitUserMessage(text.trim())
+        void taskSession.import(args.trim())
+      } else {
+        taskSession.create(text.trim(), args)
+      }
+    } else if (name === '/loop') {
+      loopSession.handleCommand(text.trim(), args)
+    } else if (name === '/compact') {
       await runManualCompaction(args)
     } else if (name === '/env') {
       await handleEnvCommand(replCommands, args)
+    } else if (name === '/privacy') {
+      await handlePrivacyCommand(replCommands, args)
     } else if (name === '/harden') {
-      const subject = buildHardenPrompt(args)
-      commitLines(buildUserMessage(text.trim()))
-      runQuery(subject)
+      commitUserMessage(text.trim())
+      runQuery(buildCommandPrompt({ name: 'harden', input: text.trim(), instructions: buildHardenPrompt(args) }))
     } else if (name === '/clip') {
       const sub = args.trim().toLowerCase()
       if (sub === 'all') {
         // /clip all is expanded server-side into the memory skill's session
         // distillation prompt; bare /clip remains a zero-token local action.
-        commitLines(buildUserMessage(text.trim()))
+        commitUserMessage(text.trim())
         runQuery('/clip all')
+      } else if (sub === 'copy') {
+        await handleCopyCommand(replCommands)
       } else if (sub) {
-        commitSystem('sys-clip-err', '  Usage: /clip [all]')
+        commitSystem('sys-clip-err', '  Usage: /clip [all | copy]')
       } else {
         await handleClipCommand(replCommands)
       }
@@ -3330,8 +3605,6 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       } finally {
         refreshBannerData()
       }
-    } else if (name === '/copy') {
-      await handleCopyCommand(replCommands)
     } else if (name === '/update') {
       await handleUpdateCommand(replCommands)
     } else if (name === '/version') {
@@ -3363,13 +3636,13 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
                 cloudLoginRequired = !reloadAfterAuthChange()
                 authWatcher?.sync()
                 if (cloudLoginRequired) {
-                  commitSystem('sys-login-model-err', chalk.red('  Login succeeded, but no cloud model was loaded. Try /login again.'))
+                  commitSystem('sys-login-model-err', renderErrorNotice('Login succeeded, but no cloud model was loaded. Try /login again.'))
                 } else {
                   void syncCloudNow(true)
                 }
               } catch (err) {
                 cloudLoginRequired = true
-                commitSystem('sys-login-model-err', chalk.red(`  Failed to load the signed-in cloud model: ${errorText(err)}`))
+                commitSystem('sys-login-model-err', renderErrorNotice(`Failed to load the signed-in cloud model: ${errorText(err)}`))
               }
             }
           } finally {
@@ -3389,25 +3662,20 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
             authWatcher?.sync()
           } catch (err) {
             cloudLoginRequired = true
-            commitSystem('sys-logout-model-err', chalk.red(`  Failed to reload providers after logout: ${errorText(err)}`))
+            commitSystem('sys-logout-model-err', renderErrorNotice(`Failed to reload providers after logout: ${errorText(err)}`))
           }
         }
       }
-    } else if (name === '/act' || name === '/done') {
-      if (logMode) {
-        logMode = null
-        commitSystem('sys-log-exit', '  [log mode] exited')
-      } else {
-        planning = false
-        planModeItems = []
-        commitSystem('sys-act', '  planning: off')
-      }
+    } else if (name === '/done') {
+      leaveLogMode()
+    } else if (name === '/_mem') {
+      commitSystem('sys-mem', `  ${memoryLine()}`)
     } else if (name === '/_dump') {
       try {
         const outcome = await agent.submit(
           `/_dump${args ? ' ' + args : ''}`,
           sessionId ?? undefined,
-          planning ? 'planning_interactive' : 'interactive',
+          'interactive',
         )
         if (outcome.kind === 'command') {
           const lines = (outcome.message ?? '').split('\n').map((line, i) => ({
@@ -3418,15 +3686,21 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
           commitLines(lines.length > 0 ? lines : [{ id: 'sys-dump', kind: 'system', text: '  (no dump output)' }])
         }
       } catch (err) {
-        commitSystem('sys-dump-err', chalk.red(`  /_dump failed: ${errorText(err)}`))
+        commitSystem('sys-dump-err', renderErrorNotice(`/_dump failed: ${errorText(err)}`))
       }
     } else if (name === '/log') {
       await handleLogCommand(args)
+    } else if (name === '/fork') {
+      await handleForkCommand(args)
+    } else if (name === '/back') {
+      await handleBackCommand(args)
     } else if (name === '/resume') {
       const query = normalizeResumeQuery(args)
       try {
-        if (query && isSessionIdPrefix(query)) {
-          const allSessions = await loadResumeSessions()
+        if (query === '--all') {
+          openResumeSelector(undefined, { includeAutomation: true })
+        } else if (query && isSessionIdPrefix(query)) {
+          const allSessions = mergeRemoteSessions(await resumeCache.all(), cloudSessions.remoteSessions)
           const resolved = resolveSessionByPrefix(allSessions, query)
           if (resolved.kind === 'matched') {
             await resumeSession(resolved.session)
@@ -3434,18 +3708,60 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
             openResumeSelector(query)
           }
         } else if (query) {
-          await handleSemanticResume(query)
+          await handleSessionSearch(args)
         } else {
           openResumeSelector(undefined)
         }
       } catch (err) {
-        commitSystem('sys-r-err', chalk.red(`  Failed to list sessions: ${errorText(err)}`))
+        commitSystem('sys-r-err', renderErrorNotice(`Failed to list sessions: ${errorText(err)}`))
       }
     } else if (name === '/model' && !args) {
       openModelSelector()
     }
 
     renderer.requestRender()
+  }
+
+  /** `/fork [title]`: copy the current context into a new session and move there. */
+  async function handleForkCommand(title: string) {
+    if (!sessionId) {
+      commitSystem('sys-fork-none', chalk.dim('  Nothing to fork yet: send a message first.'))
+      return
+    }
+    try {
+      const parent = (await agent.sessionLineage(sessionId)).at(-1) ?? ({ session_id: sessionId } as SessionMeta)
+      const fork = await agent.forkSession(sessionId, title.trim() || undefined)
+      invalidateResumeSessionCache()
+      await resumeSession(fork, forkNotice(fork, parent, chalk.dim, chalk.cyan))
+    } catch (err) {
+      commitSystem('sys-fork-err', renderErrorNotice(`/fork failed: ${errorText(err)}`))
+    }
+  }
+
+  /** `/back [levels | root]`: resume an ancestor along the fork chain. */
+  async function handleBackCommand(levels: string) {
+    if (!sessionId) {
+      commitSystem('sys-back-none', chalk.dim('  Not in a session.'))
+      return
+    }
+    try {
+      const lineage = await refreshForkTrail(sessionId)
+      const resolved = resolveBackTarget(lineage, levels)
+      if (resolved.kind === 'root') {
+        commitSystem('sys-back-root', chalk.dim('  Already at the root session.  /sessions lists the others.'))
+        return
+      }
+      if (resolved.kind === 'invalid') {
+        commitSystem('sys-back-arg', chalk.dim(`  /back takes a level count, e.g. /back 2 (got "${resolved.levels}").`))
+        return
+      }
+      const left = lineage[lineage.length - 1]
+      if (!left) return
+      invalidateResumeSessionCache()
+      await resumeSession(resolved.target, backNotice(left, resolved.target, resolved.skipped, chalk.dim, chalk.cyan))
+    } catch (err) {
+      commitSystem('sys-back-err', renderErrorNotice(`/back failed: ${errorText(err)}`))
+    }
   }
 
   /**
@@ -3455,67 +3771,75 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
    * sessions. Falls back to the literal-filter selector on failure.
    */
   function cloudCampaigns(notices = authNotices()) {
-    return notices.map(n => ({
-      id: n.id,
-      kind: n.kind,
-      priority: n.priority,
-      title: n.title,
-      body: n.body_md ?? '',
-    }))
+    return campaignContent(notices)
   }
 
   /** Re-read the synced catalog: refresh model config and the ad/notice slot.
    *  Called after login, by the live-sync poller, and on demand. */
   function reloadCloudContent(fresh = cloudCampaigns()): void {
-    const previous = [...adSlot.notices, ...adSlot.ads]
-    const previousById = new Map(previous.map(campaign => [campaign.id, campaign]))
-    // Refresh campaigns in place — runtime slot state (whether the slot has
-    // been triggered, and where rotation is) must survive a content refresh.
-    const keep = {
-      seenNoticeIds: adSlot.seenNoticeIds,
-      triggered: adSlot.triggered,
-      currentId: adSlot.currentId,
-      shownAt: adSlot.shownAt,
-      rotationDueAt: adSlot.rotationDueAt,
-      queuedId: adSlot.queuedId,
-      shownFingerprints: adSlot.shownFingerprints,
-    }
-    // Re-read, not cached: a mid-session login can grant a premium model.
-    const premium = hasPremiumModel(configInfo)
-    Object.assign(
-      adSlot,
-      createAdSlotState(fresh, { premium, shownFingerprints: adSlot.shownFingerprints }),
-      keep,
-    )
-    const showing = [...adSlot.notices, ...adSlot.ads].find(campaign => campaign.id === adSlot.currentId)
-    if (adSlot.currentId && !showing) {
-      adSlot.currentId = null
-      adSlot.queuedId = null
-    } else if (showing) {
-      const before = previousById.get(showing.id)
-      if (before && campaignFingerprint(before) !== campaignFingerprint(showing)) {
-        // Same campaign, new copy — retype so the updated markdown appears now.
-        adSlot.shownAt = Date.now()
-        adSlot.queuedId = null
-      }
-    }
-    if (!adSlot.triggered && (adSlot.notices.length > 0 || adSlot.ads.length > 0)) {
-      triggerAdSlot(adSlot, Date.now())
-    }
+    refreshCampaigns(adSlot, fresh, hasPremiumModel(configInfo), Date.now())
     try { configInfo = agent.configInfo() } catch {}
+    // The judge follows the catalog: switching it off on the server turns the
+    // `jev prune` marker off here on the next sync, and the engine re-reads
+    // the same cache per run.
+    if (appState.judge !== configInfo?.judge) appState = { ...appState, judge: configInfo?.judge }
   }
 
   // Live sync: re-fetch the cloud catalog so new notices, ads and models
   // appear in-session without a restart. Silent when nothing changed.
-  let lastSyncedAt = 0
   let inflightSync: Promise<void> | null = null
   const CLOUD_SYNC_MS = 15_000
-  const syncTimer = setInterval(() => {
-    void syncCloudNow()
+  const cloudSync = new CloudSync({
+    authenticated: async () => {
+      const { authWhoami } = await import('../native/index.js')
+      return Boolean(await authWhoami())
+    },
+    // The signed-in slot is driven by the account catalog, not the public
+    // /v1/notices list. The catalog already includes every campaign this
+    // account matches (everyone, premium, group); the public list is only the
+    // everyone subset. Feeding it in here replaced the showing notice with
+    // that subset and restarted the ticker every sync.
+    syncNotices: async () => [],
+    syncModels: async () => {
+      const { authSyncModels } = await import('../native/index.js')
+      return authSyncModels()
+    },
+    noticesUpdated: () => {},
+    modelsUpdated: () => {
+      authWatcher?.sync()
+      reloadCloudContent()
+    },
   }, CLOUD_SYNC_MS)
-  ;(syncTimer as unknown as { unref?: () => void }).unref?.()
-  const backgroundProcessTimer = setInterval(refreshBackgroundProcesses, 500)
-  ;(backgroundProcessTimer as unknown as { unref?: () => void }).unref?.()
+  resources.add(() => cloudSync.dispose())
+  resources.add(backgroundJobs.register({ name: 'cloud-sync', intervalMs: CLOUD_SYNC_MS, initialDelayMs: 400, run: () => syncCloudNow() }))
+  resources.add(backgroundJobs.register({ name: 'processes', intervalMs: 500, immediate: false, run: refreshBackgroundProcesses }))
+  resources.add(backgroundJobs.register({ name: 'tasks', intervalMs: 10_000, immediate: false, run: () => taskSession.refreshIfVisible() }))
+  // Official skills follow their catalog on their own: a stamp-gated check on
+  // the same cadence as the check itself, so a fresh launch and a session left
+  // open for days both stay current without anyone running /skill update.
+  // Skills are re-read from disk on every turn, so a sync needs no reload.
+  resources.add(backgroundJobs.register({
+    name: 'official-skills',
+    intervalMs: OFFICIAL_SYNC_INTERVAL_MS,
+    initialDelayMs: 1_500,
+    run: async () => {
+      const outcome = await startOfficialSkillMaintenance()
+      if (outcome.kind === 'synced' && !destroyed) noteOfficialSkillSync(outcome.result)
+    },
+  }))
+  resources.add(registerDashboard(backgroundJobs, {
+    attempt: () => tryStartServer(opts.serverPort, configInfo?.envPath ?? opts.envFile),
+    stop: stopOwnedServer,
+    publish: state => {
+      const changed = serverState?.address !== state?.address || serverState?.owned !== state?.owned
+      serverState = state
+      if (changed && !destroyed) {
+        refreshBannerData()
+        terminalTitle.refresh()
+        renderer.requestRender()
+      }
+    },
+  }))
 
   /** Adopt a cloud auth change made by another evot process. */
   function adoptExternalAuthChange(): void {
@@ -3536,39 +3860,30 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   authWatcher = new AuthWatcher(() => adoptExternalAuthChange())
 
+  // Any server-pushed group counts, not just the free tier, so granted
+  // models and split protocol groups are announced too.
+  const cloudModels = () => configInfo?.availableModels.filter(isCloudModel) ?? []
+  const modelAnnouncer = new ModelAnnouncer()
+  modelAnnouncer.seed(cloudModels().map(m => m.model))
+
   async function syncCloudNow(force = false): Promise<void> {
+    if (destroyed) return
     if (inflightSync) return inflightSync
-    if (!force && Date.now() - lastSyncedAt < CLOUD_SYNC_MS) return
     inflightSync = (async () => {
-      const { authSyncModels, authSyncNotices, authWhoami } = await import('../native/index.js')
-      if (!await authWhoami()) return
-      // Any server-pushed group counts, not just the free tier, so granted
-      // models and split protocol groups are announced too.
-      const cloudModels = () => configInfo?.availableModels.filter(isCloudModel) ?? []
-      const knownModelIds = new Set(cloudModels().map(m => m.model))
+      // The remote session index rides the same tick; empty when signed out.
+      void cloudSessions.refreshIndex()
+      // Anything present right before the sync counts as known, even if it
+      // arrived through a path other than this sync (e.g. an external login).
+      modelAnnouncer.seed(cloudModels().map(m => m.model))
       const knownCampaignIds = new Set([...adSlot.notices, ...adSlot.ads].map(c => c.id))
       const knownFingerprints = new Set([...adSlot.notices, ...adSlot.ads].map(campaignFingerprint))
 
-      // Campaigns are public and refresh independently from the authenticated
-      // model catalog. An expired cloud token must not freeze the ad slot.
-      let noticesSynced = false
-      let modelsSynced = false
-      try {
-        const notices = await authSyncNotices()
-        noticesSynced = true
-        reloadCloudContent(cloudCampaigns(notices))
-      } catch {}
-      try {
-        await authSyncModels()
-        modelsSynced = true
-        // Absorb our own write so the watcher does not replay it.
-        authWatcher?.sync()
-        reloadCloudContent()
-      } catch {}
-      lastSyncedAt = Date.now()
+      const synced = await cloudSync.run(force)
+      if (destroyed || !synced) return
+      const { noticesSynced, modelsSynced } = synced
       if (!noticesSynced && !modelsSynced) return
 
-      const addedModels = cloudModels().filter(m => !knownModelIds.has(m.model))
+      const addedModels = modelAnnouncer.fresh(cloudModels())
       const campaigns = [...adSlot.notices, ...adSlot.ads]
       const addedCampaigns = campaigns.filter(c => !knownCampaignIds.has(c.id))
       const copyChanged = campaigns.some(c => !knownFingerprints.has(campaignFingerprint(c)))
@@ -3603,143 +3918,156 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }
   }
 
-  // First pull as soon as the prompt is up, so ads/models aren't 30s stale.
-  setTimeout(() => { void syncCloudNow() }, 400).unref?.()
-
   function openModelSelector(): void {
-    const models = modelOptions(configInfo, agent.model)
-    const activeSpec = currentModelSpec(configInfo, agent.model)
-    overlay = {
-      kind: 'selector',
-      state: selectorFocusOn(
-        {
-          ...createSelectorState('Models', modelSelectorItems(models, activeSpec)),
-          presentation: 'model',
-          circularNavigation: true,
-          // An explicitly opened window starts on the list, not in its search
-          // box: arrows move between models immediately and typing still moves
-          // focus to the filter. Same contract as the previewed window.
-          listFocused: true,
-        },
-        item => item.id === activeSpec,
-      ),
-    }
+    overlay = { kind: 'selector', state: createModelWindow(configInfo, agent.model, true) }
   }
 
-  /** Swap the open or previewed /model list in place after a catalog refresh.
-   *  Keeps the current query and focused row so typing isn't yanked around. */
+  /** Swap an open model catalog in place after a cloud refresh. Both the live
+   *  /model picker and the Task-scoped picker keep their query, focused row,
+   *  and adjusted effort; Task ownership remains separate from the session. */
   function refreshOpenModelSelector(): boolean {
-    const models = modelOptions(configInfo, agent.model)
-    const activeSpec = currentModelSpec(configInfo, agent.model)
-    if (overlay.kind === 'selector' && overlay.state.presentation === 'model') {
+    if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.taskModel) {
       overlay = {
         kind: 'selector',
-        state: selectorExpandItems(overlay.state, modelSelectorItems(models, activeSpec)),
+        state: refreshTaskModelWindow(overlay.state, configInfo, agent.model),
+      }
+      return true
+    }
+    const models = modelOptions(configInfo, agent.model)
+    const activeSpec = currentModelSpec(configInfo, agent.model)
+    const rebuilt = () => modelSelectorItems(models, activeSpec, configInfo?.thinkingLevel, configInfo?.defaultModel)
+    if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.model) {
+      overlay = {
+        kind: 'selector',
+        state: selectorExpandItems(
+          overlay.state,
+          carryModelEfforts(overlay.state.allItems, rebuilt()),
+        ),
       }
       return true
     }
     if (commandWindowPreview?.kind === 'selector' && commandWindowPreview.trigger === 'model') {
       commandWindowPreview = {
         ...commandWindowPreview,
-        state: selectorExpandItems(commandWindowPreview.state, modelSelectorItems(models, activeSpec)),
+        state: selectorExpandItems(
+          commandWindowPreview.state,
+          carryModelEfforts(commandWindowPreview.state.allItems, rebuilt()),
+        ),
       }
       return true
     }
     return false
   }
 
-  async function handleSemanticResume(query: string) {
-    commitSystem('sys-rsem-busy', chalk.dim('  searching sessions…'))
-    renderer.requestRender()
-    try {
-      const outcome = await agent.submit(`/_rsearch ${query}`, sessionId ?? undefined, 'interactive')
-      if (outcome.kind !== 'command') return
-      const message = outcome.message ?? ''
-      const lines = message.split('\n')
-      commitLines(lines.map((line, i) => ({
-        id: `sys-rsem-${i}`,
-        kind: 'system' as const,
-        text: `  ${line}`,
-      })))
-      const ids: string[] = []
-      for (const line of lines) {
-        const m = /^- (\S+) — /.exec(line)
-        if (m) ids.push(m[1]!)
-      }
-      if (ids.length === 0) return
-      const allSessions = await loadResumeSessions()
-      const ranked = ids
-        .map(id => allSessions.find(s => s.session_id === id))
-        .filter((s): s is SessionMeta => Boolean(s))
-      if (ranked.length === 0) return
-      const items = formatSessionItems(ranked, agent.cwd)
-      invalidateExplicitResumeSelector()
-      overlay = {
-        kind: 'selector',
-        state: resumeSelectorState(items),
-      }
-      renderer.requestRender()
-    } catch (err) {
-      commitSystem('sys-rsem-err', chalk.red(`  Semantic search failed: ${errorText(err)}`))
-      openResumeSelector(query)
+  /**
+   * `/sessions <query>`: a normal agent turn with a prepared search task.
+   * When the answer lists sessions, open the resume selector on them in the
+   * agent's order so Enter resumes straight away.
+   */
+  async function handleSessionSearch(args: string) {
+    await runQuery(`/sessions ${args.trim()}`)
+    const results = parseSessionSearchResults(lastAssistantText(appState.messages))
+    if (results.length === 0) return
+    const allSessions = await resumeCache.all()
+    const ranked = results
+      .map(result => allSessions.find(s => s.session_id === result.sessionId))
+      .filter((s): s is SessionMeta => s !== undefined && isInteractiveSession(s))
+    if (ranked.length === 0) return
+    // Each row shows the summary the search model wrote for that session.
+    const summaries = new Map(results.map(result => [result.sessionId, result.summary]))
+    const items = formatRankedSessionItems(ranked, id => resumeCache.sessionText(id), sessionId, sessionCloudLabel, summaries)
+    invalidateExplicitResumeSelector()
+    overlay = {
+      kind: 'selector',
+      // Summaries may take two lines so they can say what each session did.
+      state: { ...resumeSelectorState(items), title: 'Session search results', labelLines: 2 },
     }
+    renderer.requestRender()
   }
 
-  function openResumeSelector(initialQuery?: string) {
+  /**
+   * `cloudOnly` (from `/share`) narrows the rows structurally, by each
+   * session's cloud state, never by matching the word in transcripts.
+   */
+  function openResumeSelector(initialQuery?: string, options: { cloudOnly?: boolean; includeAutomation?: boolean } = {}) {
     const generation = ++explicitResumeSelectorGeneration
-    const cached = resumeSessionsWithTextCache ?? resumeSessionsCache
+    const cached = resumeCache.withText ?? resumeCache.metadata
+    const shape = {
+      showOtherCwds: Boolean(options.cloudOnly || options.includeAutomation),
+      cloudFirst: Boolean(options.cloudOnly),
+    }
+    const rows = (sessions: SessionMeta[]) => {
+      const merged = mergeRemoteSessions(sessions, cloudSessions.remoteSessions)
+      return options.cloudOnly
+        ? merged.filter(session => sessionCloudLabel(session) !== '')
+        : options.includeAutomation ? merged : merged.filter(isInteractiveSession)
+    }
     const items = cached === null
       ? []
-      : resumeSessionsWithTextCache !== null
-        ? formatSessionWithTextItems(resumeSessionsWithTextCache, agent.cwd)
-        : formatSessionItems(cached, agent.cwd)
+      : formatSessionItems(rows(cached), agent.cwd, id => resumeCache.sessionText(id), sessionId, sessionCloudLabel, shape)
     overlay = {
       kind: 'selector',
       state: {
-        ...resumeSelectorState(items, initialQuery),
+        ...(options.cloudOnly ? cloudSelectorState(items) : resumeSelectorState(items, initialQuery)),
+        ...(options.cloudOnly ? { title: 'Cloud sessions', sessionScope: 'cloud' as const } : {}),
+        ...(options.includeAutomation ? { title: 'All sessions · including task runs' } : {}),
         ...(cached === null ? { emptyMessage: 'Loading sessions…' } : {}),
       },
     }
     renderer.requestRender()
+    if (cached !== null) loadFocusedResumePreview(overlay.state)
 
     const activeState = (): SelectorState | null => {
       if (generation !== explicitResumeSelectorGeneration) return null
-      if (overlay.kind !== 'selector' || !isResumeSelectorTitle(overlay.state.title)) return null
+      if (overlay.kind !== 'selector' || overlay.state.owner !== SELECTOR_OWNER.resume) return null
       return overlay.state
     }
 
-    loadResumeSessions().then(allSessions => {
+    let loadedSessions: SessionMeta[] | undefined
+    const repaint = () => {
+      if (!loadedSessions) return
       const current = activeState()
-      if (!current) return
-      if (allSessions.length === 0) {
+      if (!current || current.rename) return
+      const visible = rows(loadedSessions)
+      // An empty list closes with one line, whichever way it was opened.
+      if (visible.length === 0) {
         invalidateExplicitResumeSelector()
         overlay = { kind: 'none' }
-        commitSystem('sys-r', '  No sessions found')
+        commitSystem('sys-r', options.cloudOnly
+          ? '  No shared sessions yet · /share private to sync this session, /share public to publish it'
+          : '  No sessions found')
         renderer.requestRender()
         return
       }
-      const metaItems = formatSessionItems(allSessions, agent.cwd)
+      const metaItems = formatSessionItems(visible, agent.cwd, id => resumeCache.sessionText(id), sessionId, sessionCloudLabel, shape)
       overlay = {
         kind: 'selector',
-        state: selectorExpandItems(current, metaItems),
+        // Loaded: the placeholder must not survive as the no-match message.
+        state: { ...selectorExpandItems(current, metaItems), emptyMessage: undefined },
       }
       renderer.requestRender()
-      loadResumeSessionsWithText().then(allWithText => {
-        const enriched = activeState()
-        if (!enriched) return
-        const fullItems = formatSessionWithTextItems(allWithText, agent.cwd)
-        overlay = {
-          kind: 'selector',
-          state: selectorExpandItems(enriched, fullItems),
-        }
-        // Same reason as the command-window path: warm the lowercased search
-        // text in idle slices instead of on the first keystroke.
-        startSearchTextWarm(fullItems)
-        renderer.requestRender()
+      loadFocusedResumePreview(overlay.state)
+    }
+    refreshOpenSessionList = () => {
+      if (!loadedSessions || !activeState()) return
+      // A rename or deletion may have invalidated the local cache since this
+      // selector opened. Do not resurrect its original rows on the next tick.
+      void resumeCache.all().then(sessions => {
+        loadedSessions = sessions
+        repaint()
       }).catch(() => {})
+    }
+    // Fetch before deciding the list is empty: this machine may have no
+    // local sessions while the account already has remote ones.
+    Promise.all([resumeCache.all(), cloudSessions.refreshIndex()]).then(([sessions]) => {
+      loadedSessions = sessions
+      repaint()
     }).catch((err: unknown) => {
       if (!activeState()) return
-      commitSystem('sys-r-err', chalk.red(`  Failed to list sessions: ${errorText(err)}`))
+      invalidateExplicitResumeSelector()
+      overlay = { kind: 'none' }
+      commitSystem('sys-r-err', renderErrorNotice(`Failed to list sessions: ${errorText(err)}`))
+      renderer.requestRender()
     })
   }
 
@@ -3798,7 +4126,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         else lines.push('  PNG:  (no Chrome/Chromium — HTML only. Install chromium or set EVOT_CHROME.)')
         commitSystem('sys-log-shot', lines.join('\n'))
       } catch (err) {
-        commitSystem('sys-log-err', chalk.red(`  Shot failed: ${errorText(err)}`))
+        commitSystem('sys-log-err', renderErrorNotice(`Shot failed: ${errorText(err)}`))
       } finally {
         foregroundCommand = null
         isLoading = false
@@ -3808,11 +4136,11 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     } else if (!query) {
       const logPath = screenLog.filePath
       if (logPath) {
-        const text = formatLogPaths(logPath, rendererTrace.filePath)
+        const text = formatLogPaths(logPath, rendererTrace.filePath, renderDiagnostics.summary(), judgeTracePath(sid))
         commitSystem('sys-log', text ?? `  Log: ${logPath}`)
       }
       else if (sid) {
-        const text = formatLogPaths(join(logDir, `${sid}.screen.log`))
+        const text = formatLogPaths(join(logDir, `${sid}.screen.log`), null, null, judgeTracePath(sid))
         commitSystem('sys-log', text ?? `  Log: ${join(logDir, `${sid}.screen.log`)}`)
       }
       else commitSystem('sys-log', `  Log dir: ${logDir} (no active session)`)
@@ -3821,26 +4149,17 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     } else {
       // /log <query> — fork agent to analyze log
       const logPath = join(logDir, `${sid}.screen.log`)
-      const systemPrompt = [
-        'You are in a temporary log analysis session.',
-        'This session is not persisted and does not affect the main session context.',
-        '',
-        `Screen log file to analyze:\n${logPath}`,
-        '',
-        'Rules:',
-        '- Read relevant log sections before answering; do not guess',
-        '- Prefer partial reads; avoid loading the entire file at once',
-        '- Use search to locate key information when needed',
-        '- Do not modify any files',
-      ].join('\n')
+      const systemPrompt = logAnalysisPrompt(logPath, judgeTracePath(sid))
       try {
         const forked = agent.fork(systemPrompt)
         logMode = forked
-        commitSystem('sys-log-mode', `  [log mode] analyzing: ${logPath}\n  not persisted. press Esc to exit.`)
+        composerRevision++
+        suggestions.cancel()
+        commitSystem('sys-log-mode', `  log mode: on · read-only · /done or esc to return\n  analyzing: ${logPath} · not persisted`)
         renderer.requestRender()
         await runLogQuery(forked, query)
       } catch (err) {
-        commitSystem('sys-log-err', chalk.red(`  Fork failed: ${errorText(err)}`))
+        commitSystem('sys-log-err', renderErrorNotice(`Fork failed: ${errorText(err)}`))
       }
     }
     renderer.requestRender()
@@ -3849,13 +4168,16 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   async function runLogQuery(forked: import('../native/index.js').ForkedAgent, prompt: string) {
     if (queryBlockedByCloudLogin()) return
     const generation = beginRun()
+    runStartedAt = Date.now()
+    runTurnCount = 0
+    runThinking.reset()
     liveContentMaxHeight = 0
     isLoading = true
     spinnerState = createSpinnerState()
     streamMachine = createStreamMachineState(appState, spinnerState)
     startSpinner()
     renderer.requestRender()
-    commitLines(buildUserMessage(prompt))
+    commitUserMessage(prompt)
 
     try {
       const stream = await forked.query(prompt)
@@ -3873,19 +4195,25 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
       for await (const event of stream) {
         if (destroyed || !ownsRun(generation)) break
         if (!streamMachine) break
+        if (isHostToolEvent(event)) throw new Error('Readonly log run requested a host tool')
 
+        runThinking.observe(event)
         const update = reduceRunEvent(streamMachine, event, {
           termRows: renderer.termRows,
           cloudProvider: activeProviderIsCloud(),
         })
         streamMachine = update.state
         appState = update.state.appState
+        suggestionContext.observe(event)
         spinnerState = update.state.spinnerState
         if (update.sessionRevoked) handleCloudSessionRevoked()
 
         if (event.kind === 'assistant_delta') renderer.requestRender()
         if (update.commitLines.length > 0) commitLines(update.commitLines)
-        if (event.kind === 'turn_started') reconcileQueuedUserMessages()
+        if (event.kind === 'turn_started') {
+          runTurnCount++
+          reconcileQueuedUserMessages()
+        }
         if (update.rerenderStatus) renderer.requestRender()
       }
 
@@ -3905,7 +4233,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         streamMachine = final.state
         commitFlushResult(final)
       }
-      commitSystem('sys-log-err', chalk.red(`  Log query failed: ${errorText(err)}`))
+      commitSystem('sys-log-err', renderErrorNotice(`Log query failed: ${errorText(err)}`))
       reconcileQueuedUserMessages()
       restoreQueuedUserMessagesToEditor()
     } finally {
@@ -3914,27 +4242,51 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         isLoading = false
         streamMachine = null
         stopSpinner()
+        commitRunFooter()
         renderer.requestRender()
       }
     }
   }
 
+  async function openShareLinks(): Promise<void> {
+    invalidateExplicitResumeSelector()
+    focusedCommandWindowGeneration = null
+    nextCommandWindowGeneration()
+    releaseCommandWindowLayout()
+    const controller: ShareSelector = new ShareSelector({
+      list: () => agent.listShares(),
+      delete: id => agent.deleteShare(id),
+      open: openWebLink,
+      current: () => shareSelector === controller && overlay.kind === 'selector'
+        && overlay.state.owner === SELECTOR_OWNER.shares ? overlay.state : undefined,
+      publish: state => { overlay = { kind: 'selector', state }; renderer.requestRender() },
+    })
+    shareSelector = controller
+    await controller.load()
+  }
+
+
   function handleSelectorKey(event: KeyEvent) {
     if (overlay.kind !== 'selector') return
-    const action = handleSelectorControl(overlay.state, event)
+    if (overlay.state.owner === SELECTOR_OWNER.task) {
+      void taskSession.handleKey(event)
+      return
+    }
+    const action = handleSelectorControl(overlay.state, event, renderer.termCols, renderer.termRows,
+      focusedCommandWindowGeneration !== null ? selectorPreviewViewport : undefined)
 
     switch (action.kind) {
       case 'update':
         overlay = { kind: 'selector', state: action.state }
         renderer.requestRender()
-        if (
-          focusedCommandWindowGeneration !== null
-          && isResumeSelectorTitle(action.state.title)
-        ) {
-          scheduleFocusedResumeEnrichment(
-            focusedCommandWindowGeneration,
-            action.state.query.length > 0,
-          )
+        if (action.state.owner === SELECTOR_OWNER.resume && !action.state.rename) {
+          if (focusedCommandWindowGeneration !== null) {
+            scheduleFocusedResumeEnrichment(
+              focusedCommandWindowGeneration,
+              action.state.query.length > 0,
+            )
+          }
+          loadFocusedResumePreview(action.state)
         }
         return
       case 'close':
@@ -3956,6 +4308,27 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         resumeSession({ session_id: action.sessionId } as SessionMeta).then(() => renderer.requestRender())
         renderer.requestRender()
         return
+      case 'select-task-model': {
+        const selected = action.spec === TASK_RUNTIME_DEFAULT_MODEL
+          ? undefined
+          : selectModelOption(configInfo, action.spec)
+        overlay = { kind: 'none' }
+        resolvePendingTaskModel({
+          spec: action.spec,
+          ...(action.thinkingLevel !== undefined ? { thinkingLevel: action.thinkingLevel } : {}),
+          ...(selected ? {
+            model: selected.model,
+            label: formatModelOptionLabel(selected),
+            group: selected.group_label ?? selected.provider,
+            defaultThinkingLevel: selected.thinking_level ?? '',
+          } : {}),
+        })
+        renderer.requestRender()
+        return
+      }
+      case 'pin-default-model':
+        void pinDefaultModel(action.spec)
+        return
       case 'select-model': {
         overlay = { kind: 'none' }
         focusedCommandWindowGeneration = null
@@ -3965,33 +4338,71 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         try {
           agent.setProvider(action.spec)
           refreshConfigInfo()
+          // The picker commits a model and its effort as one gesture. The tier
+          // is applied after the switch, since it is the new model's ladder
+          // that decides whether the tier exists at all; a rejected tier leaves
+          // the model's own resolved level in place rather than failing the
+          // switch the user actually asked for.
+          let effort = configInfo?.thinkingLevel ?? ''
+          if (action.thinkingLevel !== undefined && action.thinkingLevel !== effort) {
+            const applied = agent.setThinkingLevel(action.thinkingLevel)
+            if (applied !== null) {
+              refreshConfigInfo()
+              effort = applied
+            }
+          }
           const selected = selectModelOption(configInfo, action.spec)
           const model = selected?.model ?? agent.model
           const provider = selected?.provider ?? configInfo?.provider ?? ''
           appState = { ...appState, model }
-          commitStatusLine({ id: 'sys-model', kind: 'system', text: `  Model → ${formatModelLabel(model, provider, selected?.group_label)}` })
+          const label = formatModelLabel(model, provider, selected?.group_label)
+          // Effort shares the model's status slot: they were chosen together, so
+          // reporting them apart would read as two unrelated switches.
+          commitStatusLine({
+            id: 'sys-model',
+            kind: 'system',
+            text: `  Model → ${label}${effort ? ` · thinking ${effort}` : ''}`,
+            shareEvents: modelShareEvents(provider, model, effort),
+          })
         } catch (err) {
-          commitSystem('sys-model-err', chalk.red(`  Failed to switch model: ${errorText(err)}`))
+          commitSystem('sys-model-err', renderErrorNotice(`Failed to switch model: ${errorText(err)}`))
         }
+        renderer.requestRender()
+        return
+      }
+      case 'rename-session': {
+        overlay = { kind: 'selector', state: action.state }
+        cancelResumeSearchEnrichment()
+        const token = action.state.rename
+        if (token) void saveSessionRename({
+          renameSession: (id, title) => agent.renameSession(id, title),
+          current: () => overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.resume ? overlay.state : undefined,
+          publish: state => { overlay = { kind: 'selector', state }; renderer.requestRender() },
+          cache: resumeCache,
+          cwd: agent.cwd,
+        }, token, action.title)
         renderer.requestRender()
         return
       }
       case 'delete-session':
         overlay = { kind: 'selector', state: action.state }
-        agent.deleteSession(action.sessionId).then(ok => {
+        // A cloud row goes from both places; a remote-only row has no local copy
+        // to delete, so removing the cloud copy is the whole deletion.
+        void (async () => {
+          const remote = cloudSessions.remoteFor(action.sessionId)
+          if (remote) {
+            await agent.cloudUnshareSession(action.sessionId)
+            cloudSessions.forget(action.sessionId)
+          }
+          return (await agent.deleteSession(action.sessionId)) || Boolean(remote)
+        })().then(ok => {
           if (ok) {
             preloadedSessions = preloadedSessions.filter(session => session.session_id !== action.sessionId)
-            const cached = (resumeSessionsCache ?? preloadedSessions)
-              .filter(session => session.session_id !== action.sessionId)
-            const cachedWithText = resumeSessionsWithTextCache
-              ?.filter(session => session.session_id !== action.sessionId) ?? null
-            const cacheWasComplete = resumeSessionsCacheComplete
-            replaceResumeSessionCache(cached, cacheWasComplete)
-            resumeSessionsWithTextCache = cachedWithText
+            resumeCache.remove(action.sessionId, preloadedSessions)
             commitSystem('sys-del', `  Deleted session ${action.label}`)
             // Also surface it on the overlay: resuming another session clears
             // the screen, which would otherwise wipe the only confirmation.
-            if (overlay.kind === 'selector' && isResumeSelectorTitle(overlay.state.title)) {
+            if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.resume) {
               overlay = {
                 kind: 'selector',
                 state: { ...overlay.state, subtitle: `Deleted ${action.label}` },
@@ -4000,6 +4411,47 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
             }
           }
         })
+        renderer.requestRender()
+        return
+      case 'unshare-session':
+        overlay = { kind: 'selector', state: action.state }
+        // The cloud copy goes and the local session stays. A row this machine
+        // has no copy of would lose its only copy, which is `d`'s job to say.
+        void (async () => {
+          const local = (await resumeCache.all()).some(session => session.session_id === action.sessionId)
+          if (!local) throw new Error('this machine has no copy of it · enter resumes it here first, d deletes it from the cloud')
+          await agent.cloudUnshareSession(action.sessionId)
+          cloudSessions.forget(action.sessionId)
+          resumeCache.update(action.sessionId, { cloud: null })
+          if (action.sessionId === sessionId) await refreshForkTrail(action.sessionId)
+          return `Removed ${action.label} from cloud · local copy kept`
+        })().then(text => {
+          commitSystem('sys-share', `  ${text}`)
+          // The cloud list already dropped the row; the sessions list keeps it
+          // and needs its access column redrawn.
+          return { subtitle: text, repaint: action.state.sessionScope !== 'cloud' }
+        }, (error: unknown) => {
+          const text = `Unshare failed: ${errorText(error)}`
+          commitSystem('sys-share-error', renderErrorNotice(text))
+          // The row left the cloud list on the confirming keypress; bring it back.
+          return { subtitle: text, repaint: true }
+        }).then(({ subtitle, repaint }) => {
+          // Also surface it on the overlay, as delete does: resuming another
+          // session clears the screen and would wipe the only confirmation.
+          if (overlay.kind === 'selector' && overlay.state.owner === SELECTOR_OWNER.resume) {
+            overlay = { kind: 'selector', state: { ...overlay.state, subtitle } }
+          }
+          if (repaint) refreshOpenSessionList?.()
+          renderer.requestRender()
+        })
+        renderer.requestRender()
+        return
+      case 'open-share':
+        void shareSelector?.open(action.shareId)
+        return
+      case 'delete-share':
+        overlay = { kind: 'selector', state: action.state }
+        void shareSelector?.delete(action.shareId)
         renderer.requestRender()
         return
       case 'queue-edit':
@@ -4026,6 +4478,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     const eventType = event.type === 'ctrl' && (event.key === 'n' || event.key === 'p')
       ? `ctrl+${event.key}`
       : event.type
+    const transient = overlay.state.transient === true
     const result = handleAskKeyEvent(overlay.state, eventType, extra)
 
     switch (result.action) {
@@ -4035,7 +4488,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
         resolvePendingAsk()
         overlay = { kind: 'none' }
         unfreezeTerminalTitle()
-        commitSystem('sys-ask-cancel', '  ⏺ Cancelled.')
+        if (!transient) commitSystem('sys-ask-cancel', '  ⏺ Cancelled.')
         renderer.requestRender()
         return
       case 'submit':
@@ -4047,19 +4500,19 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
           }
           overlay = { kind: 'none' }
           unfreezeTerminalTitle()
-          const answerLines: OutputLine[] = response.flatMap((r, i) => ([
-            {
-              id: `sys-ask-${i}-question`,
+          const answerLines: OutputLine[] = response.flatMap((r, i) => [
+            ...prefixedAskLines(r.question, '  • ').map((text, row) => ({
+              id: `sys-ask-${i}-question-${row}`,
               kind: 'system' as const,
-              text: `  • ${r.question}`,
-            },
-            {
-              id: `sys-ask-${i}-answer`,
+              text,
+            })),
+            ...prefixedAskLines(r.answer, '    → ').map((text, row) => ({
+              id: `sys-ask-${i}-answer-${row}`,
               kind: 'system' as const,
-              text: `    → ${r.answer}`,
-            },
-          ]))
-          commitLines(answerLines)
+              text,
+            })),
+          ])
+          if (!transient) commitLines(answerLines)
         }
         renderer.requestRender()
         return
@@ -4070,9 +4523,12 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     }
   }
 
-  function applyDetectedTheme(scheme: 'dark' | 'light'): void {
+  function applyDetectedTheme(
+    scheme: 'dark' | 'light',
+    source: 'osc11-background' | 'color-scheme',
+  ): void {
     // Committed history is pre-painted ANSI; a scheme change must rebuild it.
-    if (!setDetectedThemeScheme(scheme)) return
+    if (!setDetectedThemeScheme(scheme, source)) return
     resetHistoryCache()
     partialBlocksMemo = null
     renderer.requestRender(true)
@@ -4080,11 +4536,14 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
 
   function handleTerminalControl(event: TerminalControlEvent): void {
     if (event.type === 'osc11-background') {
-      applyDetectedTheme(schemeFromRgbColor(event.rgb))
+      applyDetectedTheme(schemeFromRgbColor(event.rgb), event.type)
       return
     }
     if (event.type === 'color-scheme') {
-      applyDetectedTheme(event.scheme)
+      applyDetectedTheme(event.scheme, event.type)
+      // Mode 2031 may signal a palette change. Refresh the actual background
+      // rather than replacing it with a possibly OS-derived scheme report.
+      process.stdout.write('\x1b]11;?\x07')
       return
     }
     enhancedKeyboard?.handleControl(event)
@@ -4123,28 +4582,28 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
   process.stdout.write('\x1b]11;?\x07\x1b[?996n\x1b[?2031h')
 
   process.stdout.write('\x1b[?2004h')
+  suggestionsReady = true
+  if (startupSuggestion) { const trigger = startupSuggestion; startupSuggestion = null; requestProductSuggestion(trigger) }
   renderer.requestRender()
 
   function cleanup() {
     if (destroyed) return
     destroyed = true
+    taskSession.dispose()
     queuedCompactionSubmissions = []
+    resolvePendingTaskModel()
     unfreezeTerminalTitle()
-    compactionTask?.abort()
+    manualCompaction.abort()
     streamRef?.abort()
     stopSpinner()
-    if (adSlotTimer !== undefined) clearTimeout(adSlotTimer)
-    clearInterval(bannerRefreshTimer)
-    clearInterval(syncTimer)
-    clearInterval(backgroundProcessTimer)
-    clearInterval(backgroundWaitTimer)
+    adSlotWakeup.dispose()
+    resources.dispose()
     authWatcher?.dispose()
     authWatcher = null
-    caretBlink.dispose()
     gitInfo.dispose()
     updateMgr.cleanup()
     if (exitHintTimer) clearTimeout(exitHintTimer)
-    cancelResumeCommandLoad()
+    cancelCommandWindowLoads()
     cancelResumeSearchEnrichment()
     invalidateExplicitResumeSelector()
     cancelSearchTextWarm()
@@ -4172,7 +4631,7 @@ export async function startRepl(opts: ReplOptions): Promise<void> {
     // teardown. Background children live in their own process groups, so they
     // would survive as orphans unless signalled synchronously right here.
     // The controller absorbs its own failures: cleanup must never throw.
-    backgroundTerminals.killAllNow()
+    backgroundCleanup.dispose()
   }
 
   function restartAfterCleanup(): void {

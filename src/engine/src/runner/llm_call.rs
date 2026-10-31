@@ -3,6 +3,7 @@
 use tokio::sync::mpsc;
 
 use super::config::AgentLoopConfig;
+use super::event_sink::EventSink;
 use super::tool_exec::build_tool_definitions;
 use crate::context::now_ms;
 use crate::provider::ApiProtocol;
@@ -21,6 +22,11 @@ const QUOTA_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 /// probes are cancellable and run indefinitely — an outage is a wait state,
 /// not a reason to discard the run.
 const OUTAGE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Network recovery must not wait behind a minute-long service-outage backoff.
+/// Keep reconnect probes frequent even after the bounded retry budget runs out;
+/// explicit quota and server failures retain their calmer existing cadence.
+const NETWORK_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A missing protocol terminal event can be a one-off upstream generation
 /// failure, but identical replays often reproduce it (for example malformed
@@ -57,7 +63,7 @@ pub(super) struct AssistantStreamInput {
 pub(super) async fn stream_assistant_response(
     context: &AgentContext,
     config: &AgentLoopConfig,
-    tx: &mpsc::UnboundedSender<AgentEvent>,
+    tx: &EventSink,
     cancel: &tokio_util::sync::CancellationToken,
     input: AssistantStreamInput,
 ) -> AssistantStreamResult {
@@ -74,21 +80,14 @@ pub(super) async fn stream_assistant_response(
         context.messages.clone()
     };
 
-    // Last-line guard before the request: drop any tool call/result that lacks
-    // an adjacent partner. Anthropic-compatible providers reject a tool_result
-    // whose tool_use is not in the previous message (HTTP 400). Loaded history is
-    // already sanitized at session build, so in the normal path this is a no-op;
-    // it stays here so the request is well-formed regardless of how `messages`
-    // was assembled (custom transform_context, future call sites).
-    let messages = crate::context::sanitize_tool_pairs(messages);
-
     // Convert to LLM messages
     let convert = config.convert_to_llm.as_ref();
     let llm_messages = match convert {
         Some(f) => f(&messages),
         None => default_convert_to_llm(&messages),
     };
-    // Normalize provider-opaque history at the LLM boundary. Replayable
+    // Normalize tool exchanges after custom conversion, then provider-opaque
+    // history at the LLM boundary. Replayable
     // thinking survives only for the exact provider/model/protocol that emitted
     // it; foreign thinking is retained as ordinary text context.
     let (target_provider, target_model, target_api) = target_model(config);
@@ -128,6 +127,7 @@ pub(super) async fn stream_assistant_response(
             model_config: config.model_config.clone(),
             cache_config: config.cache_config.clone(),
             prompt_cache_key: context.prompt_cache_key.clone(),
+            client: None,
         };
 
         // Emit one logical call start. Long-wait re-probes (quota/outage)
@@ -141,6 +141,7 @@ pub(super) async fn stream_assistant_response(
                 injected_count,
                 request: LlmCallRequest {
                     model: config.model.clone(),
+                    thinking_level,
                     system_prompt: context.system_prompt.clone(),
                     messages: llm_messages.clone(),
                     tools: tool_defs.clone(),
@@ -149,11 +150,12 @@ pub(super) async fn stream_assistant_response(
                 stats: llm_stats,
                 budget: budget.clone(),
             })
+            .await
             .ok();
         }
 
         let call_start = std::time::Instant::now();
-        let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+        let (stream_tx, mut stream_rx) = mpsc::channel(64);
         let provider_cancel = cancel.clone();
 
         // Reset metrics for this attempt.
@@ -190,6 +192,7 @@ pub(super) async fn stream_assistant_response(
                             .send(AgentEvent::MessageStart {
                                 message: placeholder,
                             })
+                            .await
                             .ok();
                     }
                     StreamEvent::TextDelta {
@@ -212,6 +215,7 @@ pub(super) async fn stream_assistant_response(
                                         delta: delta.clone(),
                                     },
                                 })
+                                .await
                                 .ok();
                         }
                     }
@@ -235,6 +239,7 @@ pub(super) async fn stream_assistant_response(
                                         delta: delta.clone(),
                                     },
                                 })
+                                .await
                                 .ok();
                         }
                     }
@@ -254,6 +259,7 @@ pub(super) async fn stream_assistant_response(
                                         name: name.clone(),
                                     },
                                 })
+                                .await
                                 .ok();
                         }
                     }
@@ -275,6 +281,7 @@ pub(super) async fn stream_assistant_response(
                                         delta: delta.clone(),
                                     },
                                 })
+                                .await
                                 .ok();
                         }
                     }
@@ -296,6 +303,7 @@ pub(super) async fn stream_assistant_response(
                                         arguments: arguments.clone(),
                                     },
                                 })
+                                .await
                                 .ok();
                         }
                     }
@@ -310,7 +318,10 @@ pub(super) async fn stream_assistant_response(
                         }
                         if partial_message.is_none() {
                             let am: AgentMessage = message.clone().into();
-                            event_tx.send(AgentEvent::MessageStart { message: am }).ok();
+                            event_tx
+                                .send(AgentEvent::MessageStart { message: am })
+                                .await
+                                .ok();
                         }
                     }
                     StreamEvent::Error { message } => {
@@ -323,7 +334,10 @@ pub(super) async fn stream_assistant_response(
                         }
                         if partial_message.is_none() {
                             let am: AgentMessage = message.clone().into();
-                            event_tx.send(AgentEvent::MessageStart { message: am }).ok();
+                            event_tx
+                                .send(AgentEvent::MessageStart { message: am })
+                                .await
+                                .ok();
                         }
                     }
                 }
@@ -332,10 +346,24 @@ pub(super) async fn stream_assistant_response(
 
         // Provider streams concurrently — events are forwarded in real-time
         // When provider returns, stream_tx is dropped, ending the forwarder
-        let result = config
+        // Enforce cancellation at the caller boundary as well: HTTP setup,
+        // error/JSON bodies and custom providers may not observe the token.
+        let stream = config
             .provider
-            .stream(stream_config, stream_tx, provider_cancel)
-            .await;
+            .stream_bounded(stream_config, stream_tx, provider_cancel);
+        tokio::pin!(stream);
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                // Let a cooperative provider observe cancellation once so it
+                // can clean up; never wait for one that ignores its token.
+                match futures::poll!(&mut stream) {
+                    std::task::Poll::Ready(result) => result,
+                    std::task::Poll::Pending => Err(ProviderError::Cancelled),
+                }
+            }
+            result = &mut stream => result,
+        };
 
         // Promote empty Ok(Message) to a retryable error so the retry loop
         // handles it uniformly instead of terminating the agent loop.
@@ -382,6 +410,7 @@ pub(super) async fn stream_assistant_response(
                     delay_ms: delay.as_millis() as u64,
                     error: error.to_string(),
                 })
+                .await
                 .ok();
                 long_wait_started = true;
                 quota_probe_delay = quota_probe_delay.saturating_mul(2).min(QUOTA_PROBE_MAX);
@@ -429,9 +458,15 @@ pub(super) async fn stream_assistant_response(
                     response_model: None,
                     response_id: None,
                 })
+                .await
                 .ok();
                 attempt += 1;
                 let delay = retry.delay_for_attempt(attempt);
+                let delay = if matches!(e, ProviderError::Network(_)) {
+                    delay.min(NETWORK_RETRY_MAX_DELAY)
+                } else {
+                    delay
+                };
                 tx.send(AgentEvent::LlmCallRetry {
                     turn,
                     attempt,
@@ -439,6 +474,7 @@ pub(super) async fn stream_assistant_response(
                     delay_ms: delay.as_millis() as u64,
                     error: e.to_string(),
                 })
+                .await
                 .ok();
                 tokio::select! {
                     _ = cancel.cancelled() => break Err(ProviderError::Cancelled),
@@ -464,11 +500,16 @@ pub(super) async fn stream_assistant_response(
                 // fail-fast contract and never enters this state.
                 forward_handle.abort();
                 let _ = forward_handle.await;
-                let delay = OUTAGE_RETRY_DELAY;
+                let delay = if matches!(e, ProviderError::Network(_)) {
+                    NETWORK_RETRY_MAX_DELAY
+                } else {
+                    OUTAGE_RETRY_DELAY
+                };
                 tx.send(AgentEvent::OutageWait {
                     delay_ms: delay.as_millis() as u64,
                     error: e.to_string(),
                 })
+                .await
                 .ok();
                 long_wait_started = true;
                 let _idle_pause = idle_clock.as_ref().map(crate::context::IdleClock::pause);
@@ -480,7 +521,16 @@ pub(super) async fn stream_assistant_response(
             }
             _ => {
                 // Final attempt — wait for forwarder to finish processing remaining events
-                let _ = forward_handle.await;
+                let mut forward_handle = forward_handle;
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        forward_handle.abort();
+                        let _ = forward_handle.await;
+                        break Err(ProviderError::Cancelled);
+                    }
+                    _ = &mut forward_handle => {}
+                }
                 if let Ok(mut m) = shared_metrics.lock() {
                     if m.duration_ms == 0 {
                         m.duration_ms = call_start.elapsed().as_millis() as u64;
@@ -526,6 +576,7 @@ pub(super) async fn stream_assistant_response(
                 response_model,
                 response_id,
             })
+            .await
             .ok();
             AssistantStreamResult::complete(outcome.into_message())
         }
@@ -554,6 +605,7 @@ pub(super) async fn stream_assistant_response(
                 response_model: None,
                 response_id: None,
             })
+            .await
             .ok();
             AssistantStreamResult::complete(Message::Assistant {
                 content: vec![Content::Text {

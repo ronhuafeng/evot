@@ -6,7 +6,7 @@
 // Message types
 // ---------------------------------------------------------------------------
 
-export type MessageRole = 'user' | 'assistant'
+export type MessageRole = 'user' | 'assistant' | 'system'
 
 export interface UIMessage {
   id: string
@@ -23,7 +23,7 @@ export interface UIMessage {
 }
 
 export interface UICompaction {
-  reason: 'threshold' | 'overflow' | 'manual'
+  reason: 'threshold' | 'overflow' | 'manual' | 'prune' | 'refusal'
   summary: string
   tokensBefore: number
   tokensAfter: number
@@ -118,7 +118,6 @@ export interface ToolBreakdownEntry {
 }
 
 export interface CompactRecord {
-  level: number
   beforeTokens?: number
   afterTokens?: number
   from_tokens?: number
@@ -149,7 +148,7 @@ export interface MessageStats {
 // ---------------------------------------------------------------------------
 
 export interface VerboseEvent {
-  kind: 'llm_call' | 'llm_retry' | 'llm_completed' | 'compact_call' | 'compact_done'
+  kind: 'llm_call' | 'llm_retry' | 'llm_completed' | 'compact_call' | 'compact_done' | 'jev_decided' | 'jev_applied' | 'jev_review'
   text: string
   expandedText?: string
 }

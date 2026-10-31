@@ -25,6 +25,68 @@ fn resolved(
 }
 
 #[test]
+fn capability_profiles_preserve_alias_route_and_apply_explicit_overrides_last() {
+    for (profile, expected_output, expected_reasoning) in [
+        (Some("  deepseek/deepseek-v4.1-flash  "), 384_000, true),
+        (Some("deepseek-chat"), 8192, false),
+        (Some("future-profile"), 128_000, true),
+        (None, 128_000, true),
+    ] {
+        let request = || ResolveModelRequest {
+            protocol: ApiProtocol::AnthropicMessages,
+            provider: "cloud".into(),
+            model_id: "evot-fast".into(),
+            base_url: "https://gateway.example.test/v1".into(),
+            headers: HashMap::from([("X-Test".into(), "header".into())]),
+            compat: None,
+            route_capabilities: RouteCapabilities::default(),
+            overrides: ModelOverrides::default(),
+        };
+        let model = ModelConfig::resolve_with_profile(request(), profile);
+        assert_eq!(model.id(), "evot-fast");
+        assert_eq!(model.provider(), "cloud");
+        assert_eq!(model.base_url(), "https://gateway.example.test/v1");
+        assert_eq!(
+            model.headers().get("X-Test").map(String::as_str),
+            Some("header")
+        );
+        assert_eq!(model.max_tokens(), expected_output);
+        assert_eq!(model.reasoning(), expected_reasoning);
+        let mut overridden = request();
+        overridden.overrides = ModelOverrides {
+            context_window: Some(64_000),
+            max_output_tokens: Some(2048),
+            supports_image: Some(false),
+            reasoning: Some(false),
+        };
+        let model = ModelConfig::resolve_with_profile(overridden, profile);
+        assert_eq!(model.context_window(), 64_000);
+        assert_eq!(model.max_tokens(), 2048);
+        assert!(!model.supports_image());
+        assert!(!model.reasoning());
+    }
+    // A newer server's unrecognized profile must not erase a known model.
+    let request = ResolveModelRequest {
+        protocol: ApiProtocol::AnthropicMessages,
+        provider: "cloud".into(),
+        model_id: "deepseek-chat".into(),
+        base_url: "https://gateway.example.test".into(),
+        headers: HashMap::new(),
+        compat: None,
+        route_capabilities: RouteCapabilities::default(),
+        overrides: ModelOverrides::default(),
+    };
+    assert_eq!(
+        ModelConfig::resolve_with_profile(request.clone(), Some("future-profile")).max_tokens(),
+        8192
+    );
+    assert_eq!(
+        ModelConfig::resolve_with_profile(request, Some("deepseek-v4.1-flash")).max_tokens(),
+        384_000
+    );
+}
+
+#[test]
 fn model_config_presets_resolve_expected_routes() {
     let anthropic = ModelConfig::anthropic("claude-sonnet-4-20250514", "Claude Sonnet 4");
     assert_eq!(anthropic.protocol(), ApiProtocol::AnthropicMessages);
@@ -223,6 +285,36 @@ fn grok_profiles_match_xai_contracts() {
 }
 
 #[test]
+fn gemini_4_argon_profile_matches_models_dev_contract() {
+    use evotengine::ThinkingLevel::*;
+
+    for id in ["gemini-4-argon", "google/gemini-4-argon"] {
+        let argon = ModelConfig::openai(id, "Gemini 4 Argon");
+        assert_eq!(argon.context_window(), 1_015_808, "{id}");
+        assert_eq!(argon.advertised_context_window(), 1_048_576, "{id}");
+        assert_eq!(argon.max_tokens(), 32_768, "{id}");
+        assert_eq!(argon.input(), [InputModality::Text, InputModality::Image]);
+        assert_eq!(argon.supported_thinking_levels(), vec![Low, Medium, High]);
+        assert_eq!(argon.default_thinking_level(), Medium, "{id}");
+        assert!(!argon.can_disable_thinking(), "{id}");
+        assert_eq!(argon.clamp_thinking_level(Xhigh), High, "{id}");
+        assert_eq!(argon.effective_thinking_level(Off), Low, "{id}");
+    }
+
+    // Uncatalogued Gemini 4+ ids inherit Argon; Gemini 3.x does not.
+    let successor = ModelConfig::openai("gemini-4.1-krypton", "Gemini 4.1");
+    assert_eq!(successor.advertised_context_window(), 1_048_576);
+    assert_eq!(successor.supported_thinking_levels(), vec![
+        Low, Medium, High
+    ]);
+    let legacy = ModelConfig::openai("gemini-3.5-flash", "Gemini 3.5 Flash");
+    // No explicit Gemini 3 profile: use the generic modern baseline, not
+    // Argon's mandatory-thinking ladder or its smaller output limit.
+    assert_eq!(legacy.max_tokens(), 128_000);
+    assert!(legacy.can_disable_thinking());
+}
+
+#[test]
 fn kimi_profiles_match_catalog_contracts() {
     for id in ["k2p7", "kimi-for-coding", "kimi-for-coding-highspeed"] {
         let config = ModelConfig::anthropic(id, id);
@@ -259,16 +351,7 @@ fn kimi_profiles_match_catalog_contracts() {
 
 #[test]
 fn current_openai_profiles_expose_limits_and_verbosity() {
-    for id in [
-        "gpt-5.4",
-        "gpt-5.4-pro",
-        "gpt-5.5",
-        "gpt-5.5-pro",
-        "gpt-5.6-luna",
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-6-astra",
-    ] {
+    for id in ["gpt-5.4", "gpt-5.4-pro", "gpt-5.5", "gpt-5.5-pro"] {
         let config = ModelConfig::openai(id, id);
         assert_eq!(config.context_window(), 922_000, "{id}");
         assert_eq!(config.advertised_context_window(), 1_000_000, "{id}");
@@ -285,6 +368,9 @@ fn current_openai_profiles_expose_limits_and_verbosity() {
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
     ] {
         assert_eq!(
             ModelConfig::openai(id, id).effective_verbosity(),
@@ -301,11 +387,74 @@ fn current_openai_profiles_expose_limits_and_verbosity() {
     }
 }
 
+/// GPT-5.6 and newer mirror Codex `models.json` and pi: 272k default
+/// context window (the long-context pricing threshold), auto-compaction at
+/// 90%, low..max reasoning and remote compaction on the first-party route.
+#[test]
+fn gpt_5_6_plus_profiles_follow_codex_and_pi() {
+    use evotengine::ThinkingLevel::*;
+
+    for id in [
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-6-astra",
+        "gpt-6-luna",
+        "gpt-6-sol",
+        "gpt-6.1-sol",
+    ] {
+        let config = ModelConfig::openai(id, id);
+        assert_eq!(config.context_window(), 272_000, "{id}");
+        assert_eq!(config.advertised_context_window(), 272_000, "{id}");
+        assert_eq!(config.max_tokens(), 128_000, "{id}");
+        assert_eq!(
+            config.profile_compaction_limit(ThinkingLevel::Medium),
+            Some(244_800),
+            "{id}"
+        );
+        assert_eq!(config.default_thinking_level(), Medium, "{id}");
+        assert_eq!(config.clamp_thinking_level(Max), Max, "{id}");
+        assert!(
+            ModelConfig::openai_responses(id, id).can_remote_compact(),
+            "{id}"
+        );
+    }
+
+    // `effort: none` is still accepted on these.
+    for id in [
+        "gpt-5.6-luna",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-6-luna",
+        "gpt-6-sol",
+    ] {
+        let config = ModelConfig::openai(id, id);
+        assert_eq!(
+            config.supported_thinking_levels(),
+            vec![Off, Low, Medium, High, Xhigh, Max],
+            "{id}"
+        );
+        assert!(config.can_disable_thinking(), "{id}");
+    }
+
+    // GPT-6 Astra and GPT-6.1 Sol reject `effort: none`.
+    for id in ["gpt-6-astra", "gpt-6.1-sol"] {
+        let config = ModelConfig::openai(id, id);
+        assert_eq!(
+            config.supported_thinking_levels(),
+            vec![Low, Medium, High, Xhigh, Max],
+            "{id}"
+        );
+        assert!(!config.can_disable_thinking(), "{id}");
+        assert_eq!(config.clamp_thinking_level(Off), Low, "{id}");
+    }
+}
+
 #[test]
 fn unknown_openai_families_keep_reasoning_fallback_without_extensions() {
     use evotengine::ThinkingLevel::*;
 
-    for id in ["codex-mini", "gpt-5.7-nova"] {
+    for id in ["codex-mini", "gpt-5.3-mini"] {
         let config = ModelConfig::openai(id, id);
         assert!(config.reasoning(), "{id}");
         assert_eq!(
@@ -316,6 +465,16 @@ fn unknown_openai_families_keep_reasoning_fallback_without_extensions() {
         assert_eq!(config.effective_verbosity(), None, "{id}");
         assert!(!config.can_remote_compact(), "{id}");
     }
+
+    // GPT-5.6+ successors inherit the 272k window and low..max ladder (no
+    // `none`, which newer models reject) but not the first-party allowlists
+    // (verbosity, remote compaction).
+    let nova = ModelConfig::openai("gpt-5.7-nova", "GPT-5.7 Nova");
+    assert_eq!(nova.supported_thinking_levels(), vec![
+        Low, Medium, High, Xhigh, Max
+    ]);
+    assert_eq!(nova.effective_verbosity(), None);
+    assert!(!nova.can_remote_compact());
 }
 
 #[test]
@@ -340,6 +499,69 @@ fn anthropic_version_rules_cover_current_and_future_models() {
     let opus_4_5 = ModelConfig::anthropic("claude-opus-4-5", "Claude Opus 4.5");
     assert_eq!(opus_4_5.context_window(), 200_000);
     assert_eq!(opus_4_5.max_tokens(), 64_000);
+}
+
+/// Fable 5.x and Opus/Sonnet 5.5+ are always-on adaptive reasoning (`off`
+/// is rejected) on their regular long-context windows; Haiku 5 joins the
+/// adaptive 1M tier with `off` still available.
+#[test]
+fn anthropic_mandatory_reasoning_profiles_follow_pi() {
+    use evotengine::ThinkingLevel::*;
+
+    for (id, window) in [
+        ("claude-fable-5", 867_000),
+        ("claude-fable-5-1", 867_000),
+        ("claude-opus-5-5", 867_000),
+        ("claude-opus-5-6", 867_000),
+        ("claude-sonnet-5-5", 872_000),
+        ("claude-sonnet-5-7", 872_000),
+    ] {
+        let config = ModelConfig::anthropic(id, id);
+        assert_eq!(config.context_window(), window, "{id}");
+        assert_eq!(config.advertised_context_window(), 1_000_000, "{id}");
+        assert_eq!(config.max_tokens(), 128_000, "{id}");
+        assert_eq!(config.default_thinking_level(), High, "{id}");
+        assert_eq!(
+            config.supported_thinking_levels(),
+            vec![Low, Medium, High, Xhigh, Max],
+            "{id}"
+        );
+        assert!(!config.can_disable_thinking(), "{id}");
+        assert_eq!(config.clamp_thinking_level(Off), Low, "{id}");
+    }
+
+    // Opus/Sonnet 5.0 keep `off`.
+    for id in ["claude-opus-5", "claude-sonnet-5", "claude-haiku-5"] {
+        let config = ModelConfig::anthropic(id, id);
+        assert_eq!(config.max_tokens(), 128_000, "{id}");
+        assert!(config.can_disable_thinking(), "{id}");
+        assert_eq!(config.clamp_thinking_level(Xhigh), Xhigh, "{id}");
+    }
+    assert_eq!(
+        ModelConfig::anthropic("claude-haiku-5", "Haiku 5").context_window(),
+        872_000
+    );
+}
+
+/// Haiku 5.5 bills the whole request at 5x once input passes 100k, so the
+/// default window stays in the cheap tier while advertising the 1M ceiling.
+#[test]
+fn anthropic_haiku_5_5_caps_input_at_pricing_threshold() {
+    use evotengine::ThinkingLevel::*;
+
+    for id in ["claude-haiku-5-5", "claude-haiku-5-6"] {
+        let config = ModelConfig::anthropic(id, id);
+        assert_eq!(config.context_window(), 100_000, "{id}");
+        assert_eq!(config.advertised_context_window(), 1_000_000, "{id}");
+        assert_eq!(config.max_tokens(), 128_000, "{id}");
+        assert_eq!(
+            config.profile_compaction_limit(Medium),
+            Some(90_000),
+            "{id}"
+        );
+        assert!(config.can_disable_thinking(), "{id}");
+        assert_eq!(config.clamp_thinking_level(Max), Max, "{id}");
+    }
 }
 
 #[test]
@@ -476,10 +698,15 @@ fn newer_uncatalogued_ids_inherit_family_windows() {
     }
 
     let gpt = ModelConfig::openai("gpt-5.7-nova", "GPT-5.7 Nova");
-    assert_eq!(gpt.context_window(), 922_000);
-    assert_eq!(gpt.advertised_context_window(), 1_000_000);
-    assert_eq!(gpt.max_tokens(), 32_768);
+    assert_eq!(gpt.context_window(), 272_000);
+    assert_eq!(gpt.advertised_context_window(), 272_000);
+    assert_eq!(gpt.max_tokens(), 128_000);
     assert!(!gpt.can_remote_compact());
+
+    let gpt_5_5 = ModelConfig::openai("gpt-5.5-mini", "GPT-5.5 Mini");
+    assert_eq!(gpt_5_5.context_window(), 922_000);
+    assert_eq!(gpt_5_5.advertised_context_window(), 1_000_000);
+    assert_eq!(gpt_5_5.max_tokens(), 32_768);
 
     let gpt4 = ModelConfig::openai("gpt-4o", "GPT-4o");
     assert_eq!(gpt4.context_window(), 128_000);
@@ -554,7 +781,14 @@ fn glm_and_deepseek_profiles_are_explicit() {
     assert_eq!(namespaced_reasoner.max_tokens(), 64_000);
     assert_eq!(namespaced_reasoner.default_thinking_level(), High);
 
-    for id in ["deepseek-v4-flash", "deepseek-v4-pro"] {
+    // The V4.1 Flash line is multimodal and offers a `low` effort tier; the
+    // deprecated ids resolve to the same profile as their canonical model.
+    for id in [
+        "deepseek-flash",
+        "deepseek-v4.1-flash",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    ] {
         let model = resolved(
             ApiProtocol::OpenAiCompletions,
             "deepseek",
@@ -572,24 +806,87 @@ fn glm_and_deepseek_profiles_are_explicit() {
             id
         );
         assert_eq!(model.max_tokens(), 384_000, "model: {}", id);
-        assert_eq!(model.input(), [InputModality::Text], "model: {}", id);
+        assert_eq!(
+            model.input(),
+            [InputModality::Text, InputModality::Image],
+            "model: {}",
+            id
+        );
         assert_eq!(
             model.supported_thinking_levels(),
-            vec![Off, Low, High, Xhigh, Max],
+            vec![Off, Low, High, Max],
             "model: {}",
             id
         );
         assert_eq!(model.default_thinking_level(), High, "model: {}", id);
         assert!(model.can_disable_thinking(), "model: {}", id);
     }
+
+    // V4 Pro rejects the `low` tier and has no image input.
+    let pro = resolved(
+        ApiProtocol::OpenAiCompletions,
+        "deepseek",
+        "deepseek-v4-pro",
+        "https://api.deepseek.com",
+        Some(OpenAiCompat::deepseek()),
+        RouteCapabilities::default(),
+        ModelOverrides::default(),
+    );
+    assert_eq!(pro.context_window(), 616_000);
+    assert_eq!(pro.advertised_context_window(), 1_000_000);
+    assert_eq!(pro.max_tokens(), 384_000);
+    assert_eq!(pro.input(), [InputModality::Text]);
+    assert_eq!(pro.supported_thinking_levels(), vec![Off, High, Max]);
+    assert_eq!(pro.default_thinking_level(), High);
+
+    let namespaced_flash =
+        ModelConfig::openai("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash");
+    assert_eq!(namespaced_flash.context_window(), 616_000);
+    assert_eq!(namespaced_flash.input(), [
+        InputModality::Text,
+        InputModality::Image
+    ]);
+    assert_eq!(namespaced_flash.supported_thinking_levels(), vec![
+        Off, Low, High, Max
+    ]);
 }
 
 #[test]
-fn unknown_models_do_not_inherit_protocol_reasoning() {
-    let config = ModelConfig::local("http://localhost:11434/v1", "some/model");
-    assert!(!config.reasoning());
-    assert_eq!(config.supported_thinking_levels(), vec![ThinkingLevel::Off]);
-    assert_eq!(config.default_thinking_level(), ThinkingLevel::Off);
+fn an_unconfigured_model_does_not_offer_reasoning_controls() {
+    let model = ModelConfig::anthropic("", "");
+    assert!(!model.reasoning());
+    assert_eq!(model.default_thinking_level(), ThinkingLevel::Off);
+    assert_eq!(model.supported_thinking_levels(), vec![ThinkingLevel::Off]);
+}
+
+#[test]
+fn unknown_models_use_modern_capacity_and_route_safe_reasoning() {
+    use evotengine::ThinkingLevel::*;
+
+    for config in [
+        ModelConfig::anthropic("evot-fast", "Fast"),
+        ModelConfig::openai("opaque-alias", "Alias"),
+        ModelConfig::openai_responses("opaque-alias", "Alias"),
+        ModelConfig::local("http://localhost:11434/v1", "some/model"),
+    ] {
+        assert_eq!(config.context_window(), 1_000_000);
+        assert_eq!(config.max_tokens(), 128_000);
+        assert!(config.reasoning());
+        assert_eq!(config.default_thinking_level(), High);
+        assert!(!config.can_remote_compact());
+        assert_eq!(config.effective_verbosity(), None);
+        if config.honors_reasoning_effort() {
+            assert_eq!(config.supported_thinking_levels(), vec![
+                Off, Minimal, Low, Medium, High, Xhigh, Max
+            ]);
+            assert_eq!(config.effective_thinking_level(Max), Max);
+            assert_eq!(config.effective_thinking_level(Off), Off);
+        } else {
+            // Unknown local transports must not invent an effort extension.
+            assert!(config.supported_thinking_levels().is_empty());
+            assert_eq!(config.effective_thinking_level(Max), Off);
+        }
+    }
 }
 
 #[test]

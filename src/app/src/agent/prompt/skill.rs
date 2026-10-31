@@ -14,8 +14,8 @@ struct BuiltinDef {
     content: &'static str,
 }
 
-// A skill is builtin only when evot itself dispatches to it by name: `/harden`
-// and `/clip all` both load their instructions from here. Everything else ships
+// A skill is builtin only when evot itself dispatches to it by name:
+// `/harden`, `/clip all`, and `/sessions <query>`. Everything else ships
 // in the evot-skills catalog and is installed on demand.
 const BUILTINS: &[BuiltinDef] = &[
     BuiltinDef {
@@ -25,6 +25,10 @@ const BUILTINS: &[BuiltinDef] = &[
     BuiltinDef {
         name: "memory",
         content: include_str!("prompts/memory.md"),
+    },
+    BuiltinDef {
+        name: "session-search",
+        content: include_str!("prompts/session-search.md"),
     },
 ];
 
@@ -452,4 +456,27 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+pub(crate) fn load_turn_skills(
+    dirs: &[PathBuf],
+    names: Option<&[String]>,
+) -> crate::error::Result<Vec<SkillSpec>> {
+    match names {
+        Some(names) => load_skills_by_name(dirs, names),
+        None => load_skills(dirs),
+    }
+    .map_err(|error| crate::error::EvotError::Agent(format!("failed to load skills: {error}")))
+}
+
+pub(crate) fn skills_prompt_section(skills: &[SkillSpec]) -> Option<super::Section> {
+    let text = format_skills_for_prompt(skills);
+    if text.is_empty() {
+        None
+    } else {
+        Some(super::Section {
+            name: "skills",
+            text,
+        })
+    }
 }
