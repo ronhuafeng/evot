@@ -87,7 +87,7 @@ jobs:
 
   test-cli-macos:
     name: Test CLI (macOS arm64)
-    runs-on: macos-14
+    runs-on: macos-latest
     needs: check
     steps:
       - uses: actions/checkout@v5
